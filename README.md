@@ -1,2 +1,1 @@
-# rust_101
-rust learning project
+# rust base ntp server using esp32 microcontroller
