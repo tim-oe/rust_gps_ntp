@@ -27,6 +27,14 @@ When stacked as a FeatherWing, the GPS board uses shared Feather rails:
 - Serial lines for NMEA traffic (GPS -> MCU UART receive)
 - Optional PPS line can be jumper-wired to any interrupt-capable GPIO
 
+## Firmware pin map currently in code
+
+- GPS UART: TX=`GPIO1`, RX=`GPIO2`
+- PPS input: `GPIO13` (rising-edge interrupt)
+- TFT SPI: SCK=`GPIO36`, MOSI=`GPIO35`, CS=`GPIO7`, DC=`GPIO39`, RST=`GPIO40`, BL=`GPIO45`
+- Button (page toggle / wake): `GPIO0` (active low with pull-up)
+- Battery monitor (MAX17048) I2C: SDA=`GPIO3`, SCL=`GPIO4`
+
 ## Bring-up checklist
 
 - GPS status LED blinks while searching, then slows after fix.

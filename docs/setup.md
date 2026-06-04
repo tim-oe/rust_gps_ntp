@@ -27,10 +27,18 @@ rustup show active-toolchain
 
 Expected output should include `esp` (not just `stable`).
 
+Persist ESP environment setup for new shells:
+
+```bash
+echo 'source "$HOME/export-esp.sh"' >> ~/.bashrc
+source ~/.bashrc
+```
+
 ## 2) Install flashing tools
 
 ```bash
 cargo install espflash cargo-espflash
+cargo install ldproxy
 ```
 
 Install `just` task runner:
@@ -102,7 +110,8 @@ You should see:
 - assigned DHCP address, e.g. `Wi-Fi connected; STA IP: 192.168.1.42`
 - boot message indicating Wi-Fi + GPS UART diagnostics mode
 - raw NMEA logs when GPS serial data is present, e.g. `GPS NMEA: $GPRMC,...`
-- parsed UTC display from RMC sentences, e.g. `GPS UTC: 2026-06-04T02:35:01Z (fix)`
+- parsed UTC display from RMC sentences, e.g. `GPS UTC: 2026-06-04 02:35:01`
+- TFT page output with button page-toggle and 15-second auto-blank/wake behavior
 
 ## 6) Next firmware milestone
 

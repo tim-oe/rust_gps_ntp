@@ -7,9 +7,13 @@ edition = "2024"
 
 [target.'cfg(target_os = "espidf")'.dependencies]
 anyhow = "1"
+chrono = "0.4"
+display-interface-spi = "0.5"
+embedded-graphics = "0.8"
 esp-idf-svc = { version = "0.51", features = ["std", "binstart"] }
 log = "0.4"
 nmea = "0.6"
+st7789 = "0.7"
 
 [build-dependencies]
 embuild = "0.33"

@@ -19,8 +19,10 @@ for your connected board at `/dev/ttyACM0`.
 - M2 implemented: UART ingest + NMEA parse (`RMC`/`ZDA`) + fix tracking
 - Wi-Fi STA credentials currently load from build env (`WIFI_SSID`/`WIFI_PASS`)
 - Boot now initializes STA and logs acquired DHCP IP
-- Runtime currently does Wi-Fi bring-up plus GPS diagnostics and UTC time display from `RMC`
-- PPS + NTP responder are the next implementation steps
+- Runtime now includes TFT display pages with button paging + 15s auto-blank
+- Display pages: time/local estimate, position/satellites/PPS, resources, MAX17048 battery
+- PPS diagnostics are wired to interrupt capture on `GPIO13`
+- NTP responder is still pending
 
 ## Rust code organization note
 
