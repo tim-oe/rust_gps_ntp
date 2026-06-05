@@ -1,17 +1,18 @@
 #[cfg(target_os = "espidf")]
+mod battery;
+#[cfg(target_os = "espidf")]
+mod display;
+#[cfg(target_os = "espidf")]
+mod gps;
+#[cfg(target_os = "espidf")]
+mod wifi;
+
+#[cfg(target_os = "espidf")]
 fn main() -> anyhow::Result<()> {
-    use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime};
-    use core::convert::TryInto;
+    use anyhow::Context;
     use core::sync::atomic::{AtomicU32, Ordering};
-    use anyhow::{anyhow, bail, Context};
+    use display::Page;
     use display_interface_spi::SPIInterfaceNoCS;
-    use embedded_graphics::mono_font::ascii::FONT_8X13_BOLD;
-    use embedded_graphics::mono_font::MonoTextStyleBuilder;
-    use embedded_graphics::pixelcolor::Rgb565;
-    use embedded_graphics::prelude::*;
-    use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
-    use embedded_graphics::text::Text;
-    use esp_idf_svc::eventloop::EspSystemEventLoop;
     use esp_idf_svc::hal::delay::{Ets, FreeRtos};
     use esp_idf_svc::hal::gpio::{self, PinDriver, Pull};
     use esp_idf_svc::hal::i2c;
@@ -20,410 +21,12 @@ fn main() -> anyhow::Result<()> {
     use esp_idf_svc::hal::spi;
     use esp_idf_svc::hal::uart::{self, UartDriver};
     use esp_idf_svc::nvs::EspDefaultNvsPartition;
-    use esp_idf_svc::wifi::{
-        AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi,
-    };
-    use st7789::{BacklightState, Orientation, ST7789};
+    use st7789::ST7789;
     use std::sync::Arc;
-
-    #[derive(Debug, Clone)]
-    struct WifiCredentials {
-        ssid: String,
-        pass: String,
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct GpsSnapshot {
-        utc_date: String,
-        utc_time: String,
-        local_time: String,
-        lat: f32,
-        lon: f32,
-        fix: bool,
-        sats: u8,
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct BatterySnapshot {
-        voltage_v: f32,
-        percent: f32,
-    }
-
-    #[derive(Debug, Copy, Clone)]
-    enum Page {
-        Time,
-        Location,
-        Resources,
-        Battery,
-    }
-
-    const DISPLAY_DEBUG_ALWAYS_ON: bool = true;
-    const DISPLAY_BACKLIGHT_ACTIVE_LOW: bool = false;
-    // CircuitPython-style viewport offsets for the 1.14" 240x135 ST7789.
-    const DISPLAY_X_OFFSET: i32 = 40;
-    const DISPLAY_Y_OFFSET: i32 = 52;
-
-    struct OffsetDisplay<'a, DI, RST, BL>
-    where
-        DI: display_interface::WriteOnlyDataCommand,
-        RST: embedded_hal_02::digital::v2::OutputPin,
-        BL: embedded_hal_02::digital::v2::OutputPin,
-    {
-        inner: &'a mut ST7789<DI, RST, BL>,
-        x_off: u16,
-        y_off: u16,
-        width: u16,
-        height: u16,
-    }
-
-    impl<'a, DI, RST, BL> OffsetDisplay<'a, DI, RST, BL>
-    where
-        DI: display_interface::WriteOnlyDataCommand,
-        RST: embedded_hal_02::digital::v2::OutputPin,
-        BL: embedded_hal_02::digital::v2::OutputPin,
-    {
-        fn new(
-            inner: &'a mut ST7789<DI, RST, BL>,
-            x_off: u16,
-            y_off: u16,
-            width: u16,
-            height: u16,
-        ) -> Self {
-            Self {
-                inner,
-                x_off,
-                y_off,
-                width,
-                height,
-            }
-        }
-    }
-
-    impl<'a, DI, RST, BL> OriginDimensions for OffsetDisplay<'a, DI, RST, BL>
-    where
-        DI: display_interface::WriteOnlyDataCommand,
-        RST: embedded_hal_02::digital::v2::OutputPin,
-        BL: embedded_hal_02::digital::v2::OutputPin,
-    {
-        fn size(&self) -> Size {
-            Size::new(self.width as u32, self.height as u32)
-        }
-    }
-
-    impl<'a, DI, RST, BL, PinE> DrawTarget for OffsetDisplay<'a, DI, RST, BL>
-    where
-        DI: display_interface::WriteOnlyDataCommand,
-        RST: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
-        BL: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
-        ST7789<DI, RST, BL>: DrawTarget<Color = Rgb565, Error = st7789::Error<PinE>>,
-    {
-        type Color = Rgb565;
-        type Error = st7789::Error<PinE>;
-
-        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-        where
-            I: IntoIterator<Item = Pixel<Self::Color>>,
-        {
-            let x_off = self.x_off as i32;
-            let y_off = self.y_off as i32;
-            let width = self.width as i32;
-            let height = self.height as i32;
-
-            let mapped = pixels.into_iter().filter_map(move |Pixel(p, c)| {
-                if p.x < 0 || p.y < 0 || p.x >= width || p.y >= height {
-                    None
-                } else {
-                    Some(Pixel(Point::new(p.x + x_off, p.y + y_off), c))
-                }
-            });
-
-            self.inner.draw_iter(mapped)
-        }
-
-        fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
-            let x_off = self.x_off as i32;
-            let y_off = self.y_off as i32;
-            let width = self.width as i32;
-            let height = self.height as i32;
-
-            let pixels = (0..height).flat_map(move |y| {
-                (0..width).map(move |x| Pixel(Point::new(x + x_off, y + y_off), color))
-            });
-
-            self.inner.draw_iter(pixels)
-        }
-    }
-
-    impl Page {
-        fn next(self) -> Self {
-            match self {
-                Self::Time => Self::Location,
-                Self::Location => Self::Resources,
-                Self::Resources => Self::Battery,
-                Self::Battery => Self::Time,
-            }
-        }
-    }
-
-    fn parse_hhmmss(raw: &str) -> Option<&str> {
-        if raw.len() < 6 || !raw.is_ascii() {
-            return None;
-        }
-        Some(&raw[..6])
-    }
-
-    fn format_hhmmss(raw6: &str) -> String {
-        format!("{}:{}:{}", &raw6[0..2], &raw6[2..4], &raw6[4..6])
-    }
-
-    fn parse_ddmmyy(raw: &str) -> Option<&str> {
-        if raw.len() < 6 || !raw.is_ascii() {
-            return None;
-        }
-        Some(&raw[..6])
-    }
-
-    fn format_ddmmyy(raw6: &str) -> String {
-        format!("20{}-{}-{}", &raw6[4..6], &raw6[2..4], &raw6[0..2])
-    }
-
-    fn nmea_to_decimal(value: &str, dir: &str) -> Option<f32> {
-        let raw: f32 = value.parse().ok()?;
-        let degrees = (raw / 100.0).floor();
-        let minutes = raw - (degrees * 100.0);
-        let mut decimal = degrees + (minutes / 60.0);
-        if dir == "S" || dir == "W" {
-            decimal = -decimal;
-        }
-        Some(decimal)
-    }
-
-    fn local_time_from_utc(utc_date: &str, utc_time: &str, lon: f32) -> Option<String> {
-        let tz_offset_h = (lon / 15.0).round() as i64;
-        let ddmmyy = parse_ddmmyy(utc_date)?;
-        let hhmmss = parse_hhmmss(utc_time)?;
-
-        let day: u32 = ddmmyy[0..2].parse().ok()?;
-        let month: u32 = ddmmyy[2..4].parse().ok()?;
-        let year: i32 = 2000 + ddmmyy[4..6].parse::<i32>().ok()?;
-        let hour: u32 = hhmmss[0..2].parse().ok()?;
-        let minute: u32 = hhmmss[2..4].parse().ok()?;
-        let second: u32 = hhmmss[4..6].parse().ok()?;
-
-        let date = NaiveDate::from_ymd_opt(year, month, day)?;
-        let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-        let dt = NaiveDateTime::new(date, time) + ChronoDuration::hours(tz_offset_h);
-
-        Some(format!(
-            "{} ({:+}h)",
-            dt.time().format("%H:%M:%S"),
-            tz_offset_h
-        ))
-    }
-
-    fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
-        let fields: Vec<&str> = sentence.split(',').collect();
-        if fields.len() < 10 {
-            return None;
-        }
-
-        let time = parse_hhmmss(fields[1])?;
-        let status = fields[2];
-        let date = parse_ddmmyy(fields[9])?;
-        let lat = nmea_to_decimal(fields[3], fields[4])?;
-        let lon = nmea_to_decimal(fields[5], fields[6])?;
-
-        gps.utc_date = format_ddmmyy(date);
-        gps.utc_time = format_hhmmss(time);
-        gps.local_time = local_time_from_utc(date, time, lon).unwrap_or_else(|| "n/a".to_owned());
-        gps.lat = lat;
-        gps.lon = lon;
-        gps.fix = status == "A";
-
-        Some(())
-    }
-
-    fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
-        let fields: Vec<&str> = sentence.split(',').collect();
-        if fields.len() < 8 {
-            return None;
-        }
-        gps.sats = fields[7].parse::<u8>().ok()?;
-        Some(())
-    }
-
-    fn read_battery(i2c: &mut i2c::I2cDriver<'_>) -> Option<BatterySnapshot> {
-        const MAX17048_ADDR: u8 = 0x36;
-        const REG_VCELL: u8 = 0x02;
-        const REG_SOC: u8 = 0x04;
-
-        let mut vcell = [0_u8; 2];
-        let mut soc = [0_u8; 2];
-        i2c.write_read(MAX17048_ADDR, &[REG_VCELL], &mut vcell, 50).ok()?;
-        i2c.write_read(MAX17048_ADDR, &[REG_SOC], &mut soc, 50).ok()?;
-
-        let vraw = u16::from_be_bytes(vcell);
-        let voltage_v = (vraw as f32) * 78.125e-6;
-        let percent = (soc[0] as f32) + ((soc[1] as f32) / 256.0);
-
-        Some(BatterySnapshot { voltage_v, percent })
-    }
-
-    fn draw_page<D>(
-        display: &mut D,
-        page: Page,
-        gps: &GpsSnapshot,
-        battery: &BatterySnapshot,
-        pps_delta_us: u32,
-        pps_count: u32,
-        bytes_seen: u64,
-    )
-    where
-        D: DrawTarget<Color = Rgb565>,
-    {
-        let style = MonoTextStyleBuilder::new()
-            .font(&FONT_8X13_BOLD)
-            .text_color(Rgb565::WHITE)
-            .build();
-
-        let _ = display.clear(Rgb565::BLACK);
-
-        let mut y = 14;
-        let mut line = |text: String| {
-            let _ = Text::new(&text, Point::new(4, y), style).draw(display);
-            y += 14;
-        };
-
-        match page {
-            Page::Time => {
-                line("Page 1/4  TIME".to_owned());
-                line(format!("UTC:   {} {}", gps.utc_date, gps.utc_time));
-                line(format!("Local: {}", gps.local_time));
-                line(format!("Fix:   {}", if gps.fix { "yes" } else { "no" }));
-                line(format!("Lat:   {:.5}", gps.lat));
-                line(format!("Lon:   {:.5}", gps.lon));
-            }
-            Page::Location => {
-                line("Page 2/4  LOCATION".to_owned());
-                line(format!("Lat: {:.6}", gps.lat));
-                line(format!("Lon: {:.6}", gps.lon));
-                line(format!("Sats: {}", gps.sats));
-                line(format!("PPS count: {}", pps_count));
-                line(format!("PPS offset: {}us", pps_delta_us));
-            }
-            Page::Resources => {
-                let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-                let min_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
-                let largest = unsafe {
-                    esp_idf_svc::sys::heap_caps_get_largest_free_block(
-                        esp_idf_svc::sys::MALLOC_CAP_8BIT as u32,
-                    )
-                };
-                // esp_clk_cpu_freq is not exposed in current esp-idf-sys bindings.
-                // Keep resource page stable until we wire a replacement API.
-                let cpu_freq_label = "n/a";
-                let part_size_kb = unsafe {
-                    let p = esp_idf_svc::sys::esp_ota_get_running_partition();
-                    if p.is_null() {
-                        0
-                    } else {
-                        ((*p).size / 1024) as u32
-                    }
-                };
-
-                line("Page 3/4  RESOURCES".to_owned());
-                line(format!("Storage(part): {} KB", part_size_kb));
-                line(format!("Heap free: {} B", free_heap));
-                line(format!("Heap min:  {} B", min_heap));
-                line(format!("Heap block: {} B", largest));
-                line(format!("CPU freq: {}", cpu_freq_label));
-                line(format!("GPS bytes: {}", bytes_seen));
-            }
-            Page::Battery => {
-                line("Page 4/4  BATTERY".to_owned());
-                line("MAX17048 over I2C".to_owned());
-                line(format!("Voltage: {:.3} V", battery.voltage_v));
-                line(format!("Charge:  {:.1} %", battery.percent));
-                line(format!("PPS last: {} us", pps_delta_us));
-                line(format!("UTC: {}", gps.utc_time));
-            }
-        }
-    }
-
-    fn load_wifi_credentials_from_env() -> anyhow::Result<WifiCredentials> {
-        let env_ssid = option_env!("WIFI_SSID")
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned);
-        let env_pass = option_env!("WIFI_PASS")
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned);
-
-        if let (Some(ssid), Some(pass)) = (env_ssid, env_pass) {
-            log::info!("Wi-Fi STA SSID loaded: {}", ssid);
-            return Ok(WifiCredentials { ssid, pass });
-        }
-
-        bail!(
-            "No Wi-Fi credentials found. Set WIFI_SSID and WIFI_PASS in your shell before flashing."
-        );
-    }
-
-    fn connect_wifi_sta(
-        modem: esp_idf_svc::hal::modem::Modem,
-        sys_loop: EspSystemEventLoop,
-        nvs: EspDefaultNvsPartition,
-        creds: &WifiCredentials,
-    ) -> anyhow::Result<BlockingWifi<EspWifi<'static>>> {
-        let mut wifi = BlockingWifi::wrap(
-            EspWifi::new(modem, sys_loop.clone(), Some(nvs)).context("failed to create EspWifi")?,
-            sys_loop,
-        )
-        .context("failed to wrap BlockingWifi")?;
-
-        let auth_method = if creds.pass.is_empty() {
-            AuthMethod::None
-        } else {
-            AuthMethod::WPA2Personal
-        };
-
-        let cfg = Configuration::Client(ClientConfiguration {
-            ssid: creds
-                .ssid
-                .as_str()
-                .try_into()
-                .map_err(|_| anyhow!("SSID too long for ESP-IDF client config"))?,
-            password: creds
-                .pass
-                .as_str()
-                .try_into()
-                .map_err(|_| anyhow!("password too long for ESP-IDF client config"))?,
-            auth_method,
-            ..Default::default()
-        });
-
-        wifi.set_configuration(&cfg)
-            .context("failed to set Wi-Fi STA configuration")?;
-
-        wifi.start().context("failed to start Wi-Fi driver")?;
-        wifi.connect().context("failed to connect Wi-Fi STA")?;
-        wifi.wait_netif_up()
-            .context("Wi-Fi netif did not come up")?;
-
-        let ip_info = wifi
-            .wifi()
-            .sta_netif()
-            .get_ip_info()
-            .context("failed to read DHCP IP info")?;
-        log::info!("Wi-Fi connected; STA IP: {}", ip_info.ip);
-
-        Ok(wifi)
-    }
 
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
-    let wifi_creds = load_wifi_credentials_from_env()?;
+    let wifi_creds = wifi::load_wifi_credentials_from_env()?;
 
     let peripherals = Peripherals::take().context("failed to take ESP32 peripherals")?;
     let modem = peripherals.modem;
@@ -434,27 +37,28 @@ fn main() -> anyhow::Result<()> {
 
     let default_nvs = EspDefaultNvsPartition::take()
         .context("failed to take default NVS partition for Wi-Fi")?;
-    let sys_loop = EspSystemEventLoop::take().context("failed to take system event loop")?;
-    let _wifi = connect_wifi_sta(modem, sys_loop, default_nvs, &wifi_creds)?;
+    let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()
+        .context("failed to take system event loop")?;
+    let _wifi = wifi::connect_wifi_sta(modem, sys_loop, default_nvs, &wifi_creds)?;
 
-    // GPS FeatherWing default UART speed is 9600 baud.
-    // Current board pin mapping under test: Feather TX/RX -> GPIO1/GPIO2.
     const GPS_UART_TX_PIN: i32 = 1;
     const GPS_UART_RX_PIN: i32 = 2;
-    const PPS_GPIO_PIN: i32 = 13;
+    const PPS_GPIO_PIN: i32 = 12;
     let uart_cfg = uart::config::Config::default().baudrate(Hertz(9_600));
     let gps_uart = UartDriver::new(
         uart1,
-        pins.gpio1, // TX -> GPS RX
-        pins.gpio2, // RX <- GPS TX
+        pins.gpio1,
+        pins.gpio2,
         Option::<gpio::Gpio0>::None,
         Option::<gpio::Gpio1>::None,
         &uart_cfg,
     )
     .context("failed to initialize GPS UART diagnostics")?;
+
     let i2c_cfg = i2c::config::Config::new().baudrate(100.kHz().into());
     let mut i2c_drv = i2c::I2cDriver::new(i2c0, pins.gpio3, pins.gpio4, &i2c_cfg)
         .context("failed to initialize I2C for battery monitor")?;
+
     let mut tft_power =
         PinDriver::output(pins.gpio21).context("failed to init TFT power enable")?;
     tft_power
@@ -463,10 +67,10 @@ fn main() -> anyhow::Result<()> {
 
     let spi_drv = spi::SpiDeviceDriver::new_single(
         spi2,
-        pins.gpio36,            // TFT SCK
-        pins.gpio35,            // TFT MOSI
-        None::<gpio::Gpio37>,   // TFT MISO unused
-        Some(pins.gpio7),       // TFT CS (S2/S3 TFT Feather)
+        pins.gpio36,
+        pins.gpio35,
+        None::<gpio::Gpio37>,
+        Some(pins.gpio7),
         &spi::config::DriverConfig::new(),
         &spi::config::Config::new().baudrate(40.MHz().into()),
     )
@@ -480,62 +84,19 @@ fn main() -> anyhow::Result<()> {
     let di = SPIInterfaceNoCS::new(spi_drv, dc);
     let mut display = ST7789::new(di, Some(rst), Some(backlight), 240, 135);
     let mut ets = Ets;
-    display
-        .init(&mut ets)
-        .map_err(|e| anyhow!("failed to initialize ST7789 display: {:?}", e))?;
-    log::info!("Display init: ST7789 initialized");
-    display
-        .set_orientation(Orientation::LandscapeSwapped)
-        .map_err(|e| anyhow!("failed to set display orientation: {:?}", e))?;
-    log::info!("Display init: orientation set to LandscapeSwapped (CP rot=270)");
-    let backlight_on_state = if DISPLAY_BACKLIGHT_ACTIVE_LOW {
-        BacklightState::Off
-    } else {
-        BacklightState::On
-    };
-    let _ = display.set_backlight(backlight_on_state, &mut ets);
-    log::info!(
-        "Display init: backlight forced on (active_low={})",
-        DISPLAY_BACKLIGHT_ACTIVE_LOW
-    );
-
-    // Draw a bright boot test pattern so display bring-up issues are obvious.
-    let mut panel = OffsetDisplay::new(
-        &mut display,
-        DISPLAY_X_OFFSET as u16,
-        DISPLAY_Y_OFFSET as u16,
-        240,
-        135,
-    );
-    let _ = Rectangle::new(Point::new(0, 0), Size::new(240, 45))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-        .draw(&mut panel);
-    let _ = Rectangle::new(Point::new(0, 45), Size::new(240, 45))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
-        .draw(&mut panel);
-    let _ = Rectangle::new(Point::new(0, 90), Size::new(240, 45))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-        .draw(&mut panel);
-    let boot_style = MonoTextStyleBuilder::new()
-        .font(&FONT_8X13_BOLD)
-        .text_color(Rgb565::WHITE)
-        .build();
-    let _ = Text::new("Display boot test", Point::new(8, 20), boot_style).draw(&mut panel);
-    log::info!(
-        "Display init: applying viewport offsets x={} y={}",
-        DISPLAY_X_OFFSET,
-        DISPLAY_Y_OFFSET
-    );
-    log::info!("Display init: boot test pattern drawn");
-    FreeRtos::delay_ms(800);
+    let backlight_on_state = display::init_display(&mut display, &mut ets)?;
+    {
+        let mut panel = display::make_panel(&mut display);
+        display::draw_boot_test(&mut panel);
+    }
 
     let mut rx_buf = [0_u8; 256];
     let mut line_buf = String::new();
     let mut bytes_seen: u64 = 0;
-    let mut gps = GpsSnapshot::default();
-    let mut battery = BatterySnapshot::default();
+    let mut gps = gps::GpsSnapshot::default();
+    let mut battery = battery::BatterySnapshot::default();
     let mut pps_pin =
-        PinDriver::input(pins.gpio13).context("failed to initialize PPS input pin")?;
+        PinDriver::input(pins.gpio12).context("failed to initialize PPS input pin")?;
     let pps_edge_us = Arc::new(AtomicU32::new(0));
     let pps_count = Arc::new(AtomicU32::new(0));
     let pps_edge_us_isr = Arc::clone(&pps_edge_us);
@@ -588,16 +149,12 @@ fn main() -> anyhow::Result<()> {
                             let line: String = line_buf.drain(..=newline_idx).collect();
                             let trimmed = line.trim();
                             if trimmed.starts_with('$') {
-                                // log::info!("GPS NMEA: {}", trimmed);
                                 if trimmed.starts_with("$GNRMC") || trimmed.starts_with("$GPRMC") {
-                                    let _ = parse_rmc(trimmed, &mut gps);
-                                    if !gps.utc_time.is_empty() {
-                                        // log::info!("GPS UTC: {} {}", gps.utc_date, gps.utc_time);
-                                    }
+                                    let _ = gps::parse_rmc(trimmed, &mut gps);
                                 } else if trimmed.starts_with("$GNGGA")
                                     || trimmed.starts_with("$GPGGA")
                                 {
-                                    let _ = parse_gga(trimmed, &mut gps);
+                                    let _ = gps::parse_gga(trimmed, &mut gps);
                                 }
                             }
                         }
@@ -617,17 +174,15 @@ fn main() -> anyhow::Result<()> {
         if current_pps_count > last_logged_pps_count {
             let now_us = pps_edge_us.load(Ordering::Relaxed);
             if last_logged_pps_us > 0 {
-                let delta = now_us.wrapping_sub(last_logged_pps_us);
-                pps_delta_us = delta;
-                // log::info!("PPS pulse #{} delta={}us", current_pps_count, delta);
+                pps_delta_us = now_us.wrapping_sub(last_logged_pps_us);
+                log::info!("PPS pulse #{} delta={}us", current_pps_count, pps_delta_us);
             } else {
-                // log::info!("PPS pulse #{} detected", current_pps_count);
+                log::info!("PPS pulse #{} detected", current_pps_count);
             }
 
             last_logged_pps_count = current_pps_count;
             last_logged_pps_us = now_us;
 
-            // This HAL disables the GPIO interrupt after each event; re-enable from task context.
             if let Err(err) = pps_pin.enable_interrupt() {
                 log::warn!("Failed to re-enable PPS interrupt: {}", err);
             }
@@ -635,7 +190,7 @@ fn main() -> anyhow::Result<()> {
 
         let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
         if last_battery_us == 0 || (now_us - last_battery_us) >= 5_000_000 {
-            if let Some(reading) = read_battery(&mut i2c_drv) {
+            if let Some(reading) = battery::read_battery(&mut i2c_drv) {
                 battery = reading;
             }
             last_battery_us = now_us;
@@ -654,25 +209,15 @@ fn main() -> anyhow::Result<()> {
         }
         last_button_pressed = button_pressed;
 
-        if !DISPLAY_DEBUG_ALWAYS_ON && screen_on && (now_us - last_interaction_us) >= 15_000_000 {
+        if !display::DISPLAY_DEBUG_ALWAYS_ON && screen_on && (now_us - last_interaction_us) >= 15_000_000
+        {
             screen_on = false;
-            let backlight_off_state = if DISPLAY_BACKLIGHT_ACTIVE_LOW {
-                BacklightState::On
-            } else {
-                BacklightState::Off
-            };
-            let _ = display.set_backlight(backlight_off_state, &mut ets);
+            let _ = display.set_backlight(display::backlight_off_state(), &mut ets);
         }
 
-        if screen_on && (force_redraw || (now_us - last_draw_us) >= 2_000_000) {
-            let mut panel = OffsetDisplay::new(
-                &mut display,
-                DISPLAY_X_OFFSET as u16,
-                DISPLAY_Y_OFFSET as u16,
-                240,
-                135,
-            );
-            draw_page(
+        if screen_on && (force_redraw || (now_us - last_draw_us) >= 5_000_000) {
+            let mut panel = display::make_panel(&mut display);
+            display::draw_page(
                 &mut panel,
                 current_page,
                 &gps,
@@ -693,17 +238,7 @@ fn main() -> anyhow::Result<()> {
                     esp_idf_svc::sys::MALLOC_CAP_8BIT as u32,
                 )
             };
-
             let _ = (free_heap, min_free_heap, largest_block, current_pps_count, bytes_seen);
-            // log::info!(
-            //     "RES diag: free_heap={}B min_free_heap={}B largest_8bit_block={}B pps_count={} gps_bytes={}",
-            //     free_heap,
-            //     min_free_heap,
-            //     largest_block,
-            //     current_pps_count,
-            //     bytes_seen
-            // );
-
             last_diag_us = now_us;
         }
 
