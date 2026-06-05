@@ -1,0 +1,8 @@
+#
+# ESP-IDF defaults for this Rust firmware.
+# Keep these minimal and focused on runtime stability.
+#
+
+# Rust app_main has substantial stack usage (Wi-Fi, display, parsing, logging).
+# Prevent early reboot loops from main task stack overflow.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384

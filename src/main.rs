@@ -5,7 +5,7 @@ fn main() -> anyhow::Result<()> {
     use core::sync::atomic::{AtomicU32, Ordering};
     use anyhow::{anyhow, bail, Context};
     use display_interface_spi::SPIInterfaceNoCS;
-    use embedded_graphics::mono_font::ascii::FONT_6X10;
+    use embedded_graphics::mono_font::ascii::FONT_8X13_BOLD;
     use embedded_graphics::mono_font::MonoTextStyleBuilder;
     use embedded_graphics::pixelcolor::Rgb565;
     use embedded_graphics::prelude::*;
@@ -23,7 +23,7 @@ fn main() -> anyhow::Result<()> {
     use esp_idf_svc::wifi::{
         AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi,
     };
-    use st7789::{Orientation, ST7789};
+    use st7789::{BacklightState, Orientation, ST7789};
     use std::sync::Arc;
 
     #[derive(Debug, Clone)]
@@ -55,6 +55,103 @@ fn main() -> anyhow::Result<()> {
         Location,
         Resources,
         Battery,
+    }
+
+    const DISPLAY_DEBUG_ALWAYS_ON: bool = true;
+    const DISPLAY_BACKLIGHT_ACTIVE_LOW: bool = false;
+    // CircuitPython-style viewport offsets for the 1.14" 240x135 ST7789.
+    const DISPLAY_X_OFFSET: i32 = 40;
+    const DISPLAY_Y_OFFSET: i32 = 52;
+
+    struct OffsetDisplay<'a, DI, RST, BL>
+    where
+        DI: display_interface::WriteOnlyDataCommand,
+        RST: embedded_hal_02::digital::v2::OutputPin,
+        BL: embedded_hal_02::digital::v2::OutputPin,
+    {
+        inner: &'a mut ST7789<DI, RST, BL>,
+        x_off: u16,
+        y_off: u16,
+        width: u16,
+        height: u16,
+    }
+
+    impl<'a, DI, RST, BL> OffsetDisplay<'a, DI, RST, BL>
+    where
+        DI: display_interface::WriteOnlyDataCommand,
+        RST: embedded_hal_02::digital::v2::OutputPin,
+        BL: embedded_hal_02::digital::v2::OutputPin,
+    {
+        fn new(
+            inner: &'a mut ST7789<DI, RST, BL>,
+            x_off: u16,
+            y_off: u16,
+            width: u16,
+            height: u16,
+        ) -> Self {
+            Self {
+                inner,
+                x_off,
+                y_off,
+                width,
+                height,
+            }
+        }
+    }
+
+    impl<'a, DI, RST, BL> OriginDimensions for OffsetDisplay<'a, DI, RST, BL>
+    where
+        DI: display_interface::WriteOnlyDataCommand,
+        RST: embedded_hal_02::digital::v2::OutputPin,
+        BL: embedded_hal_02::digital::v2::OutputPin,
+    {
+        fn size(&self) -> Size {
+            Size::new(self.width as u32, self.height as u32)
+        }
+    }
+
+    impl<'a, DI, RST, BL, PinE> DrawTarget for OffsetDisplay<'a, DI, RST, BL>
+    where
+        DI: display_interface::WriteOnlyDataCommand,
+        RST: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
+        BL: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
+        ST7789<DI, RST, BL>: DrawTarget<Color = Rgb565, Error = st7789::Error<PinE>>,
+    {
+        type Color = Rgb565;
+        type Error = st7789::Error<PinE>;
+
+        fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+        where
+            I: IntoIterator<Item = Pixel<Self::Color>>,
+        {
+            let x_off = self.x_off as i32;
+            let y_off = self.y_off as i32;
+            let width = self.width as i32;
+            let height = self.height as i32;
+
+            let mapped = pixels.into_iter().filter_map(move |Pixel(p, c)| {
+                if p.x < 0 || p.y < 0 || p.x >= width || p.y >= height {
+                    None
+                } else {
+                    Some(Pixel(Point::new(p.x + x_off, p.y + y_off), c))
+                }
+            });
+
+            self.inner.draw_iter(mapped)
+        }
+
+        fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
+            let x_off = self.x_off as i32;
+            let y_off = self.y_off as i32;
+            let width = self.width as i32;
+            let height = self.height as i32;
+
+            let pixels = (0..height).flat_map(move |y| {
+                (0..width).map(move |x| Pixel(Point::new(x + x_off, y + y_off), color))
+            });
+
+            self.inner.draw_iter(pixels)
+        }
     }
 
     impl Page {
@@ -172,23 +269,29 @@ fn main() -> anyhow::Result<()> {
         Some(BatterySnapshot { voltage_v, percent })
     }
 
-    fn draw_page<D>(display: &mut D, page: Page, gps: &GpsSnapshot, battery: &BatterySnapshot, pps_delta_us: u32, pps_count: u32, bytes_seen: u64)
+    fn draw_page<D>(
+        display: &mut D,
+        page: Page,
+        gps: &GpsSnapshot,
+        battery: &BatterySnapshot,
+        pps_delta_us: u32,
+        pps_count: u32,
+        bytes_seen: u64,
+    )
     where
         D: DrawTarget<Color = Rgb565>,
     {
         let style = MonoTextStyleBuilder::new()
-            .font(&FONT_6X10)
+            .font(&FONT_8X13_BOLD)
             .text_color(Rgb565::WHITE)
             .build();
 
-        let _ = Rectangle::new(Point::new(0, 0), Size::new(240, 135))
-            .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
-            .draw(display);
+        let _ = display.clear(Rgb565::BLACK);
 
-        let mut y = 14_i32;
+        let mut y = 14;
         let mut line = |text: String| {
             let _ = Text::new(&text, Point::new(4, y), style).draw(display);
-            y += 12;
+            y += 14;
         };
 
         match page {
@@ -216,7 +319,9 @@ fn main() -> anyhow::Result<()> {
                         esp_idf_svc::sys::MALLOC_CAP_8BIT as u32,
                     )
                 };
-                let cpu_mhz = unsafe { esp_idf_svc::sys::esp_clk_cpu_freq() / 1_000_000 };
+                // esp_clk_cpu_freq is not exposed in current esp-idf-sys bindings.
+                // Keep resource page stable until we wire a replacement API.
+                let cpu_freq_label = "n/a";
                 let part_size_kb = unsafe {
                     let p = esp_idf_svc::sys::esp_ota_get_running_partition();
                     if p.is_null() {
@@ -231,7 +336,7 @@ fn main() -> anyhow::Result<()> {
                 line(format!("Heap free: {} B", free_heap));
                 line(format!("Heap min:  {} B", min_heap));
                 line(format!("Heap block: {} B", largest));
-                line(format!("CPU freq: {} MHz", cpu_mhz));
+                line(format!("CPU freq: {}", cpu_freq_label));
                 line(format!("GPS bytes: {}", bytes_seen));
             }
             Page::Battery => {
@@ -350,30 +455,79 @@ fn main() -> anyhow::Result<()> {
     let i2c_cfg = i2c::config::Config::new().baudrate(100.kHz().into());
     let mut i2c_drv = i2c::I2cDriver::new(i2c0, pins.gpio3, pins.gpio4, &i2c_cfg)
         .context("failed to initialize I2C for battery monitor")?;
+    let mut tft_power =
+        PinDriver::output(pins.gpio21).context("failed to init TFT power enable")?;
+    tft_power
+        .set_high()
+        .context("failed to enable TFT power rail")?;
+
     let spi_drv = spi::SpiDeviceDriver::new_single(
         spi2,
         pins.gpio36,            // TFT SCK
         pins.gpio35,            // TFT MOSI
         None::<gpio::Gpio37>,   // TFT MISO unused
-        Some(pins.gpio7),       // TFT CS
+        Some(pins.gpio7),       // TFT CS (S2/S3 TFT Feather)
         &spi::config::DriverConfig::new(),
         &spi::config::Config::new().baudrate(40.MHz().into()),
     )
     .context("failed to initialize SPI for TFT")?;
     let dc = PinDriver::output(pins.gpio39).context("failed to init TFT DC")?;
     let rst = PinDriver::output(pins.gpio40).context("failed to init TFT RST")?;
-    let mut backlight = PinDriver::output(pins.gpio45).context("failed to init TFT backlight")?;
+    let backlight = PinDriver::output(pins.gpio45).context("failed to init TFT backlight")?;
     let mut button = PinDriver::input(pins.gpio0).context("failed to init page button")?;
     button.set_pull(Pull::Up).ok();
 
     let di = SPIInterfaceNoCS::new(spi_drv, dc);
-    let mut display = ST7789::new(di, Some(rst), 240, 135);
+    let mut display = ST7789::new(di, Some(rst), Some(backlight), 240, 135);
     let mut ets = Ets;
-    display.init(&mut ets).context("failed to initialize ST7789 display")?;
     display
-        .set_orientation(Orientation::Landscape)
-        .context("failed to set display orientation")?;
-    backlight.set_high().ok();
+        .init(&mut ets)
+        .map_err(|e| anyhow!("failed to initialize ST7789 display: {:?}", e))?;
+    log::info!("Display init: ST7789 initialized");
+    display
+        .set_orientation(Orientation::LandscapeSwapped)
+        .map_err(|e| anyhow!("failed to set display orientation: {:?}", e))?;
+    log::info!("Display init: orientation set to LandscapeSwapped (CP rot=270)");
+    let backlight_on_state = if DISPLAY_BACKLIGHT_ACTIVE_LOW {
+        BacklightState::Off
+    } else {
+        BacklightState::On
+    };
+    let _ = display.set_backlight(backlight_on_state, &mut ets);
+    log::info!(
+        "Display init: backlight forced on (active_low={})",
+        DISPLAY_BACKLIGHT_ACTIVE_LOW
+    );
+
+    // Draw a bright boot test pattern so display bring-up issues are obvious.
+    let mut panel = OffsetDisplay::new(
+        &mut display,
+        DISPLAY_X_OFFSET as u16,
+        DISPLAY_Y_OFFSET as u16,
+        240,
+        135,
+    );
+    let _ = Rectangle::new(Point::new(0, 0), Size::new(240, 45))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
+        .draw(&mut panel);
+    let _ = Rectangle::new(Point::new(0, 45), Size::new(240, 45))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
+        .draw(&mut panel);
+    let _ = Rectangle::new(Point::new(0, 90), Size::new(240, 45))
+        .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
+        .draw(&mut panel);
+    let boot_style = MonoTextStyleBuilder::new()
+        .font(&FONT_8X13_BOLD)
+        .text_color(Rgb565::WHITE)
+        .build();
+    let _ = Text::new("Display boot test", Point::new(8, 20), boot_style).draw(&mut panel);
+    log::info!(
+        "Display init: applying viewport offsets x={} y={}",
+        DISPLAY_X_OFFSET,
+        DISPLAY_Y_OFFSET
+    );
+    log::info!("Display init: boot test pattern drawn");
+    FreeRtos::delay_ms(800);
 
     let mut rx_buf = [0_u8; 256];
     let mut line_buf = String::new();
@@ -434,11 +588,11 @@ fn main() -> anyhow::Result<()> {
                             let line: String = line_buf.drain(..=newline_idx).collect();
                             let trimmed = line.trim();
                             if trimmed.starts_with('$') {
-                                log::info!("GPS NMEA: {}", trimmed);
+                                // log::info!("GPS NMEA: {}", trimmed);
                                 if trimmed.starts_with("$GNRMC") || trimmed.starts_with("$GPRMC") {
                                     let _ = parse_rmc(trimmed, &mut gps);
                                     if !gps.utc_time.is_empty() {
-                                        log::info!("GPS UTC: {} {}", gps.utc_date, gps.utc_time);
+                                        // log::info!("GPS UTC: {} {}", gps.utc_date, gps.utc_time);
                                     }
                                 } else if trimmed.starts_with("$GNGGA")
                                     || trimmed.starts_with("$GPGGA")
@@ -465,9 +619,9 @@ fn main() -> anyhow::Result<()> {
             if last_logged_pps_us > 0 {
                 let delta = now_us.wrapping_sub(last_logged_pps_us);
                 pps_delta_us = delta;
-                log::info!("PPS pulse #{} delta={}us", current_pps_count, delta);
+                // log::info!("PPS pulse #{} delta={}us", current_pps_count, delta);
             } else {
-                log::info!("PPS pulse #{} detected", current_pps_count);
+                // log::info!("PPS pulse #{} detected", current_pps_count);
             }
 
             last_logged_pps_count = current_pps_count;
@@ -491,7 +645,7 @@ fn main() -> anyhow::Result<()> {
         if button_pressed && !last_button_pressed {
             if !screen_on {
                 screen_on = true;
-                backlight.set_high().ok();
+                let _ = display.set_backlight(backlight_on_state, &mut ets);
             } else {
                 current_page = current_page.next();
             }
@@ -500,14 +654,26 @@ fn main() -> anyhow::Result<()> {
         }
         last_button_pressed = button_pressed;
 
-        if screen_on && (now_us - last_interaction_us) >= 15_000_000 {
+        if !DISPLAY_DEBUG_ALWAYS_ON && screen_on && (now_us - last_interaction_us) >= 15_000_000 {
             screen_on = false;
-            backlight.set_low().ok();
+            let backlight_off_state = if DISPLAY_BACKLIGHT_ACTIVE_LOW {
+                BacklightState::On
+            } else {
+                BacklightState::Off
+            };
+            let _ = display.set_backlight(backlight_off_state, &mut ets);
         }
 
-        if screen_on && (force_redraw || (now_us - last_draw_us) >= 1_000_000) {
-            draw_page(
+        if screen_on && (force_redraw || (now_us - last_draw_us) >= 2_000_000) {
+            let mut panel = OffsetDisplay::new(
                 &mut display,
+                DISPLAY_X_OFFSET as u16,
+                DISPLAY_Y_OFFSET as u16,
+                240,
+                135,
+            );
+            draw_page(
+                &mut panel,
                 current_page,
                 &gps,
                 &battery,
@@ -528,14 +694,15 @@ fn main() -> anyhow::Result<()> {
                 )
             };
 
-            log::info!(
-                "RES diag: free_heap={}B min_free_heap={}B largest_8bit_block={}B pps_count={} gps_bytes={}",
-                free_heap,
-                min_free_heap,
-                largest_block,
-                current_pps_count,
-                bytes_seen
-            );
+            let _ = (free_heap, min_free_heap, largest_block, current_pps_count, bytes_seen);
+            // log::info!(
+            //     "RES diag: free_heap={}B min_free_heap={}B largest_8bit_block={}B pps_count={} gps_bytes={}",
+            //     free_heap,
+            //     min_free_heap,
+            //     largest_block,
+            //     current_pps_count,
+            //     bytes_seen
+            // );
 
             last_diag_us = now_us;
         }
