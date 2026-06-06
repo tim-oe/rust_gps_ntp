@@ -10,8 +10,17 @@ GPS-disciplined Stratum-1 NTP server firmware written in Rust for the ESP32-S3 p
 | RMC sentence | [GPRMC field layout (gpsd)](https://gpsd.gitlab.io/gpsd/NMEA.html#_rmc_recommended_minimum_navigation_information) |
 | GGA sentence | [GPGGA field layout (gpsd)](https://gpsd.gitlab.io/gpsd/NMEA.html#_gga_global_positioning_system_fix_data) |
 | NTPv4 protocol | [RFC 5905 – Network Time Protocol Version 4](https://www.rfc-editor.org/rfc/rfc5905) |
+| NTPv4 clock discipline algorithm | [RFC 5905 §11 – Poll Process and Clock Discipline](https://www.rfc-editor.org/rfc/rfc5905#section-11) |
+| NTPv4 data types (timestamp format) | [RFC 5905 §6 – Data Types](https://www.rfc-editor.org/rfc/rfc5905#section-6) |
+| NTPv4 on-wire packet format | [RFC 5905 §7.3 – NTP Extension Fields](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
+| Root dispersion definition | [RFC 5905 §11.1 – Clock Discipline Procedures](https://www.rfc-editor.org/rfc/rfc5905#section-11.1) |
+| Leap indicator and stratum encoding | [RFC 5905 §7.3 – Packet Header Variables](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
 | NTP mode-6 control | [RFC 1305 §3.2 – Control Messages](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) · [ntpq reference](https://www.ntp.org/documentation/4.2.8-series/ntpq/) |
-| NTP timestamp format | [RFC 5905 §6 – Data Types](https://www.rfc-editor.org/rfc/rfc5905#section-6) |
+| PLL/FLL clock servo theory | [D. L. Mills, "Internet Time Synchronization: the Network Time Protocol", IEEE Trans. Comm. 1991](https://www.eecis.udel.edu/~mills/database/papers/trans.pdf) |
+| NTP clock filter and combine algorithms | [D. L. Mills, "Improved Algorithms for Synchronizing Computer Network Clocks", IEEE/ACM Trans. Netw. 1995](https://www.eecis.udel.edu/~mills/database/papers/tune2.pdf) |
+| NTP project clock discipline notes | [NTP 4.2.8 Clock Discipline](https://www.ntp.org/documentation/4.2.8-series/discipline/) |
+| Holdover / frequency stability characterization | [NIST Technical Note 1337 – Characterization of Clocks and Oscillators](https://tf.nist.gov/general/pdf/868.pdf) |
+| GPS PPS signal specification | [NMEA 0183 §8 / MTK3339 datasheet](https://cdn-shop.adafruit.com/datasheets/GlobalTop-FGPMMOPA6H-Datasheet-V0A.pdf) |
 | ESP32-S3 technical reference | [ESP32-S3 Technical Reference Manual (Espressif)](https://www.espressif.com/sites/default/files/documentation/esp32-s3_technical_reference_manual_en.pdf) |
 | esp-idf-svc (ESP-IDF Rust bindings) | [esp-idf-svc on crates.io](https://crates.io/crates/esp-idf-svc) · [GitHub](https://github.com/esp-rs/esp-idf-svc) · [API docs](https://docs.rs/esp-idf-svc) |
 | esp-idf-sys (low-level C bindings) | [esp-idf-sys on crates.io](https://crates.io/crates/esp-idf-sys) · [API docs](https://docs.rs/esp-idf-sys) |
@@ -69,14 +78,24 @@ GPIO12 rising-edge ISR
 PpsMonitor::record_edge()
     │  polled each loop iteration by PpsMonitor::poll()
     ▼
-NtpServer::observe_pps_pulse()   (advances ClockAnchor by 1 s per valid pulse)
+NtpServer::observe_pps_pulse()
+    │  First pulse: align anchor to GPS UTC
+    │  Subsequent pulses: PLL servo update
+    │    - proportional path: nudge anchor.monotonic_us by Kp × phase_error
+    │    - integral path:     freq_ppm += Ki × phase_error
+    └──► UiFeed::publish_ntp(ntp_snapshot)     (discipline metrics for display)
 
 UDP port 123 (nonblocking)
     │  NTP client requests (mode 3/4) or ntpq control queries (mode 6)
     ▼
 NtpServer::poll()
+    │  discipline_params() → DisciplineParams { stratum, leap, root_disp_short }
+    │  current_ntp_timestamp() → freq-corrected NTP timestamp
     │  build_response() / build_mode6_response()
     └──► UDP send to client
+
+Main loop (every 1 s when no PPS, or on each PPS event)
+    └──► UiFeed::publish_ntp(ntp_snapshot)     (keeps holdover dispersion live on display)
 ```
 
 ---
@@ -134,24 +153,67 @@ A valid interval is defined as `800_000 µs ≤ interval ≤ 1_200_000 µs` (±2
 
 ### `ntp` – NTPv4 Server
 
-**Relevant spec:** [RFC 5905 – Network Time Protocol Version 4](https://www.rfc-editor.org/rfc/rfc5905)
+**Relevant specs:**
+- [RFC 5905 – Network Time Protocol Version 4](https://www.rfc-editor.org/rfc/rfc5905)
+- [RFC 5905 §11 – Clock Discipline Procedures](https://www.rfc-editor.org/rfc/rfc5905#section-11)
+- [RFC 1305 §3.2 – Mode-6 Control Messages](https://www.rfc-editor.org/rfc/rfc1305#section-3.2)
+- [D. L. Mills, "Internet Time Synchronization: the Network Time Protocol", IEEE Trans. Comm. 1991](https://www.eecis.udel.edu/~mills/database/papers/trans.pdf)
 
-#### Clock Discipline
+#### Clock Discipline and PLL Servo
 
-Two inputs feed the `ClockAnchor`:
+The clock discipline is a simplified type-2 PLL/FLL hybrid ([RFC 5905 §11](https://www.rfc-editor.org/rfc/rfc5905#section-11), Mills 1991) operating on two inputs:
 
-1. **GPS UTC seconds** (from RMC, ~1 Hz): Sets or re-anchors the monotonic-to-UTC mapping. Re-anchoring only occurs when the predicted UTC from the current anchor diverges from GPS by more than 1 second, avoiding unnecessary jumps.
-2. **PPS interval** (from GPIO ISR, 1 Hz): The first pulse aligns the anchor to the latest GPS UTC second. Subsequent valid pulses increment `anchor.unix_seconds` by 1 and update `anchor.monotonic_us` to the pulse edge.
+1. **GPS UTC seconds** (from RMC, ~1 Hz): Sets or re-anchors the monotonic-to-UTC mapping. Re-anchoring only occurs when the predicted UTC diverges by more than 1 second, avoiding unnecessary jumps.
+2. **PPS interval** (from GPIO ISR, 1 Hz): Runs the full servo on each valid pulse.
 
-Current NTP timestamp is computed from the anchor:
+**Servo update on each PPS pulse** (interval `I` in microseconds):
 
 ```
-ntp_seconds = anchor.unix_seconds + elapsed_seconds + NTP_UNIX_EPOCH_OFFSET (2208988800)
-ntp_fraction = elapsed_remainder_us * (2^32 / 1_000_000)
+phase_error_us = I − 1_000_000
+
+// Proportional path: nudge the anchor's monotonic reference
+anchor.monotonic_us = pulse_edge_us − (phase_error_us × Kp)
+
+// Integral path: accumulate oscillator frequency estimate
+freq_ppm += phase_error_us × Ki
+freq_ppm = clamp(freq_ppm, −500, +500)
+```
+
+Constants: `Kp = 0.1`, `Ki = 0.01`. Positive `freq_ppm` means the monotonic oscillator runs fast relative to GPS.
+
+**Frequency-corrected timestamps**: elapsed monotonic time is scaled before computing sub-second fractions:
+
+```
+corrected_elapsed_us = raw_elapsed_us × (1 − freq_ppm / 1_000_000)
+```
+
+This removes accumulated oscillator drift between PPS pulses, improving timestamp accuracy during the inter-pulse interval.
+
+#### Holdover State Machine
+
+When PPS pulses stop arriving, the server enters holdover and continues serving time from the last known anchor with growing uncertainty ([RFC 5905 §11.1](https://www.rfc-editor.org/rfc/rfc5905#section-11.1)):
+
+| PPS age | State | Stratum | Root dispersion |
+|---|---|---|---|
+| < 10 s | `Locked` | 1 | 1 ms (base) |
+| 10 s – ~33 min | `Holdover` | 1 | 1 ms + 0.5 ms/s |
+| > ~33 min (disp ≥ 1 s) | `Unsync` | 16 | capped at 2 s |
+
+- **Dispersion growth rate**: 0.5 ms/s (`HOLDOVER_DISP_RATE_US_PER_SEC = 500 µs/s`). After 60 s in holdover the dispersion is ≈31 ms; clients can decide whether to trust it based on their own `maxdist` policy.
+- **Stratum demotion threshold**: 1 s of root dispersion triggers `stratum=16` and `LI=11` (alarm), consistent with RFC 5905 §11.1.
+- **Recovery**: stratum returns to 1 immediately upon the next valid PPS pulse.
+
+The `DisciplineState` enum (`Locked` / `Holdover` / `Unsync`) is published via `NtpSnapshot` to the display task.
+
+#### NTP Timestamp Format
+
+Per [RFC 5905 §6](https://www.rfc-editor.org/rfc/rfc5905#section-6): 32-bit seconds since 1900-01-01 followed by 32-bit sub-second fraction.
+
+```
+ntp_seconds  = anchor.unix_seconds + corrected_elapsed_seconds + 2_208_988_800
+ntp_fraction = corrected_remainder_us × (2³² / 1_000_000)
 ntp_timestamp = (ntp_seconds << 32) | ntp_fraction
 ```
-
-The 64-bit NTP timestamp format is defined in [RFC 5905 §6](https://www.rfc-editor.org/rfc/rfc5905#section-6): 32 bits of seconds since 1900-01-01 followed by 32 bits of sub-second fraction.
 
 #### Packet Building (`build_response`)
 
@@ -160,32 +222,30 @@ Standard mode-3 client → mode-4 server exchange per [RFC 5905 §7.3](https://w
 | Byte offset | Field | Value (synced) |
 |---|---|---|
 | 0 | LI/VN/Mode | LI=0, VN mirrored from client, Mode=4 |
-| 1 | Stratum | 1 (GPS primary reference) |
+| 1 | Stratum | 1 (GPS primary reference) or 16 (unsync) |
 | 2 | Poll | mirrored from client |
 | 3 | Precision | −20 (≈1 µs) |
 | 4–7 | Root Delay | 0 |
-| 8–11 | Root Dispersion | 1/65536 s (synced) or 5/65536 s (unsynced) |
-| 12–15 | Reference ID | `GPS\0` (synced) or `INIT` (unsynced) |
+| 8–11 | Root Dispersion | computed from servo state (16.16 NTP short format) |
+| 12–15 | Reference ID | `GPS\0` (stratum 1) or `INIT` (stratum 16) |
 | 16–23 | Reference Timestamp | server receive timestamp |
 | 24–31 | Originate Timestamp | client transmit timestamp (echoed) |
 | 32–39 | Receive Timestamp | server receive timestamp |
 | 40–47 | Transmit Timestamp | filled immediately before send |
-
-When GPS fix or PPS lock is absent, stratum is set to 16 (unsynchronised) and LI to `11` (alarm).
 
 #### Mode-6 Diagnostics
 
 Mode-6 (control) packets from `ntpq` are answered with a minimal subset of opcodes:
 
 - **READSTAT (op=1)**: Returns one pseudo-association entry so `ntpq -p` can proceed.
-- **READVAR (op=2, assoc=0)**: System variables (`stratum`, `refid`, `precision`, `rootdelay`, `rootdisp`).
+- **READVAR (op=2, assoc=0)**: System variables (`stratum`, `leap`, `refid`, `precision`, `rootdelay`, `rootdisp`). Dispersion reflects current holdover state.
 - **READVAR (op=2, assoc=1)**: Peer variables including live PPS offset, jitter, and processing delay (EWMA smoothed, α=0.2).
 
 **Reference:** [RFC 1305 §3.2](https://www.rfc-editor.org/rfc/rfc1305#section-3.2)
 
 #### Jitter and Delay Tracking
 
-Both `pps_jitter_us` and `proc_delay_us` are maintained as exponentially weighted moving averages with coefficient α=0.2 (80% weight on history). The PPS offset is the deviation of the measured 1-second interval from 1,000,000 µs.
+Both `pps_jitter_us` and `proc_delay_us` are maintained as exponentially weighted moving averages with coefficient α=0.2 (80% weight on history). The PPS offset is the raw phase error `I − 1_000_000` µs; jitter is the EWMA of its absolute value.
 
 ---
 
@@ -199,10 +259,11 @@ Both `pps_jitter_us` and `proc_delay_us` are maintained as exponentially weighte
 
 | Page | Content |
 |---|---|
-| Time | Local time, date, timezone offset |
-| Location | Latitude, longitude, satellite count |
-| Resources | Flash partition size, heap free, heap minimum |
-| Battery | Voltage, charge percent, PPS offset |
+| Time (1/5) | Local time, date, timezone offset |
+| Location (2/5) | Latitude, longitude, satellite count |
+| Resources (3/5) | Flash partition size, heap free, heap minimum |
+| Battery (4/5) | Voltage, charge percent, PPS offset |
+| NTP (5/5) | Discipline state (LOCKED/HOLDOVER/UNSYNC), stratum, freq offset (ppm), PPS phase offset, jitter, root dispersion |
 
 **Boot test:** On first boot, three horizontal RGB bands (red/green/blue) are drawn to verify panel visibility, followed by an 800 ms delay.
 

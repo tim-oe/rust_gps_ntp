@@ -173,6 +173,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut tz_initialized = false;
     let mut current_tz_name: Option<String> = None;
     let mut last_tz_lookup_us = 0_i64;
+    let mut last_ntp_publish_us = 0_i64;
 
     if let Some(store) = tz_store.as_ref() {
         match store.load_cached() {
@@ -249,9 +250,20 @@ pub fn run() -> anyhow::Result<()> {
                     ntp_server.observe_pps_pulse(Some(delta));
                 }
             }
+            // Publish fresh discipline metrics whenever PPS fires (every ~1 s when locked).
+            ui_feed.publish_ntp(ntp_server.ntp_snapshot(gps.fix));
+            last_ntp_publish_us = monotonic_us();
             if let Err(err) = pps_pin.enable_interrupt() {
                 log::warn!("PPS: failed to re-enable interrupt: {}", err);
             }
+        }
+
+        // During holdover the dispersion grows with time; refresh the display
+        // snapshot every second so the UI reflects current uncertainty.
+        let now_us = monotonic_us();
+        if (now_us - last_ntp_publish_us) >= 1_000_000 {
+            ui_feed.publish_ntp(ntp_server.ntp_snapshot(gps.fix));
+            last_ntp_publish_us = now_us;
         }
 
         FreeRtos::delay_ms(10);

@@ -21,12 +21,84 @@ const MODE6_OPCODE_READSTAT: u8 = 1;
 const MODE6_OPCODE_READVAR: u8 = 2;
 const MODE6_ASSOC_ID: u16 = 1;
 
+// --- Discipline servo parameters ---
+/// Proportional gain: fraction of phase error applied to the anchor per pulse.
+const SERVO_KP: f64 = 0.1;
+/// Integral gain: fraction of phase error fed into frequency learning per pulse.
+const SERVO_KI: f64 = 0.01;
+/// Clamp on estimated frequency offset to prevent runaway corrections (ppm).
+const SERVO_MAX_FREQ_PPM: f64 = 500.0;
+
+// --- Holdover and dispersion thresholds ---
+/// Microseconds without a valid PPS pulse before holdover dispersion begins growing.
+const HOLDOVER_ENTRY_US: i64 = 10_000_000;
+/// Root dispersion growth rate in microseconds per second during holdover.
+const HOLDOVER_DISP_RATE_US_PER_SEC: i64 = 500;
+/// Base root dispersion when PPS-locked, in microseconds (1 ms).
+const BASE_DISP_US: i64 = 1_000;
+/// Maximum root dispersion cap, in microseconds (2 s).
+const MAX_DISP_US: i64 = 2_000_000;
+/// Dispersion threshold above which stratum=16 and leap=unsync are declared (1 s).
+const HOLDOVER_UNSYNC_US: i64 = 1_000_000;
+
 #[derive(Clone, Copy)]
 struct ClockAnchor {
     /// Unix epoch seconds at the anchor instant.
     unix_seconds: i64,
     /// Monotonic microseconds when the anchor was captured.
     monotonic_us: i64,
+}
+
+/// High-level discipline state for display and diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisciplineState {
+    /// GPS fix present, PPS fresh, and anchor established.
+    Locked,
+    /// PPS or GPS lost; serving from oscillator with growing uncertainty.
+    Holdover,
+    /// No anchor; cannot produce disciplined timestamps.
+    Unsync,
+}
+
+/// Snapshot of NTP discipline metrics for the display and UI task.
+#[derive(Clone, Copy)]
+pub struct NtpSnapshot {
+    pub stratum: u8,
+    pub state: DisciplineState,
+    /// Estimated oscillator frequency offset in ppm (positive = fast).
+    pub freq_ppm: f64,
+    /// Latest PPS phase error in microseconds.
+    pub pps_offset_us: i32,
+    /// Smoothed PPS jitter estimate in microseconds.
+    pub pps_jitter_us: f32,
+    /// Current root dispersion in milliseconds.
+    pub root_disp_ms: f64,
+}
+
+impl Default for NtpSnapshot {
+    fn default() -> Self {
+        Self {
+            stratum: 16,
+            state: DisciplineState::Unsync,
+            freq_ppm: 0.0,
+            pps_offset_us: 0,
+            pps_jitter_us: 0.0,
+            root_disp_ms: 5_000.0,
+        }
+    }
+}
+
+/// Discipline state derived from the PPS servo and holdover logic.
+///
+/// Used to populate stratum, leap indicator, and root dispersion fields in
+/// both standard NTP responses and mode-6 control responses.
+struct DisciplineParams {
+    stratum: u8,
+    leap: u8,
+    /// Root dispersion in NTP short format (16.16 fixed-point seconds).
+    root_disp_short: u32,
+    /// Root dispersion in milliseconds, for mode-6 text variable output.
+    root_disp_ms: f64,
 }
 
 /// Stateful NTP server engine and discipline metrics.
@@ -41,6 +113,11 @@ pub struct NtpServer {
     pps_has_sample: bool,
     proc_delay_us: f32,
     proc_delay_has_sample: bool,
+    /// Estimated oscillator frequency offset in parts per million.
+    /// Positive means the local monotonic clock runs fast relative to GPS seconds.
+    freq_ppm: f64,
+    /// Monotonic timestamp of the last accepted PPS pulse.
+    last_pps_monotonic_us: Option<i64>,
 }
 
 impl NtpServer {
@@ -70,6 +147,8 @@ impl NtpServer {
             pps_has_sample: false,
             proc_delay_us: 0.0,
             proc_delay_has_sample: false,
+            freq_ppm: 0.0,
+            last_pps_monotonic_us: None,
         })
     }
 
@@ -106,65 +185,174 @@ impl NtpServer {
         }
     }
 
-    /// Feed PPS pulse timing into the discipline loop.
+    /// Feed a PPS pulse event into the discipline servo.
     ///
-    /// Pass `None` for the first observed pulse to align to current GPS UTC,
-    /// then pass `Some(interval_us)` for subsequent pulse deltas.
+    /// Pass `None` for the first observed pulse to align the anchor to GPS UTC
+    /// without a frequency update. Pass `Some(interval_us)` for subsequent
+    /// pulses to run the full PLL servo (proportional phase + integral frequency).
     ///
     /// # Parameters
-    /// - `pps_interval_us`: `None` for first pulse alignment, or pulse interval in microseconds.
+    /// - `pps_interval_us`: `None` for first pulse alignment, or the measured
+    ///   interval in microseconds between the previous and current PPS edge.
     ///
     /// # Returns
     /// - No return value.
     pub fn observe_pps_pulse(&mut self, pps_interval_us: Option<u32>) {
         let now_us = monotonic_us_now();
 
-        if let Some(anchor) = &mut self.clock_anchor {
-            if let Some(interval) = pps_interval_us {
-                if (800_000..=1_200_000).contains(&interval) {
-                    anchor.unix_seconds = anchor.unix_seconds.saturating_add(1);
-                    anchor.monotonic_us = now_us;
+        match pps_interval_us {
+            None => {
+                // First pulse: align anchor to GPS UTC; no servo update yet since
+                // there is no interval measurement to derive frequency error from.
+                if let Some(gps_utc) = self.last_gps_utc_seconds {
+                    self.clock_anchor = Some(ClockAnchor {
+                        unix_seconds: gps_utc,
+                        monotonic_us: now_us,
+                    });
                     self.pps_locked = true;
+                    self.last_pps_monotonic_us = Some(now_us);
+                    log::debug!("NTP: PPS first pulse, aligned to GPS UTC {}", gps_utc);
                 }
-            } else if let Some(gps_utc) = self.last_gps_utc_seconds {
-                anchor.unix_seconds = gps_utc;
-                anchor.monotonic_us = now_us;
-                self.pps_locked = true;
             }
-        } else if let Some(gps_utc) = self.last_gps_utc_seconds {
-            self.clock_anchor = Some(ClockAnchor {
-                unix_seconds: gps_utc,
-                monotonic_us: now_us,
-            });
-            self.pps_locked = pps_interval_us.is_none();
-        }
+            Some(interval) => {
+                if !(800_000..=1_200_000).contains(&interval) {
+                    return;
+                }
 
-        if let Some(interval) = pps_interval_us {
-            self.update_pps_interval_us(interval);
+                // Phase error in microseconds: positive means our clock runs fast
+                // (the measured interval exceeded the ideal 1 000 000 us).
+                let phase_error_us = interval as i64 - 1_000_000;
+
+                // Integral path: accumulate frequency estimate.
+                // A phase error of +1 us/s equals +1 ppm.
+                self.freq_ppm = (self.freq_ppm + phase_error_us as f64 * SERVO_KI)
+                    .clamp(-SERVO_MAX_FREQ_PPM, SERVO_MAX_FREQ_PPM);
+
+                // Proportional path: nudge the anchor's monotonic reference to
+                // correct the phase by a fraction of the observed error.
+                if let Some(anchor) = &mut self.clock_anchor {
+                    let phase_correction_us = (phase_error_us as f64 * SERVO_KP) as i64;
+                    anchor.unix_seconds = anchor.unix_seconds.saturating_add(1);
+                    // Subtracting the correction shifts the apparent second boundary
+                    // earlier when the clock is fast, and later when it is slow.
+                    anchor.monotonic_us = now_us.saturating_sub(phase_correction_us);
+                } else if let Some(gps_utc) = self.last_gps_utc_seconds {
+                    self.clock_anchor = Some(ClockAnchor {
+                        unix_seconds: gps_utc,
+                        monotonic_us: now_us,
+                    });
+                }
+
+                // Update PPS diagnostics used by mode-6 and ntpq display.
+                let sample_jitter = phase_error_us.unsigned_abs() as f32;
+                self.pps_offset_us = phase_error_us as i32;
+                if self.pps_has_sample {
+                    self.pps_jitter_us = self.pps_jitter_us * 0.8 + sample_jitter * 0.2;
+                } else {
+                    self.pps_jitter_us = sample_jitter;
+                    self.pps_has_sample = true;
+                }
+
+                self.pps_locked = true;
+                self.last_pps_monotonic_us = Some(now_us);
+                log::debug!(
+                    "NTP: PPS servo phase_err={}us freq={:.3}ppm",
+                    phase_error_us,
+                    self.freq_ppm
+                );
+            }
         }
     }
 
-    /// Update PPS-derived offset and jitter estimates used in diagnostics.
+    /// Compute discipline parameters from current servo and holdover state.
+    ///
+    /// Stratum and leap indicator follow GPS+PPS sync status. Root dispersion
+    /// starts at 1 ms when locked and grows at 0.5 ms/s during holdover.
+    /// When dispersion exceeds 1 s the server declares stratum=16 / leap=unsync.
     ///
     /// # Parameters
-    /// - `pps_interval_us`: Interval between consecutive PPS pulses.
+    /// - `gps_fix`: Whether the GPS module currently reports a valid fix.
     ///
     /// # Returns
-    /// - No return value.
-    fn update_pps_interval_us(&mut self, pps_interval_us: u32) {
-        // Ignore obviously invalid intervals.
-        if !(800_000..=1_200_000).contains(&pps_interval_us) {
-            return;
-        }
-        let offset_us = (pps_interval_us as i32).saturating_sub(1_000_000);
-        let sample_jitter = (offset_us.unsigned_abs()) as f32;
-        self.pps_offset_us = offset_us;
-        if self.pps_has_sample {
-            // EWMA with moderate smoothing to avoid noisy jumps in ntpq view.
-            self.pps_jitter_us = self.pps_jitter_us * 0.8 + sample_jitter * 0.2;
+    /// - `DisciplineParams` with stratum, leap, and dispersion fields.
+    fn discipline_params(&self, gps_fix: bool) -> DisciplineParams {
+        let now_us = monotonic_us_now();
+
+        let pps_age_us = self
+            .last_pps_monotonic_us
+            .map(|t| now_us.saturating_sub(t))
+            .unwrap_or(i64::MAX);
+        let pps_fresh = pps_age_us < HOLDOVER_ENTRY_US;
+        let has_anchor = self.clock_anchor.is_some();
+
+        let fully_synced = gps_fix && pps_fresh && has_anchor;
+
+        let disp_us = if fully_synced {
+            BASE_DISP_US
+        } else if has_anchor {
+            // Holdover: dispersion grows linearly after HOLDOVER_ENTRY_US elapses.
+            let holdover_us = pps_age_us.saturating_sub(HOLDOVER_ENTRY_US).max(0);
+            let holdover_secs = holdover_us.div_euclid(MICROS_PER_SEC);
+            let growth = holdover_secs.saturating_mul(HOLDOVER_DISP_RATE_US_PER_SEC);
+            (BASE_DISP_US + growth).min(MAX_DISP_US)
         } else {
-            self.pps_jitter_us = sample_jitter;
-            self.pps_has_sample = true;
+            MAX_DISP_US
+        };
+
+        // Declare stratum 1 as long as uncertainty is below the unsync threshold,
+        // even without a current GPS fix (holdover), so clients keep using us.
+        let stratum = if fully_synced || (has_anchor && disp_us < HOLDOVER_UNSYNC_US) {
+            1_u8
+        } else {
+            16_u8
+        };
+        let leap = if stratum == 1 { 0_u8 } else { 3_u8 };
+
+        // NTP short format: 16.16 fixed-point seconds.
+        let root_disp_short = ((disp_us as u64 * (1u64 << 16)) / 1_000_000) as u32;
+        let root_disp_ms = disp_us as f64 / 1_000.0;
+
+        DisciplineParams {
+            stratum,
+            leap,
+            root_disp_short,
+            root_disp_ms,
+        }
+    }
+
+    /// Build a public discipline snapshot for the UI and display task.
+    ///
+    /// # Parameters
+    /// - `gps_fix`: Whether the GPS module currently reports a valid fix.
+    ///
+    /// # Returns
+    /// - `NtpSnapshot` with current servo state, frequency, and dispersion.
+    pub fn ntp_snapshot(&self, gps_fix: bool) -> NtpSnapshot {
+        let dp = self.discipline_params(gps_fix);
+        let now_us = monotonic_us_now();
+        let pps_age_us = self
+            .last_pps_monotonic_us
+            .map(|t| now_us.saturating_sub(t))
+            .unwrap_or(i64::MAX);
+        let pps_fresh = pps_age_us < HOLDOVER_ENTRY_US;
+        let has_anchor = self.clock_anchor.is_some();
+        let fully_synced = gps_fix && pps_fresh && has_anchor;
+
+        let state = if fully_synced {
+            DisciplineState::Locked
+        } else if has_anchor {
+            DisciplineState::Holdover
+        } else {
+            DisciplineState::Unsync
+        };
+
+        NtpSnapshot {
+            stratum: dp.stratum,
+            state,
+            freq_ppm: self.freq_ppm,
+            pps_offset_us: self.pps_offset_us,
+            pps_jitter_us: self.pps_jitter_us,
+            root_disp_ms: dp.root_disp_ms,
         }
     }
 
@@ -198,11 +386,11 @@ impl NtpServer {
                                 );
                                 continue;
                             }
-                            let synced = gps_fix && self.pps_locked && self.clock_anchor.is_some();
+                            let dp = self.discipline_params(gps_fix);
                             let resp = build_mode6_response(
                                 &req[..len],
                                 version,
-                                synced,
+                                &dp,
                                 self.pps_offset_us,
                                 self.pps_jitter_us,
                                 self.proc_delay_us,
@@ -224,10 +412,10 @@ impl NtpServer {
                             let mut req48 = [0_u8; NTP_PACKET_LEN];
                             req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
 
-                            let synced = gps_fix && self.pps_locked && self.clock_anchor.is_some();
+                            let dp = self.discipline_params(gps_fix);
                             let started_us = monotonic_us_now();
                             let now_ntp = self.current_ntp_timestamp();
-                            let mut resp = build_response(&req48, synced, now_ntp);
+                            let mut resp = build_response(&req48, &dp, now_ntp);
                             let transmit_ts = self.current_ntp_timestamp();
                             write_u64_be(&mut resp[40..48], transmit_ts);
 
@@ -263,7 +451,7 @@ impl NtpServer {
 /// # Parameters
 /// - `req`: Raw mode-6 request bytes.
 /// - `version`: NTP version extracted from request header.
-/// - `synced`: Current synchronized-state flag.
+/// - `dp`: Discipline parameters (stratum, leap, dispersion).
 /// - `pps_offset_us`: Latest PPS-derived offset in microseconds.
 /// - `pps_jitter_us`: Smoothed jitter estimate in microseconds.
 /// - `proc_delay_us`: Smoothed processing delay estimate in microseconds.
@@ -273,7 +461,7 @@ impl NtpServer {
 fn build_mode6_response(
     req: &[u8],
     version: u8,
-    synced: bool,
+    dp: &DisciplineParams,
     pps_offset_us: i32,
     pps_jitter_us: f32,
     proc_delay_us: f32,
@@ -289,6 +477,10 @@ fn build_mode6_response(
     let mut payload: Vec<u8> = Vec::new();
     let mut error = false;
 
+    let synced = dp.stratum == 1;
+    // NTP mode-6 displays leap as its 2-bit binary value written as two digits.
+    let leap_str = if dp.leap == 0 { "00" } else { "11" };
+
     // LI=0, VN from request, Mode=6 (control)
     resp[0] = (vn << 3) | 6;
     match opcode {
@@ -301,12 +493,14 @@ fn build_mode6_response(
         MODE6_OPCODE_READVAR => {
             let vars = if associd == 0 {
                 if synced {
-                    String::from(
-                        "stratum=1,leap=00,precision=-20,rootdelay=0.000,rootdisp=1.000,refid=GPS,peer=1,system=\"rust_gps_ntp\"",
+                    format!(
+                        "stratum={},leap={},precision=-20,rootdelay=0.000,rootdisp={:.3},refid=GPS,peer=1,system=\"rust_gps_ntp\"",
+                        dp.stratum, leap_str, dp.root_disp_ms
                     )
                 } else {
-                    String::from(
-                        "stratum=16,leap=11,precision=-20,rootdelay=0.000,rootdisp=5.000,refid=INIT,peer=0,system=\"rust_gps_ntp\"",
+                    format!(
+                        "stratum=16,leap=11,precision=-20,rootdelay=0.000,rootdisp={:.3},refid=INIT,peer=0,system=\"rust_gps_ntp\"",
+                        dp.root_disp_ms
                     )
                 }
             } else if associd == MODE6_ASSOC_ID {
@@ -315,7 +509,8 @@ fn build_mode6_response(
                     let jitter_ms = (pps_jitter_us.max(1.0)) / 1_000.0;
                     let delay_ms = (proc_delay_us.max(1.0)) / 1_000.0;
                     format!(
-                        "srcadr=GPS,srcport=123,refid=GPS,stratum=1,leap=00,hmode=3,pmode=4,hpoll=6,ppoll=6,reach=255,delay={delay_ms:.3},offset={offset_ms:.3},jitter={jitter_ms:.3}"
+                        "srcadr=GPS,srcport=123,refid=GPS,stratum={},leap={},hmode=3,pmode=4,hpoll=6,ppoll=6,reach=255,delay={delay_ms:.3},offset={offset_ms:.3},jitter={jitter_ms:.3}",
+                        dp.stratum, leap_str
                     )
                 } else {
                     String::from(
@@ -364,14 +559,14 @@ fn build_mode6_response(
 ///
 /// # Parameters
 /// - `req`: Parsed 48-byte client request.
-/// - `gps_fix`: Current synchronized-state flag.
+/// - `dp`: Discipline parameters (stratum, leap, dispersion).
 /// - `receive_ts`: Server receive timestamp in NTP 64-bit format.
 ///
 /// # Returns
 /// - 48-byte response packet with originate/receive/reference fields populated.
 fn build_response(
     req: &[u8; NTP_PACKET_LEN],
-    gps_fix: bool,
+    dp: &DisciplineParams,
     receive_ts: u64,
 ) -> [u8; NTP_PACKET_LEN] {
     let mut resp = [0_u8; NTP_PACKET_LEN];
@@ -381,24 +576,23 @@ fn build_response(
     } else {
         4
     };
-    let leap = if gps_fix { 0 } else { 3 };
-    resp[0] = (leap << 6) | (version << 3) | 4; // server mode
-    resp[1] = if gps_fix { 1 } else { 16 }; // stratum
+    resp[0] = (dp.leap << 6) | (version << 3) | 4; // server mode
+    resp[1] = dp.stratum;
     resp[2] = req[2]; // copy poll interval from client
     resp[3] = (-20_i8) as u8; // precision ~1us
 
     // Root delay / root dispersion in NTP short format (16.16).
     write_u32_be(&mut resp[4..8], 0);
-    write_u32_be(&mut resp[8..12], if gps_fix { 1 << 16 } else { 5 << 16 });
+    write_u32_be(&mut resp[8..12], dp.root_disp_short);
 
     // Reference ID:
-    if gps_fix {
+    if dp.stratum == 1 {
         resp[12..16].copy_from_slice(b"GPS\0");
     } else {
         resp[12..16].copy_from_slice(b"INIT");
     }
 
-    let reference_ts = if gps_fix { receive_ts } else { 0 };
+    let reference_ts = if dp.stratum == 1 { receive_ts } else { 0 };
     write_u64_be(&mut resp[16..24], reference_ts);
 
     // Originate timestamp = client's transmit timestamp.
@@ -429,6 +623,10 @@ fn ntp_timestamp_now() -> u64 {
 impl NtpServer {
     /// Compute the current NTP timestamp from the disciplined anchor clock.
     ///
+    /// Elapsed monotonic time is scaled by the frequency correction factor so
+    /// that oscillator drift accumulated since the last PPS pulse is removed
+    /// before computing the fractional second.
+    ///
     /// # Parameters
     /// - `self`: NTP server state containing discipline anchor.
     ///
@@ -437,9 +635,20 @@ impl NtpServer {
     fn current_ntp_timestamp(&self) -> u64 {
         if let Some(anchor) = self.clock_anchor {
             let now_us = monotonic_us_now();
-            let elapsed_us = now_us.saturating_sub(anchor.monotonic_us);
-            let elapsed_seconds = elapsed_us.div_euclid(MICROS_PER_SEC);
-            let rem_us = elapsed_us.rem_euclid(MICROS_PER_SEC) as u64;
+            let raw_elapsed_us = now_us.saturating_sub(anchor.monotonic_us);
+
+            // Scale elapsed time by (1 - freq_ppm/1e6) to compensate for oscillator
+            // drift. Positive freq_ppm means the monotonic clock runs fast, so we
+            // shrink the elapsed interval to recover real-time microseconds.
+            let corrected_elapsed_us = if self.freq_ppm == 0.0 {
+                raw_elapsed_us
+            } else {
+                ((raw_elapsed_us as f64) * (1.0 - self.freq_ppm / 1_000_000.0)) as i64
+            }
+            .max(0);
+
+            let elapsed_seconds = corrected_elapsed_us.div_euclid(MICROS_PER_SEC);
+            let rem_us = corrected_elapsed_us.rem_euclid(MICROS_PER_SEC) as u64;
 
             let unix_seconds = anchor.unix_seconds.saturating_add(elapsed_seconds);
             let ntp_seconds = if unix_seconds >= 0 {
@@ -501,8 +710,14 @@ mod tests {
 
     #[test]
     fn build_response_sets_server_mode_and_stratum_when_synced() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 1.0,
+        };
         let req = [0_u8; NTP_PACKET_LEN];
-        let resp = build_response(&req, true, 0x0123_0000_0000_0000);
+        let resp = build_response(&req, &dp, 0x0123_0000_0000_0000);
         assert_eq!(resp[0] & 0x07, 4);
         assert_eq!(resp[1], 1);
         assert_eq!(&resp[12..16], b"GPS\0");
@@ -510,14 +725,26 @@ mod tests {
 
     #[test]
     fn build_response_marks_unsynced_with_init_refid() {
+        let dp = DisciplineParams {
+            stratum: 16,
+            leap: 3,
+            root_disp_short: 5 << 16,
+            root_disp_ms: 5000.0,
+        };
         let req = [0_u8; NTP_PACKET_LEN];
-        let resp = build_response(&req, false, 0);
+        let resp = build_response(&req, &dp, 0);
         assert_eq!(resp[1], 16);
         assert_eq!(&resp[12..16], b"INIT");
     }
 
     #[test]
     fn build_mode6_readvar_includes_gps_peer_when_synced() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 1.0,
+        };
         let req = [
             0,
             MODE6_OPCODE_READVAR,
@@ -532,7 +759,7 @@ mod tests {
             0,
             0,
         ];
-        let resp = build_mode6_response(&req, 4, true, 250, 500.0, 1200.0);
+        let resp = build_mode6_response(&req, 4, &dp, 250, 500.0, 1200.0);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
         assert!(payload.contains("refid=GPS"));
         assert!(payload.contains("stratum=1"));
@@ -559,15 +786,27 @@ mod tests {
 
     #[test]
     fn build_mode6_readstat_returns_association_row() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 1.0,
+        };
         let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, true, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
         assert_eq!(resp.len(), NTP_CONTROL_HEADER_LEN + 4);
     }
 
     #[test]
     fn build_mode6_readvar_unsynced_system_vars() {
+        let dp = DisciplineParams {
+            stratum: 16,
+            leap: 3,
+            root_disp_short: 5 << 16,
+            root_disp_ms: 5000.0,
+        };
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, false, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
         assert!(payload.contains("stratum=16"));
         assert!(payload.contains("refid=INIT"));
@@ -575,6 +814,12 @@ mod tests {
 
     #[test]
     fn build_mode6_readvar_unsynced_peer_vars() {
+        let dp = DisciplineParams {
+            stratum: 16,
+            leap: 3,
+            root_disp_short: 5 << 16,
+            root_disp_ms: 5000.0,
+        };
         let req = [
             0,
             MODE6_OPCODE_READVAR,
@@ -589,22 +834,34 @@ mod tests {
             0,
             0,
         ];
-        let resp = build_mode6_response(&req, 4, false, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
         assert!(payload.contains("srcadr=INIT"));
     }
 
     #[test]
     fn build_mode6_unsupported_opcode_sets_error_bit() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 1.0,
+        };
         let req = [0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, true, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
         assert_ne!(resp[1] & 0x40, 0);
     }
 
     #[test]
     fn build_mode6_invalid_version_defaults_to_v4() {
+        let dp = DisciplineParams {
+            stratum: 16,
+            leap: 3,
+            root_disp_short: 5 << 16,
+            root_disp_ms: 5000.0,
+        };
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 0, false, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 0, &dp, 0, 0.0, 0.0);
         assert_eq!((resp[0] >> 3) & 0x07, 4);
     }
 
@@ -623,6 +880,8 @@ mod tests {
                 pps_has_sample: false,
                 proc_delay_us: 0.0,
                 proc_delay_has_sample: false,
+                freq_ppm: 0.0,
+                last_pps_monotonic_us: None,
             })
         }
     }
@@ -656,6 +915,7 @@ mod tests {
         server.update_gps_utc_seconds(1_700_000_000);
         server.observe_pps_pulse(None);
         assert!(server.pps_locked);
+        assert!(server.last_pps_monotonic_us.is_some());
     }
 
     #[test]
@@ -779,5 +1039,186 @@ mod tests {
             .expect("timeout");
         let mut resp = [0_u8; 64];
         assert!(client.recv_from(&mut resp).is_err());
+    }
+
+    // --- Servo and holdover tests ---
+
+    #[test]
+    fn servo_updates_freq_ppm_positive_for_fast_clock() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Interval longer than 1s: monotonic is fast relative to GPS.
+        server.observe_pps_pulse(Some(1_000_500));
+        assert!(
+            server.freq_ppm > 0.0,
+            "freq_ppm should be positive when interval > 1s (fast clock)"
+        );
+        // Expected: 0.0 + 500 * 0.01 = 5.0 ppm
+        assert!(
+            (server.freq_ppm - 5.0).abs() < 0.001,
+            "expected ~5.0 ppm, got {}",
+            server.freq_ppm
+        );
+    }
+
+    #[test]
+    fn servo_updates_freq_ppm_negative_for_slow_clock() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Interval shorter than 1s: monotonic is slow relative to GPS.
+        server.observe_pps_pulse(Some(999_500));
+        assert!(
+            server.freq_ppm < 0.0,
+            "freq_ppm should be negative when interval < 1s (slow clock)"
+        );
+        // Expected: 0.0 + (-500) * 0.01 = -5.0 ppm
+        assert!(
+            (server.freq_ppm + 5.0).abs() < 0.001,
+            "expected ~-5.0 ppm, got {}",
+            server.freq_ppm
+        );
+    }
+
+    #[test]
+    fn servo_accumulates_freq_over_multiple_pulses() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Apply ten identical intervals with +100 us error each.
+        for _ in 0..10 {
+            server.observe_pps_pulse(Some(1_000_100));
+        }
+        // Expected after 10 pulses: 10 * 100 * 0.01 = 10.0 ppm
+        assert!(
+            (server.freq_ppm - 10.0).abs() < 0.01,
+            "expected ~10.0 ppm, got {}",
+            server.freq_ppm
+        );
+    }
+
+    #[test]
+    fn servo_clamps_freq_ppm_at_max() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Extreme interval: should saturate at SERVO_MAX_FREQ_PPM.
+        for _ in 0..10_000 {
+            server.observe_pps_pulse(Some(1_200_000));
+        }
+        assert_eq!(server.freq_ppm, SERVO_MAX_FREQ_PPM);
+    }
+
+    #[test]
+    fn discipline_params_fully_synced_gives_stratum_1_and_base_dispersion() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        let dp = server.discipline_params(true);
+        assert_eq!(dp.stratum, 1);
+        assert_eq!(dp.leap, 0);
+        let expected_short = ((BASE_DISP_US as u64 * (1u64 << 16)) / 1_000_000) as u32;
+        assert_eq!(dp.root_disp_short, expected_short);
+        assert!((dp.root_disp_ms - 1.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn discipline_params_fresh_pps_holds_stratum_1_without_gps_fix() {
+        // Holdover design: with fresh PPS and a valid anchor, remain stratum 1
+        // even when GPS fix is temporarily lost, so clients keep using us while
+        // dispersion is still low.
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        let dp = server.discipline_params(false);
+        assert_eq!(dp.stratum, 1, "should hold stratum 1 with fresh PPS in holdover");
+    }
+
+    #[test]
+    fn discipline_params_stale_pps_and_no_gps_fix_gives_stratum_16() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Simulate deep holdover (PPS stale beyond unsync threshold).
+        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
+        server.last_pps_monotonic_us = Some(past_us);
+        let dp = server.discipline_params(false);
+        assert_eq!(dp.stratum, 16);
+        assert_eq!(dp.leap, 3);
+    }
+
+    #[test]
+    fn discipline_params_no_pps_no_anchor_gives_stratum_16() {
+        let server = NtpServer::new_for_test().expect("test socket");
+        let dp = server.discipline_params(true);
+        assert_eq!(dp.stratum, 16);
+    }
+
+    #[test]
+    fn holdover_dispersion_grows_after_pps_loss() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Simulate PPS that arrived 60 s into holdover (10s entry + 60s growth).
+        let past_us =
+            monotonic_us_now() - (HOLDOVER_ENTRY_US + 60 * MICROS_PER_SEC);
+        server.last_pps_monotonic_us = Some(past_us);
+        let dp = server.discipline_params(true);
+        // Expected disp = BASE_DISP_US + 60 * RATE = 1000 + 30000 = 31000 us = 31 ms.
+        assert!(
+            dp.root_disp_ms > 1.0,
+            "dispersion should exceed base 1 ms in holdover"
+        );
+        assert!(
+            dp.root_disp_ms > 29.0,
+            "expected ~31 ms, got {:.1} ms",
+            dp.root_disp_ms
+        );
+        // Still stratum 1 since 31 ms < 1000 ms threshold.
+        assert_eq!(dp.stratum, 1, "should remain stratum 1 below 1 s threshold");
+    }
+
+    #[test]
+    fn holdover_declares_stratum_16_when_dispersion_exceeds_1s() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Need dispersion >= HOLDOVER_UNSYNC_US (1_000_000 us):
+        // BASE + secs * RATE >= 1_000_000  →  secs >= (1_000_000 - 1_000) / 500 = 1998 s
+        let holdover_secs = 2_010_i64;
+        let past_us = monotonic_us_now()
+            - (HOLDOVER_ENTRY_US + holdover_secs * MICROS_PER_SEC);
+        server.last_pps_monotonic_us = Some(past_us);
+        let dp = server.discipline_params(true);
+        assert_eq!(dp.stratum, 16, "should be stratum 16 when dispersion >= 1 s");
+        assert_eq!(dp.leap, 3);
+    }
+
+    #[test]
+    fn holdover_stratum_1_restored_after_pps_returns() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Force into deep holdover.
+        let past_us = monotonic_us_now()
+            - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
+        server.last_pps_monotonic_us = Some(past_us);
+        assert_eq!(server.discipline_params(true).stratum, 16);
+        // Simulate PPS returning.
+        server.observe_pps_pulse(Some(1_000_000));
+        let dp = server.discipline_params(true);
+        assert_eq!(dp.stratum, 1, "stratum should recover to 1 after PPS returns");
+    }
+
+    #[test]
+    fn freq_correction_does_not_affect_zero_freq_ppm() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        assert_eq!(server.freq_ppm, 0.0);
+        // current_ntp_timestamp should not panic or produce obviously wrong output.
+        let ts = server.current_ntp_timestamp();
+        assert_ne!(ts, 0);
     }
 }

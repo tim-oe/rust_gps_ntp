@@ -42,7 +42,7 @@ using GPS NMEA + PPS.
 
 ### M5 - robustness
 
-- [ ] Holdover behavior when GPS fix is lost
+- [x] Holdover behavior when GPS fix is lost (PLL/FLL servo + growing root dispersion, stratum demotion at 1 s)
 - [ ] Basic metrics (fix age, PPS age, clients served)
 - [ ] Boot-time self-check logs for UART/PPS/network state
 

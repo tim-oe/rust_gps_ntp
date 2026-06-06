@@ -17,6 +17,7 @@ use std::sync::atomic::Ordering;
 use crate::battery::{self, BatteryMonitor, BatterySnapshot};
 use crate::display::{self, Page};
 use crate::gps::GpsSnapshot;
+use crate::ntp::NtpSnapshot;
 
 const UI_TASK_STACK_BYTES: usize = 16_384;
 const BATTERY_SAMPLE_US: i64 = 5_000_000;
@@ -24,14 +25,15 @@ const DRAW_INTERVAL_US: i64 = 5_000_000;
 const SCREEN_BLANK_US: i64 = 15_000_000;
 const UI_LOOP_DELAY_MS: u32 = 10;
 
-/// Shared GPS and PPS samples written by the main loop and read by the UI task.
+/// Shared GPS, PPS, and NTP discipline samples written by the main loop and read by the UI task.
 pub struct UiFeed {
     gps: RwLock<GpsSnapshot>,
     pps_delta_us: AtomicU32,
+    ntp: RwLock<NtpSnapshot>,
 }
 
 impl UiFeed {
-    /// Create a new feed with an empty GPS snapshot and zero PPS delta.
+    /// Create a new feed with an empty GPS snapshot, zero PPS delta, and default NTP state.
     ///
     /// # Parameters
     /// - None.
@@ -42,6 +44,7 @@ impl UiFeed {
         Arc::new(Self {
             gps: RwLock::new(GpsSnapshot::default()),
             pps_delta_us: AtomicU32::new(0),
+            ntp: RwLock::new(NtpSnapshot::default()),
         })
     }
 
@@ -69,21 +72,35 @@ impl UiFeed {
         self.pps_delta_us.store(delta_us, Ordering::Relaxed);
     }
 
-    /// Read a consistent GPS snapshot and PPS delta for one draw pass.
+    /// Publish the latest NTP discipline snapshot for UI rendering.
+    ///
+    /// # Parameters
+    /// - `snap`: Current discipline snapshot from `NtpServer::ntp_snapshot`.
+    ///
+    /// # Returns
+    /// - No return value. Silently no-ops if the feed lock is poisoned.
+    pub fn publish_ntp(&self, snap: NtpSnapshot) {
+        if let Ok(mut guard) = self.ntp.write() {
+            *guard = snap;
+        }
+    }
+
+    /// Read a consistent GPS snapshot, PPS delta, and NTP snapshot for one draw pass.
     ///
     /// # Parameters
     /// - `self`: Shared feed state.
     ///
     /// # Returns
-    /// - `(GpsSnapshot, u32)` containing a cloned GPS snapshot and PPS delta.
-    fn snapshot(&self) -> (GpsSnapshot, u32) {
+    /// - Tuple of cloned GPS snapshot, PPS delta in microseconds, and NTP snapshot.
+    fn snapshot(&self) -> (GpsSnapshot, u32, NtpSnapshot) {
         let gps = self
             .gps
             .read()
             .map(|guard| guard.clone())
             .unwrap_or_default();
         let pps_delta_us = self.pps_delta_us.load(Ordering::Relaxed);
-        (gps, pps_delta_us)
+        let ntp = self.ntp.read().map(|guard| *guard).unwrap_or_default();
+        (gps, pps_delta_us, ntp)
     }
 }
 
@@ -232,9 +249,9 @@ fn ui_task_main<DI, RST, BL, PinE>(
         }
 
         if screen_on && (force_redraw || (now_us - last_draw_us) >= DRAW_INTERVAL_US) {
-            let (gps, pps_delta_us) = feed.snapshot();
+            let (gps, pps_delta_us, ntp) = feed.snapshot();
             let mut panel = display::make_panel(display);
-            display::draw_page(&mut panel, current_page, &gps, &battery, pps_delta_us);
+            display::draw_page(&mut panel, current_page, &gps, &battery, pps_delta_us, &ntp);
             if !rendered_once {
                 log::trace!("Display diag: first frame rendered");
                 rendered_once = true;

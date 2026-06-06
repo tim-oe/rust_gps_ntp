@@ -9,7 +9,7 @@ This document tracks remaining NTP work after the current functional baseline:
 
 ## Priority roadmap
 
-## 1) Discipline servo and holdover (highest impact)
+## [x] 1) Discipline servo and holdover (highest impact)
 
 - Implement a small PLL/FLL-style servo for phase + frequency correction.
 - Use PPS as the phase reference, and GPS UTC as second labeling.
@@ -22,7 +22,7 @@ Why: this gives the biggest real-world stability improvement.
 
 ESP32 feasibility: **Yes**.
 
-## 2) Improve NTP correctness fields
+## [ ] 2) Improve NTP correctness fields
 
 - Replace synthetic values with measured/model-driven values:
   - root delay,
@@ -34,7 +34,7 @@ Why: improves standards compliance and client trust decisions.
 
 ESP32 feasibility: **Yes**.
 
-## 3) Expand mode-6 control support
+## [ ] 3) Expand mode-6 control support
 
 - Flesh out `READVAR`/`READSTAT` variable coverage.
 - Improve association/system status encoding for better `ntpq` output.
@@ -44,7 +44,7 @@ Why: better observability and debugging from standard NTP tools.
 
 ESP32 feasibility: **Yes**, with scope control to avoid unnecessary complexity.
 
-## 4) Add NTP service protections
+## [ ] 4) Add NTP service protections
 
 - Per-client rate limiting.
 - Optional Kiss-o'-Death responses for abusive polling patterns.
@@ -54,7 +54,7 @@ Why: protects limited CPU/network resources on embedded hardware.
 
 ESP32 feasibility: **Yes**.
 
-## 5) Leap-second and long-run edge cases
+## [ ] 5) Leap-second and long-run edge cases
 
 - Explicit leap indicator handling from GPS data path.
 - Robust behavior across:
@@ -66,7 +66,7 @@ Why: long-term correctness and resilience.
 
 ESP32 feasibility: **Mostly yes**; leap-quality depends on the upstream GPS data quality.
 
-## 6) Testing and interoperability
+## [ ] 6) Testing and interoperability
 
 - Add unit tests for:
   - timestamp math,
