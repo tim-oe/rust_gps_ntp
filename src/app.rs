@@ -3,7 +3,7 @@
 use anyhow::Context;
 use display_interface_spi::SPIInterfaceNoCS;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
-use esp_idf_svc::hal::gpio::{self, PinDriver, Pull};
+use esp_idf_svc::hal::gpio::{self, PinDriver};
 use esp_idf_svc::hal::i2c;
 use esp_idf_svc::hal::peripherals::Peripherals;
 use esp_idf_svc::hal::prelude::*;
@@ -11,14 +11,16 @@ use esp_idf_svc::hal::spi;
 use esp_idf_svc::hal::uart::{self, UartDriver};
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use st7789::ST7789;
+use std::sync::Arc;
 
-use crate::battery::{self, BatteryMonitor, BatterySnapshot};
-use crate::display::{self, Page};
+use crate::battery::{self, BatteryMonitor};
+use crate::display;
 use crate::gps::{self, GpsSnapshot};
 use crate::logging;
 use crate::ntp;
 use crate::pps::{PpsEvent, PpsMonitor, PpsPollState};
 use crate::timezone::{TimezoneStore, TimezoneWorker};
+use crate::ui_task::{UiFeed, UiTaskHandle};
 use crate::wifi;
 
 pub const GPS_UART_TX_PIN: i32 = 1;
@@ -103,27 +105,32 @@ pub fn run() -> anyhow::Result<()> {
     let dc = PinDriver::output(pins.gpio39).context("failed to init TFT DC")?;
     let rst = PinDriver::output(pins.gpio40).context("failed to init TFT RST")?;
     let backlight = PinDriver::output(pins.gpio45).context("failed to init TFT backlight")?;
-    let mut button = PinDriver::input(pins.gpio0).context("failed to init page button")?;
-    if let Err(err) = button.set_pull(Pull::Up) {
-        log::warn!("Display: failed to enable button pull-up: {}", err);
-    }
+    let button = PinDriver::input(pins.gpio0).context("failed to init page button")?;
 
     let di = SPIInterfaceNoCS::new(spi_drv, dc);
     let mut display = ST7789::new(di, Some(rst), Some(backlight), 240, 135);
     let mut ets = Ets;
     let backlight_on_state = display::init_display(&mut display, &mut ets)?;
 
+    let ui_feed = UiFeed::new();
+    let _ui_task = UiTaskHandle::spawn(
+        Arc::clone(&ui_feed),
+        display,
+        button,
+        i2c_drv,
+        battery_monitor,
+        backlight_on_state,
+    )?;
+
     let mut rx_buf = [0_u8; 256];
     let mut line_buf = String::new();
     let mut bytes_seen: u64 = 0;
     let mut gps = GpsSnapshot::default();
-    let mut battery = BatterySnapshot::default();
 
     let pps = PpsMonitor::new();
     let pps_edge_us_isr = pps.edge_us();
     let pps_count_isr = pps.count();
     let mut pps_poll = PpsPollState::default();
-    let mut pps_delta_us = 0_u32;
     let mut pps_pin =
         PinDriver::input(pins.gpio12).context("failed to initialize PPS input pin")?;
     unsafe {
@@ -144,15 +151,6 @@ pub fn run() -> anyhow::Result<()> {
         "PPS: monitoring GPIO{} (rising-edge interrupt)",
         PPS_GPIO_PIN
     );
-
-    let mut last_battery_us = 0_i64;
-    let mut last_draw_us = 0_i64;
-    let mut last_button_pressed = false;
-    let mut screen_on = true;
-    let mut current_page = Page::Time;
-    let mut last_interaction_us = monotonic_us();
-    let mut force_redraw = true;
-    let mut rendered_once = false;
 
     let mut ntp_server = ntp::NtpServer::bind()?;
     let mut tz_store = TimezoneStore::new(default_nvs_tz).ok();
@@ -196,6 +194,7 @@ pub fn run() -> anyhow::Result<()> {
             &mut line_buf,
             &mut bytes_seen,
             &mut gps,
+            &ui_feed,
             &mut ntp_server,
             tz_worker.as_mut(),
             &mut tz_initialized,
@@ -230,65 +229,14 @@ pub fn run() -> anyhow::Result<()> {
                     ntp_server.observe_pps_pulse(None);
                 }
                 PpsEvent::Delta(delta) => {
-                    pps_delta_us = delta;
-                    log::debug!(
-                        "PPS: pulse #{} delta={}us",
-                        pps_poll.pulse_count(),
-                        pps_delta_us
-                    );
-                    ntp_server.observe_pps_pulse(Some(pps_delta_us));
+                    ui_feed.publish_pps_delta(delta);
+                    log::debug!("PPS: pulse #{} delta={}us", pps_poll.pulse_count(), delta);
+                    ntp_server.observe_pps_pulse(Some(delta));
                 }
             }
             if let Err(err) = pps_pin.enable_interrupt() {
                 log::warn!("PPS: failed to re-enable interrupt: {}", err);
             }
-        }
-
-        let now_us = monotonic_us();
-        if last_battery_us == 0 || (now_us - last_battery_us) >= 5_000_000 {
-            if let Some(kind) = battery_monitor {
-                match battery::read_battery(&mut i2c_drv, kind) {
-                    Ok(reading) => battery = reading,
-                    Err(err) => log::debug!("Battery: read failed: {}", err),
-                }
-            }
-            last_battery_us = now_us;
-        }
-
-        let button_pressed = !button.is_high();
-        if button_pressed && !last_button_pressed {
-            if !screen_on {
-                screen_on = true;
-                if let Err(err) = display.set_backlight(backlight_on_state, &mut ets) {
-                    log::warn!("Display: failed to turn backlight on: {:?}", err);
-                }
-            } else {
-                current_page = current_page.next();
-            }
-            last_interaction_us = now_us;
-            force_redraw = true;
-        }
-        last_button_pressed = button_pressed;
-
-        if !display::DISPLAY_DEBUG_ALWAYS_ON
-            && screen_on
-            && (now_us - last_interaction_us) >= 15_000_000
-        {
-            screen_on = false;
-            if let Err(err) = display.set_backlight(display::backlight_off_state(), &mut ets) {
-                log::warn!("Display: failed to turn backlight off: {:?}", err);
-            }
-        }
-
-        if screen_on && (force_redraw || (now_us - last_draw_us) >= 5_000_000) {
-            let mut panel = display::make_panel(&mut display);
-            display::draw_page(&mut panel, current_page, &gps, &battery, pps_delta_us);
-            if !rendered_once {
-                log::trace!("Display diag: first frame rendered");
-                rendered_once = true;
-            }
-            last_draw_us = now_us;
-            force_redraw = false;
         }
 
         FreeRtos::delay_ms(10);
@@ -305,6 +253,7 @@ fn poll_gps_uart(
     line_buf: &mut String,
     bytes_seen: &mut u64,
     gps: &mut GpsSnapshot,
+    ui_feed: &UiFeed,
     ntp_server: &mut ntp::NtpServer,
     mut tz_worker: Option<&mut TimezoneWorker>,
     tz_initialized: &mut bool,
@@ -336,16 +285,26 @@ fn poll_gps_uart(
         }
 
         if trimmed.starts_with("$GNRMC") || trimmed.starts_with("$GPRMC") {
-            if gps::parse_rmc(trimmed, gps).is_some() && gps.fix {
-                if let Some(utc_unix_seconds) = gps.utc_unix_seconds {
-                    ntp_server.update_gps_utc_seconds(utc_unix_seconds);
-                }
-                if let Some(worker) = tz_worker.as_mut() {
-                    maybe_schedule_timezone_lookup(gps, worker, tz_initialized, last_tz_lookup_us);
+            if gps::parse_rmc(trimmed, gps).is_some() {
+                ui_feed.publish_gps(gps);
+                if gps.fix {
+                    if let Some(utc_unix_seconds) = gps.utc_unix_seconds {
+                        ntp_server.update_gps_utc_seconds(utc_unix_seconds);
+                    }
+                    if let Some(worker) = tz_worker.as_mut() {
+                        maybe_schedule_timezone_lookup(
+                            gps,
+                            worker,
+                            tz_initialized,
+                            last_tz_lookup_us,
+                        );
+                    }
                 }
             }
         } else if trimmed.starts_with("$GNGGA") || trimmed.starts_with("$GPGGA") {
-            let _ = gps::parse_gga(trimmed, gps);
+            if gps::parse_gga(trimmed, gps).is_some() {
+                ui_feed.publish_gps(gps);
+            }
         }
     }
 }
