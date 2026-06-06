@@ -37,8 +37,8 @@ fn main() -> anyhow::Result<()> {
     let spi2 = peripherals.spi2;
     let pins = peripherals.pins;
 
-    let default_nvs = EspDefaultNvsPartition::take()
-        .context("failed to take default NVS partition for Wi-Fi")?;
+    let default_nvs =
+        EspDefaultNvsPartition::take().context("failed to take default NVS partition for Wi-Fi")?;
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()
         .context("failed to take system event loop")?;
     let _wifi = wifi::connect_wifi_sta(modem, sys_loop, default_nvs, &wifi_creds)?;
@@ -133,6 +133,7 @@ fn main() -> anyhow::Result<()> {
     let mut current_page = Page::Time;
     let mut last_interaction_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     let mut force_redraw = true;
+    let mut rendered_once = false;
 
     log::info!("System: booted; Wi-Fi + GPS UART diagnostics mode");
     log::info!(
@@ -155,7 +156,10 @@ fn main() -> anyhow::Result<()> {
     pps_pin
         .enable_interrupt()
         .context("failed to enable PPS interrupt")?;
-    log::info!("PPS: monitoring GPIO{} (rising-edge interrupt)", PPS_GPIO_PIN);
+    log::info!(
+        "PPS: monitoring GPIO{} (rising-edge interrupt)",
+        PPS_GPIO_PIN
+    );
 
     loop {
         if let Ok(read) = gps_uart.read(&mut rx_buf, 25) {
@@ -232,7 +236,9 @@ fn main() -> anyhow::Result<()> {
         }
         last_button_pressed = button_pressed;
 
-        if !display::DISPLAY_DEBUG_ALWAYS_ON && screen_on && (now_us - last_interaction_us) >= 15_000_000
+        if !display::DISPLAY_DEBUG_ALWAYS_ON
+            && screen_on
+            && (now_us - last_interaction_us) >= 15_000_000
         {
             screen_on = false;
             let _ = display.set_backlight(display::backlight_off_state(), &mut ets);
@@ -240,13 +246,11 @@ fn main() -> anyhow::Result<()> {
 
         if screen_on && (force_redraw || (now_us - last_draw_us) >= 5_000_000) {
             let mut panel = display::make_panel(&mut display);
-            display::draw_page(
-                &mut panel,
-                current_page,
-                &gps,
-                &battery,
-                pps_delta_us,
-            );
+            display::draw_page(&mut panel, current_page, &gps, &battery, pps_delta_us);
+            if !rendered_once {
+                log::info!("Display: first frame rendered");
+                rendered_once = true;
+            }
             last_draw_us = now_us;
             force_redraw = false;
         }
@@ -259,7 +263,13 @@ fn main() -> anyhow::Result<()> {
                     esp_idf_svc::sys::MALLOC_CAP_8BIT as u32,
                 )
             };
-            let _ = (free_heap, min_free_heap, largest_block, current_pps_count, bytes_seen);
+            let _ = (
+                free_heap,
+                min_free_heap,
+                largest_block,
+                current_pps_count,
+                bytes_seen,
+            );
             last_diag_us = now_us;
         }
 

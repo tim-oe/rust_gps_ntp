@@ -44,7 +44,11 @@ fn nmea_to_decimal(value: &str, dir: &str) -> Option<f32> {
     Some(decimal)
 }
 
-fn local_datetime_from_utc(utc_date: &str, utc_time: &str, lon: f32) -> Option<(String, String, i8)> {
+fn local_datetime_from_utc(
+    utc_date: &str,
+    utc_time: &str,
+    lon: f32,
+) -> Option<(String, String, i8)> {
     let tz_offset_h = (lon / 15.0).round() as i8;
     let ddmmyy = parse_ddmmyy(utc_date)?;
     let hhmmss = parse_hhmmss(utc_time)?;
@@ -79,14 +83,8 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     let lat = nmea_to_decimal(fields[3], fields[4])?;
     let lon = nmea_to_decimal(fields[5], fields[6])?;
 
-    let (local_date, local_time, tz_offset_hours) =
-        local_datetime_from_utc(date, time, lon).unwrap_or_else(|| {
-            (
-                format_ddmmyy(date),
-                format_hhmmss(time),
-                0,
-            )
-        });
+    let (local_date, local_time, tz_offset_hours) = local_datetime_from_utc(date, time, lon)
+        .unwrap_or_else(|| (format_ddmmyy(date), format_hhmmss(time), 0));
     gps.local_date = local_date;
     gps.local_time = local_time;
     gps.tz_offset_hours = tz_offset_hours;
@@ -115,4 +113,42 @@ pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     gps.sats = fields[7].parse::<u8>().ok()?;
     log::trace!("GPS GGA parsed: sats={}", gps.sats);
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rmc_populates_local_fields_and_coords() {
+        let mut gps = GpsSnapshot::default();
+        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+
+        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
+        assert_eq!(gps.local_date, "2094-03-23");
+        assert_eq!(gps.local_time, "13:35:19");
+        assert_eq!(gps.tz_offset_hours, 1);
+        assert!(gps.fix);
+        assert!((gps.lat - 48.1173).abs() < 0.0001);
+        assert!((gps.lon - 11.516667).abs() < 0.0001);
+    }
+
+    #[test]
+    fn parse_rmc_marks_invalid_fix_status() {
+        let mut gps = GpsSnapshot::default();
+        let rmc = "$GPRMC,225446,V,4916.45,N,12311.12,W,000.5,054.7,191194,020.3,E*68";
+
+        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
+        assert!(!gps.fix);
+        assert!(gps.lon < 0.0);
+    }
+
+    #[test]
+    fn parse_gga_updates_satellite_count() {
+        let mut gps = GpsSnapshot::default();
+        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08,1.0,545.4,M,46.9,M,,*47";
+
+        assert_eq!(parse_gga(gga, &mut gps), Some(()));
+        assert_eq!(gps.sats, 8);
+    }
 }

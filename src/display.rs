@@ -2,8 +2,8 @@ use anyhow::anyhow;
 use core::sync::atomic::{AtomicBool, Ordering};
 // Official font docs (embedded-graphics mono/ascii):
 // https://docs.rs/embedded-graphics/latest/embedded_graphics/mono_font/ascii/index.html
-use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
+use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
@@ -265,20 +265,24 @@ pub fn draw_page<D>(
     gps: &GpsSnapshot,
     battery: &BatterySnapshot,
     pps_delta_us: u32,
-)
-where
+) where
     D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
 {
     let style = MonoTextStyleBuilder::new()
         .font(&FONT_10X20)
         .text_color(Rgb565::WHITE)
         .build();
 
-    let _ = display.clear(Rgb565::BLACK);
+    if let Err(err) = display.clear(Rgb565::BLACK) {
+        log::warn!("Display: clear failed: {:?}", err);
+    }
 
     let mut y = 20;
     let mut line = |text: String| {
-        let _ = Text::new(&text, Point::new(4, y), style).draw(display);
+        if let Err(err) = Text::new(&text, Point::new(4, y), style).draw(display) {
+            log::warn!("Display: text draw failed (\"{}\"): {:?}", text, err);
+        }
         y += 21;
     };
 
@@ -301,15 +305,17 @@ where
             // We don't have a filesystem yet, so show app partition size as storage capacity.
             let storage_part_bytes = unsafe {
                 let p = esp_idf_svc::sys::esp_ota_get_running_partition();
-                if p.is_null() {
-                    0_u64
-                } else {
-                    (*p).size as u64
-                }
+                if p.is_null() { 0_u64 } else { (*p).size as u64 }
             };
             line("Page 3/4  RESOURCES".to_owned());
-            line(format!("Storage part: {}", format_human_bytes(storage_part_bytes)));
-            line(format!("Heap free: {}", format_human_bytes(free_heap as u64)));
+            line(format!(
+                "Storage part: {}",
+                format_human_bytes(storage_part_bytes)
+            ));
+            line(format!(
+                "Heap free: {}",
+                format_human_bytes(free_heap as u64)
+            ));
             line(format!("Heap min: {}", format_human_bytes(min_heap as u64)));
         }
         Page::Battery => {

@@ -42,7 +42,10 @@ fn level_from_key(key: &str, build_env_value: Option<&'static str>) -> Option<Es
 }
 
 fn sdkconfig_flag_enabled(key: &str) -> bool {
-    matches!(level_from_sdkconfig_defaults(key), Some("y" | "1" | "true" | "yes"))
+    matches!(
+        level_from_sdkconfig_defaults(key),
+        Some("y" | "1" | "true" | "yes")
+    )
 }
 
 fn global_default_level() -> EspLogLevel {
@@ -75,8 +78,9 @@ fn set_level_from_key(tag: &str, key: &str, build_env_value: Option<&'static str
 }
 
 pub fn display_boot_test_enabled() -> bool {
-    let effective_display_level = level_from_key("LOG_DISPLAY_LEVEL", option_env!("LOG_DISPLAY_LEVEL"))
-        .unwrap_or_else(global_default_level);
+    let effective_display_level =
+        level_from_key("LOG_DISPLAY_LEVEL", option_env!("LOG_DISPLAY_LEVEL"))
+            .unwrap_or_else(global_default_level);
     matches!(
         effective_display_level,
         esp_idf_svc::sys::esp_log_level_t_ESP_LOG_DEBUG
@@ -115,5 +119,9 @@ pub fn init() {
         "LOG_BATTERY_LEVEL",
         option_env!("LOG_BATTERY_LEVEL"),
     );
-    set_level_from_key("rust_gps_ntp", "LOG_PPS_LEVEL", option_env!("LOG_PPS_LEVEL"));
+    set_level_from_key(
+        "rust_gps_ntp",
+        "LOG_PPS_LEVEL",
+        option_env!("LOG_PPS_LEVEL"),
+    );
 }

@@ -134,10 +134,54 @@ Other useful tasks:
 just fmt
 just lint
 just test
+just test-host
+just coverage
+just coverage-html
+just coverage-lcov
+just ci-esp
 just ci
 ```
 
-## 6) Logging configuration
+Note: `just flash` and `just flash-monitor` now run an ESP compile check
+(`just check-esp`) before flashing.
+
+## 6) Test and coverage reporting
+
+Host tests and coverage run on your Linux host target (not xtensa), which is
+what we want for pure-logic modules like GPS parsing.
+
+Install coverage tooling once:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov
+```
+
+Run tests:
+
+```bash
+just test-host
+```
+
+Generate coverage reports:
+
+```bash
+# terminal summary
+just coverage
+
+# HTML report (open target/llvm-cov/html/index.html)
+just coverage-html
+
+# LCOV file for CI tools (Codecov/Sonar/etc.)
+just coverage-lcov
+```
+
+Outputs:
+
+- HTML report directory: `target/llvm-cov/html/`
+- LCOV file: `target/llvm-cov/lcov.info`
+
+## 7) Logging configuration
 
 The project uses `src/logging.rs` to centralize logger initialization and optional
 per-module log-level overrides.
@@ -180,7 +224,7 @@ Display boot test behavior:
 - runs once at startup only when effective display log level is `debug` or `trace/verbose`
 - does not run at default `info`
 
-## 7) Verify boot logs
+## 8) Verify boot logs
 
 You should see:
 
@@ -190,7 +234,7 @@ You should see:
 - boot message indicating Wi-Fi + GPS UART diagnostics mode
 - TFT page output with button page-toggle and 15-second auto-blank/wake behavior
 
-## 8) Next firmware milestone
+## 9) Next firmware milestone
 
 Implement in this order:
 

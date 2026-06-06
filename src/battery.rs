@@ -18,8 +18,10 @@ fn read_max17048(i2c: &mut i2c::I2cDriver<'_>) -> Option<BatterySnapshot> {
     const REG_SOC: u8 = 0x04;
     let mut vcell = [0_u8; 2];
     let mut soc = [0_u8; 2];
-    i2c.write_read(MAX17048_ADDR, &[REG_VCELL], &mut vcell, 50).ok()?;
-    i2c.write_read(MAX17048_ADDR, &[REG_SOC], &mut soc, 50).ok()?;
+    i2c.write_read(MAX17048_ADDR, &[REG_VCELL], &mut vcell, 50)
+        .ok()?;
+    i2c.write_read(MAX17048_ADDR, &[REG_SOC], &mut soc, 50)
+        .ok()?;
 
     let vraw = u16::from_be_bytes(vcell);
     let voltage_v = (vraw as f32) * 78.125e-6;
@@ -60,7 +62,10 @@ pub fn detect_monitor(i2c: &mut i2c::I2cDriver<'_>) -> Option<BatteryMonitor> {
     None
 }
 
-pub fn read_battery(i2c: &mut i2c::I2cDriver<'_>, monitor: BatteryMonitor) -> Option<BatterySnapshot> {
+pub fn read_battery(
+    i2c: &mut i2c::I2cDriver<'_>,
+    monitor: BatteryMonitor,
+) -> Option<BatterySnapshot> {
     match monitor {
         BatteryMonitor::Max17048 => read_max17048(i2c),
         BatteryMonitor::Lc709203 => read_lc709203(i2c),
