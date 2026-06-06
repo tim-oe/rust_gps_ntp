@@ -48,13 +48,15 @@ coverage:
 check:
     source {{esp_export}} && cargo +esp check
 
-# Flash app partition only — fast iterative deploy; skips bootloader and partition table.
+# Deploy app partition only — runs coverage gate then flashes app; use after first full flash.
 flash-app:
-    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}}
+    just coverage
+    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}}
 
-# Flash app partition only and attach serial monitor.
+# Deploy app partition only and attach serial monitor.
 flash-app-monitor:
-    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --monitor
+    just coverage
+    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}} --monitor
 
 # Full flash (bootloader + partition table + app); run after partitions.csv changes or first flash.
 flash:

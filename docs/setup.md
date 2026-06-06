@@ -123,23 +123,23 @@ result in NVS for future boots. Cached timezone is used immediately at boot and
 then refreshed periodically from network lookup; if the resolved zone changes,
 the new value is applied and persisted.
 
-There are two flash workflows:
+There are two flash workflows, both always run the coverage gate first:
 
-**First flash or after changing `partitions.csv`** — writes bootloader, partition table, and app; runs coverage gate and ESP check first:
+**First flash or after changing `partitions.csv`** — writes bootloader, partition table, and app:
 
 ```bash
 just flash          # flash only
 just flash-monitor  # flash then attach monitor
 ```
 
-**Iterative development** — writes app partition only; faster, no coverage gate:
+**Iterative code deployment** — writes app partition only; use after the first full flash:
 
 ```bash
 just flash-app          # flash only
 just flash-app-monitor  # flash then attach monitor
 ```
 
-All flash recipes use `--release` builds. The full-flash recipes also write `partitions.csv`, which configures a larger factory app slot for ESP32-S3.
+All flash recipes use `--release` builds and `partitions.csv`, which configures a larger factory app slot for ESP32-S3.
 
 Other useful tasks:
 
