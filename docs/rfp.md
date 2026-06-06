@@ -15,40 +15,42 @@ using GPS NMEA + PPS.
 
 ### M1 - Platform bring-up
 
-- Boot firmware on ESP32 and emit periodic logs
-- Validate flash and monitor flow on `/dev/ttyACM0`
+- [x] Boot firmware on ESP32 and emit periodic logs
+- [x] Validate flash and monitor flow on `/dev/ttyACM0`
 
 ### M2 - GPS serial ingest
 
 - [x] Configure UART at 9600 baud
 - [x] Read NMEA sentences
-- [x] Parse `RMC` and `ZDA` for UTC time and date
+- [x] Parse `RMC` and `GGA` for UTC time, date, and satellite count
+- [x] Validate NMEA checksum before parse
 - [x] Track GPS fix validity
 
 ### M3 - PPS discipline
 
-- Wire PPS to interrupt-capable GPIO
-- Capture microsecond timer on each rising edge
-- Align parsed UTC second with PPS edge
+- [x] Wire PPS to interrupt-capable GPIO (`GPIO12`)
+- [x] Capture microsecond timer on each rising edge (`AtomicU64`)
+- [x] Align parsed UTC second with PPS edge
 
 ### M4 - NTP server
 
-- Bind UDP socket on port 123
-- Build NTPv4 response packets
-- Set stratum/reference fields to GPS source
-- Populate transmit timestamps from disciplined clock
+- [x] Bind UDP socket on port 123
+- [x] Build NTPv4 response packets
+- [x] Set stratum/reference fields to GPS source
+- [x] Populate transmit timestamps from disciplined clock
+- [x] Mode-6 diagnostics for `ntpq`
 
 ### M5 - robustness
 
-- Holdover behavior when GPS fix is lost
-- Basic metrics (fix age, PPS age, clients served)
-- Boot-time self-check logs for UART/PPS/network state
+- [ ] Holdover behavior when GPS fix is lost
+- [ ] Basic metrics (fix age, PPS age, clients served)
+- [ ] Boot-time self-check logs for UART/PPS/network state
 
-## Data model (planned)
+## Data model
 
-- `GpsState`: fix status, satellites, last parsed UTC, last NMEA update
-- `PpsState`: last edge instant and quality flags
-- `DisciplinedClock`: conversion between monotonic ticks and UTC/NTP time
+- `GpsSnapshot`: fix status, satellites, local time estimate, UTC epoch
+- `PpsMonitor`: last edge instant (`u64` monotonic us) and pulse count
+- `NtpServer` / `ClockAnchor`: monotonic-to-UTC conversion for NTP timestamps
 
 ## Test plan
 
@@ -56,3 +58,4 @@ using GPS NMEA + PPS.
 - Verify second rollover exactly on PPS pulses
 - Exercise no-fix and fix-recovery scenarios
 - Confirm multiple clients can query repeatedly without drift jumps
+- Host unit tests: `just test` (GPS, PPS delta, NTP packet builders, timezone JSON, battery decode)

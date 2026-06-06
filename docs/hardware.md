@@ -2,7 +2,7 @@
 
 Target hardware:
 
-- Adafruit ESP32-S2 TFT Feather
+- Adafruit ESP32-S3 TFT Feather (project default; S2 Feather docs remain useful reference)
 - Adafruit Ultimate GPS FeatherWing
 
 Note: the connected board currently identifies as ESP32-S3, and project
@@ -16,7 +16,7 @@ References:
 ## Assembly
 
 1. Solder Feather headers to both boards.
-2. Stack the Ultimate GPS FeatherWing onto the ESP32-S2 Feather.
+2. Stack the Ultimate GPS FeatherWing onto the ESP32 Feather.
 3. Connect USB-C and confirm the board enumerates as `/dev/ttyACM0`.
 
 ## Signal expectations
@@ -27,20 +27,20 @@ When stacked as a FeatherWing, the GPS board uses shared Feather rails:
 - Serial lines for NMEA traffic (GPS -> MCU UART receive)
 - Optional PPS line can be jumper-wired to any interrupt-capable GPIO
 
-## Firmware pin map currently in code
+## Firmware pin map (matches `src/app.rs` constants)
 
 - GPS UART: TX=`GPIO1`, RX=`GPIO2`
-- PPS input: `GPIO13` (rising-edge interrupt)
+- PPS input: `GPIO12` (rising-edge interrupt)
 - TFT SPI: SCK=`GPIO36`, MOSI=`GPIO35`, CS=`GPIO7`, DC=`GPIO39`, RST=`GPIO40`, BL=`GPIO45`
 - Button (page toggle / wake): `GPIO0` (active low with pull-up)
-- Battery monitor (MAX17048) I2C: SDA=`GPIO3`, SCL=`GPIO4`
+- Battery monitor I2C: SDA=`GPIO42`, SCL=`GPIO41` (MAX17048 or LC709203)
 
 ## Bring-up checklist
 
 - GPS status LED blinks while searching, then slows after fix.
 - Serial monitor shows firmware heartbeat.
-- After UART parser is added, monitor should display valid NMEA sentences.
-- After PPS is wired, firmware should observe a 1 Hz edge interrupt.
+- Monitor should display valid NMEA sentences after UART parser is active.
+- After PPS is wired to `GPIO12`, firmware should observe a 1 Hz edge interrupt.
 
 ## Practical recommendations
 

@@ -3,6 +3,7 @@
 //! This module supports the two fuel gauges used in project hardware variants:
 //! MAX17048 and LC709203.
 
+#[cfg(target_os = "espidf")]
 use esp_idf_svc::hal::i2c;
 
 /// Last sampled battery telemetry values.
@@ -23,14 +24,29 @@ pub enum BatteryMonitor {
     Lc709203,
 }
 
+/// Decode MAX17048 VCELL register bytes into volts.
+pub fn decode_max17048_vcell(vcell: [u8; 2]) -> f32 {
+    let vraw = u16::from_be_bytes(vcell);
+    (vraw as f32) * 78.125e-6
+}
+
+/// Decode MAX17048 SOC register bytes into percent.
+pub fn decode_max17048_soc(soc: [u8; 2]) -> f32 {
+    (soc[0] as f32) + ((soc[1] as f32) / 256.0)
+}
+
+/// Decode LC709203 cell voltage register bytes into millivolts.
+pub fn decode_lc709203_voltage_mv(vcell: [u8; 2]) -> f32 {
+    u16::from_le_bytes(vcell) as f32
+}
+
+/// Decode LC709203 RSOC register bytes into percent.
+pub fn decode_lc709203_percent(rsoc: [u8; 2]) -> f32 {
+    u16::from_le_bytes(rsoc) as f32
+}
+
 /// Read battery telemetry from a MAX17048 fuel gauge.
-///
-/// # Parameters
-/// - `i2c`: I2C driver used to read MAX17048 registers.
-///
-/// # Returns
-/// - `Ok(BatterySnapshot)` when both voltage and SOC reads succeed.
-/// - `Err` when an I2C transaction fails.
+#[cfg(target_os = "espidf")]
 fn read_max17048(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<BatterySnapshot> {
     const MAX17048_ADDR: u8 = 0x36;
     const REG_VCELL: u8 = 0x02;
@@ -42,21 +58,14 @@ fn read_max17048(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<BatterySnapshot
     i2c.write_read(MAX17048_ADDR, &[REG_SOC], &mut soc, 50)
         .map_err(|e| anyhow::anyhow!("MAX17048 read SOC failed: {e}"))?;
 
-    let vraw = u16::from_be_bytes(vcell);
-    let voltage_v = (vraw as f32) * 78.125e-6;
-    let percent = (soc[0] as f32) + ((soc[1] as f32) / 256.0);
+    let voltage_v = decode_max17048_vcell(vcell);
+    let percent = decode_max17048_soc(soc);
 
     Ok(BatterySnapshot { voltage_v, percent })
 }
 
 /// Read battery telemetry from an LC709203 fuel gauge.
-///
-/// # Parameters
-/// - `i2c`: I2C driver used to read LC709203 registers.
-///
-/// # Returns
-/// - `Ok(BatterySnapshot)` when both voltage and RSOC reads succeed.
-/// - `Err` when an I2C transaction fails.
+#[cfg(target_os = "espidf")]
 fn read_lc709203(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<BatterySnapshot> {
     const LC709203_ADDR: u8 = 0x0B;
     const REG_VCELL_MV: u8 = 0x09;
@@ -69,24 +78,14 @@ fn read_lc709203(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<BatterySnapshot
     i2c.write_read(LC709203_ADDR, &[REG_RSOC], &mut rsoc, 50)
         .map_err(|e| anyhow::anyhow!("LC709203 read RSOC failed: {e}"))?;
 
-    // LC709203 uses little-endian 16-bit register values.
-    let voltage_mv = u16::from_le_bytes(vcell) as f32;
-    let percent = u16::from_le_bytes(rsoc) as f32;
-
     Ok(BatterySnapshot {
-        voltage_v: voltage_mv / 1000.0,
-        percent,
+        voltage_v: decode_lc709203_voltage_mv(vcell) / 1000.0,
+        percent: decode_lc709203_percent(rsoc),
     })
 }
 
 /// Probe known battery monitor addresses and return the detected chip.
-///
-/// # Parameters
-/// - `i2c`: I2C driver used for probe reads.
-///
-/// # Returns
-/// - `Some(BatteryMonitor)` for the first recognized monitor.
-/// - `None` when no supported monitor responds.
+#[cfg(target_os = "espidf")]
 pub fn detect_monitor(i2c: &mut i2c::I2cDriver<'_>) -> Option<BatteryMonitor> {
     if read_max17048(i2c).is_ok() {
         return Some(BatteryMonitor::Max17048);
@@ -98,14 +97,7 @@ pub fn detect_monitor(i2c: &mut i2c::I2cDriver<'_>) -> Option<BatteryMonitor> {
 }
 
 /// Read battery telemetry using the previously detected monitor type.
-///
-/// # Parameters
-/// - `i2c`: I2C driver used for register access.
-/// - `monitor`: Detected monitor type to query.
-///
-/// # Returns
-/// - `Ok(BatterySnapshot)` when a read succeeds for the selected monitor.
-/// - `Err` when the underlying monitor read fails.
+#[cfg(target_os = "espidf")]
 pub fn read_battery(
     i2c: &mut i2c::I2cDriver<'_>,
     monitor: BatteryMonitor,
@@ -113,5 +105,28 @@ pub fn read_battery(
     match monitor {
         BatteryMonitor::Max17048 => read_max17048(i2c),
         BatteryMonitor::Lc709203 => read_lc709203(i2c),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_max17048_vcell_known_value() {
+        // 0x9800 -> 38912 * 78.125uV = 3.04V (typical register encoding)
+        let volts = decode_max17048_vcell([0x98, 0x00]);
+        assert!((volts - 3.04).abs() < 0.001);
+    }
+
+    #[test]
+    fn decode_max17048_soc_whole_and_fraction() {
+        assert!((decode_max17048_soc([75, 128]) - 75.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn decode_lc709203_registers() {
+        assert_eq!(decode_lc709203_voltage_mv([0x10, 0x0E]), 3600.0);
+        assert_eq!(decode_lc709203_percent([100, 0]), 100.0);
     }
 }

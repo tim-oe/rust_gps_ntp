@@ -4,19 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1"
 chrono = "0.4"
 chrono-tz = "0.10"
 log = "0.4"
+portable-atomic = "1"
 
 [target.'cfg(target_os = "espidf")'.dependencies]
-anyhow = "1"
 display-interface = "0.4"
 display-interface-spi = "0.4"
 embedded-graphics = "0.7"
 embedded-svc = "0.28"
 embedded-hal-02 = { package = "embedded-hal", version = "0.2" }
 esp-idf-svc = { version = "0.51", features = ["std", "binstart"] }
-nmea = "0.7"
 st7789 = "0.7"
 
 [build-dependencies]

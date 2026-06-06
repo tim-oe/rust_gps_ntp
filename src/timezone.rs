@@ -1,22 +1,28 @@
-//! Timezone resolution and cache helpers for GPS coordinates.
-//!
-//! The implementation uses a lightweight HTTP lookup and stores the resulting
-//! IANA timezone name in NVS for reuse across boots.
+//! IANA timezone resolution, NVS cache, and background HTTP lookup.
 
+#[cfg(target_os = "espidf")]
 use anyhow::{Context, anyhow};
+#[cfg(target_os = "espidf")]
 use embedded_svc::http::{Method, client::Client as HttpClient};
+#[cfg(target_os = "espidf")]
 use embedded_svc::utils::io;
+#[cfg(target_os = "espidf")]
 use esp_idf_svc::http::client::EspHttpConnection;
+#[cfg(target_os = "espidf")]
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
 
+#[cfg(target_os = "espidf")]
 const NVS_NAMESPACE: &str = "rust_gps_ntp";
+#[cfg(target_os = "espidf")]
 const NVS_KEY_LOCAL_TZ: &str = "local_tz";
 
 /// NVS-backed storage for resolved timezone values.
+#[cfg(target_os = "espidf")]
 pub struct TimezoneStore {
     nvs: EspDefaultNvs,
 }
 
+#[cfg(target_os = "espidf")]
 impl TimezoneStore {
     /// Open timezone cache namespace in default NVS partition.
     pub fn new(partition: EspDefaultNvsPartition) -> anyhow::Result<Self> {
@@ -43,6 +49,7 @@ impl TimezoneStore {
 }
 
 /// Resolve timezone from latitude/longitude using an online API.
+#[cfg(target_os = "espidf")]
 pub fn fetch_timezone_for_coords(lat: f32, lon: f32) -> anyhow::Result<Option<String>> {
     // Primary provider: Open-Meteo (no key required).
     let open_meteo_url = format!(
@@ -60,6 +67,80 @@ pub fn fetch_timezone_for_coords(lat: f32, lon: f32) -> anyhow::Result<Option<St
     fetch_timezone_from_url(&geonames_url).context("timezone lookup request failed (geonames)")
 }
 
+/// Non-blocking timezone lookup worker backed by a background thread.
+#[cfg(target_os = "espidf")]
+pub struct TimezoneWorker {
+    request_tx: std::sync::mpsc::Sender<(f32, f32)>,
+    result_rx: std::sync::mpsc::Receiver<anyhow::Result<Option<String>>>,
+    pending: bool,
+    _handle: std::thread::JoinHandle<()>,
+}
+
+#[cfg(target_os = "espidf")]
+impl TimezoneWorker {
+    /// Spawn a worker thread that executes HTTP lookups off the main loop.
+    pub fn spawn() -> anyhow::Result<Self> {
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::Builder::new()
+            .name("tz_lookup".into())
+            .stack_size(12_000)
+            .spawn(move || {
+                while let Ok((lat, lon)) = request_rx.recv() {
+                    let result = fetch_timezone_for_coords(lat, lon);
+                    if result_tx.send(result).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("failed to spawn timezone lookup worker")?;
+
+        Ok(Self {
+            request_tx,
+            result_rx,
+            pending: false,
+            _handle: handle,
+        })
+    }
+
+    /// Return true while a lookup request is in flight.
+    pub fn is_pending(&self) -> bool {
+        self.pending
+    }
+
+    /// Queue a coordinate lookup when no request is pending.
+    pub fn try_request(&mut self, lat: f32, lon: f32) -> bool {
+        if self.pending {
+            return false;
+        }
+        match self.request_tx.send((lat, lon)) {
+            Ok(()) => {
+                self.pending = true;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Poll for a completed lookup result without blocking the main loop.
+    pub fn poll(&mut self) -> Option<anyhow::Result<Option<String>>> {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.result_rx.try_recv() {
+            Ok(result) => {
+                self.pending = false;
+                Some(result)
+            }
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => {
+                self.pending = false;
+                Some(Err(anyhow!("timezone worker disconnected")))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "espidf")]
 fn fetch_timezone_from_url(url: &str) -> anyhow::Result<Option<String>> {
     let mut client = HttpClient::wrap(
         EspHttpConnection::new(&Default::default())
@@ -87,7 +168,8 @@ fn fetch_timezone_from_url(url: &str) -> anyhow::Result<Option<String>> {
         .or_else(|| extract_json_string_field(body, "ianaTimeZoneId")))
 }
 
-fn extract_json_string_field<'a>(json: &'a str, key: &str) -> Option<String> {
+/// Extract a JSON string field value from a minimal API response body.
+pub fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
     let key_needle = format!("\"{key}\"");
     let key_pos = json.find(&key_needle)?;
     let after_key = &json[key_pos + key_needle.len()..];
@@ -100,4 +182,33 @@ fn extract_json_string_field<'a>(json: &'a str, key: &str) -> Option<String> {
     tail = &tail[1..];
     let end = tail.find('"')?;
     Some(tail[..end].to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_json_string_field;
+
+    #[test]
+    fn extract_json_string_field_reads_timezone_key() {
+        let body = r#"{"latitude":38.9,"longitude":-90.2,"timezone":"America/Chicago"}"#;
+        assert_eq!(
+            extract_json_string_field(body, "timezone"),
+            Some("America/Chicago".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_json_string_field_reads_geonames_alias() {
+        let body = r#"{"timezoneId":"Europe/Berlin","status":"OK"}"#;
+        assert_eq!(
+            extract_json_string_field(body, "timezoneId"),
+            Some("Europe/Berlin".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_json_string_field_missing_key_returns_none() {
+        let body = r#"{"latitude":0.0,"longitude":0.0}"#;
+        assert_eq!(extract_json_string_field(body, "timezone"), None);
+    }
 }

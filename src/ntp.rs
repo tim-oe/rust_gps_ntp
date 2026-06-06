@@ -7,6 +7,7 @@ use std::net::UdpSocket;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+#[cfg(target_os = "espidf")]
 use esp_idf_svc::sys;
 
 const NTP_PORT: u16 = 123;
@@ -246,7 +247,7 @@ impl NtpServer {
 
                     self.served += 1;
 
-                    if self.served % 64 == 0 {
+                    if self.served.is_multiple_of(64) {
                         log::debug!("NTP: served {} requests", self.served);
                     }
                 }
@@ -352,7 +353,7 @@ fn build_mode6_response(
     if count > 0 {
         resp.extend_from_slice(&payload[..count as usize]);
         // Mode-6 control payloads are 32-bit aligned on the wire.
-        while resp.len() % 4 != 0 {
+        while !resp.len().is_multiple_of(4) {
             resp.push(0);
         }
     }
@@ -455,14 +456,19 @@ impl NtpServer {
 }
 
 /// Return monotonic microseconds from ESP-IDF high-resolution timer.
-///
-/// # Parameters
-/// - None.
-///
-/// # Returns
-/// - Monotonic microsecond count from ESP-IDF.
 fn monotonic_us_now() -> i64 {
-    unsafe { sys::esp_timer_get_time() }
+    #[cfg(target_os = "espidf")]
+    {
+        return unsafe { sys::esp_timer_get_time() };
+    }
+    #[cfg(not(target_os = "espidf"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64
+    }
 }
 
 /// Write a big-endian `u32` into an output byte slice.
@@ -487,4 +493,55 @@ fn write_u32_be(dst: &mut [u8], value: u32) {
 /// - No return value.
 fn write_u64_be(dst: &mut [u8], value: u64) {
     dst.copy_from_slice(&value.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_response_sets_server_mode_and_stratum_when_synced() {
+        let req = [0_u8; NTP_PACKET_LEN];
+        let resp = build_response(&req, true, 0x0123_0000_0000_0000);
+        assert_eq!(resp[0] & 0x07, 4);
+        assert_eq!(resp[1], 1);
+        assert_eq!(&resp[12..16], b"GPS\0");
+    }
+
+    #[test]
+    fn build_response_marks_unsynced_with_init_refid() {
+        let req = [0_u8; NTP_PACKET_LEN];
+        let resp = build_response(&req, false, 0);
+        assert_eq!(resp[1], 16);
+        assert_eq!(&resp[12..16], b"INIT");
+    }
+
+    #[test]
+    fn build_mode6_readvar_includes_gps_peer_when_synced() {
+        let req = [
+            0,
+            MODE6_OPCODE_READVAR,
+            0,
+            0,
+            0,
+            0,
+            0,
+            MODE6_ASSOC_ID as u8,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let resp = build_mode6_response(&req, 4, true, 250, 500.0, 1200.0);
+        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
+        assert!(payload.contains("refid=GPS"));
+        assert!(payload.contains("stratum=1"));
+    }
+
+    #[test]
+    fn write_u64_be_roundtrip() {
+        let mut buf = [0_u8; 8];
+        write_u64_be(&mut buf, 0x0123_4567_89ab_cdef);
+        assert_eq!(buf, 0x0123_4567_89ab_cdef_u64.to_be_bytes());
+    }
 }

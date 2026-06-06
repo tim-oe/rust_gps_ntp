@@ -31,6 +31,28 @@ pub struct GpsSnapshot {
     pub sats: u8,
 }
 
+/// Validate the NMEA XOR checksum suffix (`*$HH`).
+pub fn nmea_checksum_valid(sentence: &str) -> bool {
+    let bytes = sentence.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return false;
+    }
+    let Some(star_idx) = sentence.rfind('*') else {
+        return false;
+    };
+    if star_idx + 3 > sentence.len() {
+        return false;
+    }
+    let Ok(expected) = u8::from_str_radix(&sentence[star_idx + 1..star_idx + 3], 16) else {
+        return false;
+    };
+    let mut computed = 0_u8;
+    for &byte in &bytes[1..star_idx] {
+        computed ^= byte;
+    }
+    computed == expected
+}
+
 /// Validate and normalize an NMEA `hhmmss` time field.
 ///
 /// # Parameters
@@ -219,6 +241,10 @@ fn utc_datetime_from_fields(utc_date: &str, utc_time: &str) -> Option<NaiveDateT
 /// - `Some(())` when required RMC fields parse successfully.
 /// - `None` when required fields are missing or malformed.
 pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
+    if !nmea_checksum_valid(sentence) {
+        log::trace!("GPS RMC rejected: checksum invalid");
+        return None;
+    }
     log::trace!("GPS RMC raw: {}", sentence);
     let fields: Vec<&str> = sentence.split(',').collect();
     if fields.len() < 10 {
@@ -263,6 +289,10 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
 /// - `Some(())` when satellite count parses successfully.
 /// - `None` when required GGA fields are missing or malformed.
 pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
+    if !nmea_checksum_valid(sentence) {
+        log::trace!("GPS GGA rejected: checksum invalid");
+        return None;
+    }
     log::trace!("GPS GGA raw: {}", sentence);
     let fields: Vec<&str> = sentence.split(',').collect();
     if fields.len() < 8 {
@@ -276,6 +306,20 @@ pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nmea_checksum_valid_accepts_known_sentence() {
+        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
+        assert!(nmea_checksum_valid(rmc));
+    }
+
+    #[test]
+    fn nmea_checksum_invalid_rejects_parse() {
+        let mut gps = GpsSnapshot::default();
+        let bad = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*00";
+        assert!(!nmea_checksum_valid(bad));
+        assert_eq!(parse_rmc(bad, &mut gps), None);
+    }
 
     #[test]
     fn parse_rmc_populates_local_fields_and_coords() {
@@ -294,7 +338,7 @@ mod tests {
     #[test]
     fn parse_rmc_marks_invalid_fix_status() {
         let mut gps = GpsSnapshot::default();
-        let rmc = "$GPRMC,225446,V,4916.45,N,12311.12,W,000.5,054.7,191194,020.3,E*68";
+        let rmc = "$GPRMC,225446,V,4916.45,N,12311.12,W,000.5,054.7,191194,020.3,E*7F";
 
         assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
         assert!(!gps.fix);
@@ -304,7 +348,7 @@ mod tests {
     #[test]
     fn parse_gga_updates_satellite_count() {
         let mut gps = GpsSnapshot::default();
-        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08,1.0,545.4,M,46.9,M,,*47";
+        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08,1.0,545.4,M,46.9,M,,*45";
 
         assert_eq!(parse_gga(gga, &mut gps), Some(()));
         assert_eq!(gps.sats, 8);
@@ -315,7 +359,7 @@ mod tests {
         assert!(set_runtime_timezone("America/Chicago"));
         let mut gps = GpsSnapshot::default();
         // 2026-06-01 12:00:00 UTC should be 07:00:00 CDT (UTC-5).
-        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010626,0.0,E*00";
+        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010626,0.0,E*67";
 
         assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
         assert_eq!(gps.local_date, "2026-06-01");
@@ -328,7 +372,7 @@ mod tests {
         assert!(set_runtime_timezone("America/Chicago"));
         let mut gps = GpsSnapshot::default();
         // 2026-01-01 12:00:00 UTC should be 06:00:00 CST (UTC-6).
-        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010126,0.0,E*00";
+        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010126,0.0,E*60";
 
         assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
         assert_eq!(gps.local_date, "2026-01-01");

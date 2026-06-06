@@ -55,8 +55,10 @@ flash-monitor:
     just check-esp
     source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}} --monitor
 
-ci: fmt-check lint test
+# Host-only CI (works without ESP toolchain); default for local dev and GitHub Actions.
+ci: fmt-check lint-host test-host
 
+# Full firmware CI including ESP target check (requires export-esp.sh).
 ci-esp: fmt-check lint-host test-host check-esp
 
 ci-coverage: fmt-check lint-host test-host coverage-lcov
