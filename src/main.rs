@@ -108,10 +108,6 @@ fn main() -> anyhow::Result<()> {
     let mut display = ST7789::new(di, Some(rst), Some(backlight), 240, 135);
     let mut ets = Ets;
     let backlight_on_state = display::init_display(&mut display, &mut ets)?;
-    {
-        let mut panel = display::make_panel(&mut display);
-        display::draw_boot_test(&mut panel);
-    }
 
     let mut rx_buf = [0_u8; 256];
     let mut line_buf = String::new();

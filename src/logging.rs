@@ -36,15 +36,52 @@ fn level_from_sdkconfig_defaults(key: &str) -> Option<&'static str> {
     None
 }
 
+fn level_from_key(key: &str, build_env_value: Option<&'static str>) -> Option<EspLogLevel> {
+    let raw = build_env_value.or_else(|| level_from_sdkconfig_defaults(key))?;
+    parse_level(raw)
+}
+
+fn sdkconfig_flag_enabled(key: &str) -> bool {
+    matches!(level_from_sdkconfig_defaults(key), Some("y" | "1" | "true" | "yes"))
+}
+
+fn global_default_level() -> EspLogLevel {
+    if sdkconfig_flag_enabled("CONFIG_LOG_DEFAULT_LEVEL_VERBOSE") {
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_VERBOSE
+    } else if sdkconfig_flag_enabled("CONFIG_LOG_DEFAULT_LEVEL_DEBUG") {
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_DEBUG
+    } else if sdkconfig_flag_enabled("CONFIG_LOG_DEFAULT_LEVEL_INFO") {
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_INFO
+    } else if sdkconfig_flag_enabled("CONFIG_LOG_DEFAULT_LEVEL_WARN") {
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_WARN
+    } else if sdkconfig_flag_enabled("CONFIG_LOG_DEFAULT_LEVEL_ERROR") {
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_ERROR
+    } else if sdkconfig_flag_enabled("CONFIG_LOG_DEFAULT_LEVEL_NONE") {
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_NONE
+    } else {
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_INFO
+    }
+}
+
 fn set_level_from_key(tag: &str, key: &str, build_env_value: Option<&'static str>) {
     if let Some(raw) = build_env_value.or_else(|| level_from_sdkconfig_defaults(key)) {
-        if let Some(level) = parse_level(raw) {
+        if let Some(level) = level_from_key(key, build_env_value) {
             set_level(tag, level);
             log::info!("log level override: {}={} (key: {})", tag, raw, key);
         } else {
             log::warn!("invalid log level for {}: '{}'", key, raw);
         }
     }
+}
+
+pub fn display_boot_test_enabled() -> bool {
+    let effective_display_level = level_from_key("LOG_DISPLAY_LEVEL", option_env!("LOG_DISPLAY_LEVEL"))
+        .unwrap_or_else(global_default_level);
+    matches!(
+        effective_display_level,
+        esp_idf_svc::sys::esp_log_level_t_ESP_LOG_DEBUG
+            | esp_idf_svc::sys::esp_log_level_t_ESP_LOG_VERBOSE
+    )
 }
 
 /// Initialize ESP logger backend and apply optional per-module level overrides.

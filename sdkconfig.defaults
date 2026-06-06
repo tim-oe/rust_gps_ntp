@@ -16,3 +16,4 @@ CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
 # module log levels
 # LOG_GPS_LEVEL=trace
 # LOG_PPS_LEVEL=trace
+# LOG_DISPLAY_LEVEL=trace

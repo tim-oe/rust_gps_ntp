@@ -1,4 +1,5 @@
 use anyhow::anyhow;
+use core::sync::atomic::{AtomicBool, Ordering};
 use embedded_graphics::mono_font::ascii::FONT_8X13_BOLD;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::Rgb565;
@@ -17,6 +18,7 @@ pub const DISPLAY_X_OFFSET: i32 = 40;
 pub const DISPLAY_Y_OFFSET: i32 = 52;
 const DISPLAY_WIDTH: u16 = 240;
 const DISPLAY_HEIGHT: u16 = 135;
+static BOOT_TEST_DRAWN: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Copy, Clone)]
 pub enum Page {
@@ -128,19 +130,30 @@ where
     }
 }
 
-pub fn make_panel<'a, DI, RST, BL>(display: &'a mut ST7789<DI, RST, BL>) -> OffsetDisplay<'a, DI, RST, BL>
+pub fn make_panel<'a, DI, RST, BL, PinE>(
+    display: &'a mut ST7789<DI, RST, BL>,
+) -> OffsetDisplay<'a, DI, RST, BL>
 where
     DI: display_interface::WriteOnlyDataCommand,
-    RST: embedded_hal_02::digital::v2::OutputPin,
-    BL: embedded_hal_02::digital::v2::OutputPin,
+    RST: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
+    BL: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
+    ST7789<DI, RST, BL>: DrawTarget<Color = Rgb565, Error = st7789::Error<PinE>>,
 {
-    OffsetDisplay::new(
+    let mut panel = OffsetDisplay::new(
         display,
         DISPLAY_X_OFFSET as u16,
         DISPLAY_Y_OFFSET as u16,
         DISPLAY_WIDTH,
         DISPLAY_HEIGHT,
-    )
+    );
+
+    let should_draw_boot_test = crate::logging::display_boot_test_enabled()
+        && !BOOT_TEST_DRAWN.swap(true, Ordering::AcqRel);
+    if should_draw_boot_test {
+        draw_boot_test(&mut panel);
+    }
+
+    panel
 }
 
 pub fn backlight_off_state() -> BacklightState {
@@ -186,7 +199,7 @@ where
     Ok(backlight_on_state)
 }
 
-pub fn draw_boot_test<D>(panel: &mut D)
+fn draw_boot_test<D>(panel: &mut D)
 where
     D: DrawTarget<Color = Rgb565>,
 {
@@ -204,12 +217,12 @@ where
         .text_color(Rgb565::WHITE)
         .build();
     let _ = Text::new("Display boot test", Point::new(8, 20), boot_style).draw(panel);
-    log::info!(
+    log::debug!(
         "Display init: applying viewport offsets x={} y={}",
         DISPLAY_X_OFFSET,
         DISPLAY_Y_OFFSET
     );
-    log::info!("Display init: boot test pattern drawn");
+    log::debug!("Display init: boot test pattern drawn");
     FreeRtos::delay_ms(800);
 }
 
