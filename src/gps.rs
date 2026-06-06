@@ -1,17 +1,44 @@
-use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime};
+//! GPS sentence parsing and display-oriented snapshot shaping.
+//!
+//! The parser ingests NMEA RMC/GGA sentences and maintains a lightweight state
+//! object that is consumed by display and NTP paths.
 
+use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Offset};
+use chrono_tz::Tz;
+use std::str::FromStr;
+use std::sync::{OnceLock, RwLock};
+
+static RUNTIME_TZ: OnceLock<RwLock<Option<Tz>>> = OnceLock::new();
+
+/// Current GPS-derived values used by UI and NTP logic.
 #[derive(Debug, Clone, Default)]
 pub struct GpsSnapshot {
+    /// Local date string derived from UTC and longitude-based timezone estimate.
     pub local_date: String,
+    /// Local time string derived from UTC and longitude-based timezone estimate.
     pub local_time: String,
+    /// Estimated local timezone offset in hours.
     pub tz_offset_hours: i8,
+    /// Parsed UTC seconds since Unix epoch from the latest valid RMC sentence.
     pub utc_unix_seconds: Option<i64>,
+    /// Latitude in signed decimal degrees.
     pub lat: f32,
+    /// Longitude in signed decimal degrees.
     pub lon: f32,
+    /// True when RMC status reports an active fix.
     pub fix: bool,
+    /// Satellite count from the latest GGA sentence.
     pub sats: u8,
 }
 
+/// Validate and normalize an NMEA `hhmmss` time field.
+///
+/// # Parameters
+/// - `raw`: Raw NMEA field that should begin with `hhmmss`.
+///
+/// # Returns
+/// - `Some(&str)` containing the normalized first 6 characters.
+/// - `None` when the field is too short or non-ASCII.
 fn parse_hhmmss(raw: &str) -> Option<&str> {
     if raw.len() < 6 || !raw.is_ascii() {
         return None;
@@ -19,10 +46,25 @@ fn parse_hhmmss(raw: &str) -> Option<&str> {
     Some(&raw[..6])
 }
 
+/// Format a normalized `hhmmss` field as `HH:MM:SS`.
+///
+/// # Parameters
+/// - `raw6`: Normalized six-character time field.
+///
+/// # Returns
+/// - Formatted `HH:MM:SS` string.
 fn format_hhmmss(raw6: &str) -> String {
     format!("{}:{}:{}", &raw6[0..2], &raw6[2..4], &raw6[4..6])
 }
 
+/// Validate and normalize an NMEA `ddmmyy` date field.
+///
+/// # Parameters
+/// - `raw`: Raw NMEA field that should begin with `ddmmyy`.
+///
+/// # Returns
+/// - `Some(&str)` containing the normalized first 6 characters.
+/// - `None` when the field is too short or non-ASCII.
 fn parse_ddmmyy(raw: &str) -> Option<&str> {
     if raw.len() < 6 || !raw.is_ascii() {
         return None;
@@ -30,10 +72,26 @@ fn parse_ddmmyy(raw: &str) -> Option<&str> {
     Some(&raw[..6])
 }
 
+/// Format a normalized `ddmmyy` field as `YYYY-MM-DD`.
+///
+/// # Parameters
+/// - `raw6`: Normalized six-character date field.
+///
+/// # Returns
+/// - Formatted `YYYY-MM-DD` string using a 2000-based century.
 fn format_ddmmyy(raw6: &str) -> String {
     format!("20{}-{}-{}", &raw6[4..6], &raw6[2..4], &raw6[0..2])
 }
 
+/// Convert NMEA `ddmm.mmmm`/`dddmm.mmmm` coordinates to decimal degrees.
+///
+/// # Parameters
+/// - `value`: Coordinate field in NMEA degree-minute format.
+/// - `dir`: Hemisphere designator (`N`, `S`, `E`, or `W`).
+///
+/// # Returns
+/// - `Some(f32)` signed decimal degrees.
+/// - `None` when parsing fails.
 fn nmea_to_decimal(value: &str, dir: &str) -> Option<f32> {
     let raw: f32 = value.parse().ok()?;
     let degrees = (raw / 100.0).floor();
@@ -45,12 +103,21 @@ fn nmea_to_decimal(value: &str, dir: &str) -> Option<f32> {
     Some(decimal)
 }
 
+/// Estimate local datetime from UTC fields and longitude-derived timezone.
+///
+/// # Parameters
+/// - `utc_date`: Date field in `ddmmyy` format.
+/// - `utc_time`: Time field in `hhmmss` format.
+/// - `lon`: Longitude used to estimate timezone offset (`round(lon/15)`).
+///
+/// # Returns
+/// - `Some((local_date, local_time, tz_offset_hours))` when conversion succeeds.
+/// - `None` when UTC date/time parsing fails.
 fn local_datetime_from_utc(
     utc_date: &str,
     utc_time: &str,
     lon: f32,
 ) -> Option<(String, String, i8)> {
-    let tz_offset_h = (lon / 15.0).round() as i8;
     let ddmmyy = parse_ddmmyy(utc_date)?;
     let hhmmss = parse_hhmmss(utc_time)?;
 
@@ -63,14 +130,69 @@ fn local_datetime_from_utc(
 
     let date = NaiveDate::from_ymd_opt(year, month, day)?;
     let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-    let dt = NaiveDateTime::new(date, time) + ChronoDuration::hours(tz_offset_h as i64);
-    Some((
-        dt.date().format("%Y-%m-%d").to_string(),
-        dt.time().format("%H:%M:%S").to_string(),
-        tz_offset_h,
-    ))
+    let utc_dt = NaiveDateTime::new(date, time).and_utc();
+
+    if let Some(tz) = configured_timezone() {
+        let local = utc_dt.with_timezone(&tz);
+        let tz_offset_h = (local.offset().fix().local_minus_utc() / 3600) as i8;
+        Some((
+            local.date_naive().format("%Y-%m-%d").to_string(),
+            local.time().format("%H:%M:%S").to_string(),
+            tz_offset_h,
+        ))
+    } else {
+        let tz_offset_h = (lon / 15.0).round() as i8;
+        let dt = utc_dt.naive_utc() + ChronoDuration::hours(tz_offset_h as i64);
+        Some((
+            dt.date().format("%Y-%m-%d").to_string(),
+            dt.time().format("%H:%M:%S").to_string(),
+            tz_offset_h,
+        ))
+    }
 }
 
+fn configured_timezone() -> Option<Tz> {
+    runtime_timezone().or_else(|| {
+        static TZ: OnceLock<Option<Tz>> = OnceLock::new();
+        *TZ.get_or_init(|| option_env!("LOCAL_TZ").and_then(|name| Tz::from_str(name).ok()))
+    })
+}
+
+fn runtime_timezone() -> Option<Tz> {
+    let lock = RUNTIME_TZ.get_or_init(|| RwLock::new(None));
+    lock.read().ok().and_then(|guard| *guard)
+}
+
+/// Set the runtime timezone from an IANA timezone name.
+///
+/// # Parameters
+/// - `tz_name`: IANA timezone identifier, for example `America/Chicago`.
+///
+/// # Returns
+/// - `true` if parsing and update succeeded.
+/// - `false` if `tz_name` is invalid.
+pub fn set_runtime_timezone(tz_name: &str) -> bool {
+    let Some(tz) = Tz::from_str(tz_name).ok() else {
+        return false;
+    };
+    let lock = RUNTIME_TZ.get_or_init(|| RwLock::new(None));
+    if let Ok(mut guard) = lock.write() {
+        *guard = Some(tz);
+        true
+    } else {
+        false
+    }
+}
+
+/// Convert raw UTC date/time NMEA fields into a UTC `NaiveDateTime`.
+///
+/// # Parameters
+/// - `utc_date`: Date field in `ddmmyy` format.
+/// - `utc_time`: Time field in `hhmmss` format.
+///
+/// # Returns
+/// - `Some(NaiveDateTime)` when both fields parse correctly.
+/// - `None` when parsing fails.
 fn utc_datetime_from_fields(utc_date: &str, utc_time: &str) -> Option<NaiveDateTime> {
     let ddmmyy = parse_ddmmyy(utc_date)?;
     let hhmmss = parse_hhmmss(utc_time)?;
@@ -87,6 +209,15 @@ fn utc_datetime_from_fields(utc_date: &str, utc_time: &str) -> Option<NaiveDateT
     Some(NaiveDateTime::new(date, time))
 }
 
+/// Parse an RMC sentence and update position, fix, local time and UTC epoch.
+///
+/// # Parameters
+/// - `sentence`: Full NMEA RMC sentence.
+/// - `gps`: Mutable snapshot updated in place on successful parse.
+///
+/// # Returns
+/// - `Some(())` when required RMC fields parse successfully.
+/// - `None` when required fields are missing or malformed.
 pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     log::trace!("GPS RMC raw: {}", sentence);
     let fields: Vec<&str> = sentence.split(',').collect();
@@ -122,6 +253,15 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     Some(())
 }
 
+/// Parse a GGA sentence and update satellite count.
+///
+/// # Parameters
+/// - `sentence`: Full NMEA GGA sentence.
+/// - `gps`: Mutable snapshot updated in place on successful parse.
+///
+/// # Returns
+/// - `Some(())` when satellite count parses successfully.
+/// - `None` when required GGA fields are missing or malformed.
 pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     log::trace!("GPS GGA raw: {}", sentence);
     let fields: Vec<&str> = sentence.split(',').collect();
@@ -168,5 +308,31 @@ mod tests {
 
         assert_eq!(parse_gga(gga, &mut gps), Some(()));
         assert_eq!(gps.sats, 8);
+    }
+
+    #[test]
+    fn runtime_timezone_override_applies_dst_rules_for_summer() {
+        assert!(set_runtime_timezone("America/Chicago"));
+        let mut gps = GpsSnapshot::default();
+        // 2026-06-01 12:00:00 UTC should be 07:00:00 CDT (UTC-5).
+        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010626,0.0,E*00";
+
+        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
+        assert_eq!(gps.local_date, "2026-06-01");
+        assert_eq!(gps.local_time, "07:00:00");
+        assert_eq!(gps.tz_offset_hours, -5);
+    }
+
+    #[test]
+    fn runtime_timezone_override_applies_dst_rules_for_winter() {
+        assert!(set_runtime_timezone("America/Chicago"));
+        let mut gps = GpsSnapshot::default();
+        // 2026-01-01 12:00:00 UTC should be 06:00:00 CST (UTC-6).
+        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010126,0.0,E*00";
+
+        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
+        assert_eq!(gps.local_date, "2026-01-01");
+        assert_eq!(gps.local_time, "06:00:00");
+        assert_eq!(gps.tz_offset_hours, -6);
     }
 }

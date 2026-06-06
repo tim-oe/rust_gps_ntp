@@ -1,3 +1,5 @@
+//! ESP32 firmware entrypoint wiring together Wi-Fi, GPS, display, battery, PPS, and NTP.
+
 #[cfg(target_os = "espidf")]
 mod battery;
 #[cfg(target_os = "espidf")]
@@ -9,9 +11,19 @@ mod logging;
 #[cfg(target_os = "espidf")]
 mod ntp;
 #[cfg(target_os = "espidf")]
+mod timezone;
+#[cfg(target_os = "espidf")]
 mod wifi;
 
 #[cfg(target_os = "espidf")]
+/// Run firmware initialization and the main service loop on ESP-IDF targets.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - `Ok(())` only if the main loop exits cleanly (normally it runs forever).
+/// - `Err` when initialization of required peripherals/services fails.
 fn main() -> anyhow::Result<()> {
     use anyhow::Context;
     use core::sync::atomic::{AtomicU32, Ordering};
@@ -41,6 +53,7 @@ fn main() -> anyhow::Result<()> {
 
     let default_nvs =
         EspDefaultNvsPartition::take().context("failed to take default NVS partition for Wi-Fi")?;
+    let default_nvs_tz = default_nvs.clone();
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()
         .context("failed to take system event loop")?;
     let _wifi = wifi::connect_wifi_sta(modem, sys_loop, default_nvs, &wifi_creds)?;
@@ -106,7 +119,9 @@ fn main() -> anyhow::Result<()> {
     let rst = PinDriver::output(pins.gpio40).context("failed to init TFT RST")?;
     let backlight = PinDriver::output(pins.gpio45).context("failed to init TFT backlight")?;
     let mut button = PinDriver::input(pins.gpio0).context("failed to init page button")?;
-    button.set_pull(Pull::Up).ok();
+    if let Err(err) = button.set_pull(Pull::Up) {
+        log::warn!("Display: failed to enable button pull-up: {}", err);
+    }
 
     let di = SPIInterfaceNoCS::new(spi_drv, dc);
     let mut display = ST7789::new(di, Some(rst), Some(backlight), 240, 135);
@@ -137,6 +152,31 @@ fn main() -> anyhow::Result<()> {
     let mut force_redraw = true;
     let mut rendered_once = false;
     let mut ntp_server = ntp::NtpServer::bind()?;
+    let mut tz_store = timezone::TimezoneStore::new(default_nvs_tz).ok();
+    let mut tz_initialized = false;
+    let mut current_tz_name: Option<String> = None;
+    let mut last_tz_lookup_us = 0_i64;
+    const TZ_LOOKUP_RETRY_US: i64 = 300_000_000; // 5 minutes
+    const TZ_LOOKUP_REFRESH_US: i64 = 21_600_000_000; // 6 hours
+    if let Some(store) = tz_store.as_ref() {
+        match store.load_cached() {
+            Ok(Some(tz_name)) if gps::set_runtime_timezone(&tz_name) => {
+                tz_initialized = true;
+                current_tz_name = Some(tz_name.clone());
+                log::info!("GPS: loaded cached timezone {}", tz_name);
+            }
+            Ok(Some(tz_name)) => {
+                log::warn!(
+                    "GPS: cached timezone '{}' is invalid; will refresh",
+                    tz_name
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                log::warn!("GPS: failed to read timezone cache: {}", err);
+            }
+        }
+    }
     log::info!("NTP: listening on UDP/123");
 
     log::info!("System: booted; Wi-Fi + GPS UART diagnostics mode");
@@ -182,6 +222,75 @@ fn main() -> anyhow::Result<()> {
                                     if gps::parse_rmc(trimmed, &mut gps).is_some() && gps.fix {
                                         if let Some(utc_unix_seconds) = gps.utc_unix_seconds {
                                             ntp_server.update_gps_utc_seconds(utc_unix_seconds);
+                                        }
+                                        let now_us =
+                                            unsafe { esp_idf_svc::sys::esp_timer_get_time() };
+                                        let lookup_interval_us = if tz_initialized {
+                                            TZ_LOOKUP_REFRESH_US
+                                        } else {
+                                            TZ_LOOKUP_RETRY_US
+                                        };
+                                        let should_lookup_tz = last_tz_lookup_us == 0
+                                            || (now_us - last_tz_lookup_us) >= lookup_interval_us;
+                                        if should_lookup_tz {
+                                            match timezone::fetch_timezone_for_coords(
+                                                gps.lat, gps.lon,
+                                            ) {
+                                                Ok(Some(tz_name)) => {
+                                                    if gps::set_runtime_timezone(&tz_name) {
+                                                        let changed = current_tz_name.as_deref()
+                                                            != Some(tz_name.as_str());
+                                                        tz_initialized = true;
+                                                        if changed {
+                                                            if let Some(old_tz) =
+                                                                current_tz_name.as_ref()
+                                                            {
+                                                                log::info!(
+                                                                    "GPS: timezone updated from {} to {}",
+                                                                    old_tz,
+                                                                    tz_name
+                                                                );
+                                                            } else {
+                                                                log::info!(
+                                                                    "GPS: timezone resolved from coordinates: {}",
+                                                                    tz_name
+                                                                );
+                                                            }
+                                                            if let Some(store) = tz_store.as_mut() {
+                                                                if let Err(err) =
+                                                                    store.save(&tz_name)
+                                                                {
+                                                                    log::warn!(
+                                                                        "GPS: failed to persist timezone '{}': {}",
+                                                                        tz_name,
+                                                                        err
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        current_tz_name = Some(tz_name);
+                                                    } else {
+                                                        log::warn!(
+                                                            "GPS: timezone lookup returned invalid value '{}'",
+                                                            tz_name
+                                                        );
+                                                    }
+                                                }
+                                                Ok(None) => {
+                                                    log::warn!(
+                                                        "GPS: timezone lookup returned no timezone for coords ({:.6}, {:.6})",
+                                                        gps.lat,
+                                                        gps.lon
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    log::warn!(
+                                                        "GPS: timezone lookup failed: {}",
+                                                        err
+                                                    );
+                                                }
+                                            }
+                                            last_tz_lookup_us = now_us;
                                         }
                                     }
                                 } else if trimmed.starts_with("$GNGGA")
@@ -230,8 +339,13 @@ fn main() -> anyhow::Result<()> {
         let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
         if last_battery_us == 0 || (now_us - last_battery_us) >= 5_000_000 {
             if let Some(kind) = battery_monitor {
-                if let Some(reading) = battery::read_battery(&mut i2c_drv, kind) {
-                    battery = reading;
+                match battery::read_battery(&mut i2c_drv, kind) {
+                    Ok(reading) => {
+                        battery = reading;
+                    }
+                    Err(err) => {
+                        log::debug!("Battery: read failed: {}", err);
+                    }
                 }
             }
             last_battery_us = now_us;
@@ -241,7 +355,9 @@ fn main() -> anyhow::Result<()> {
         if button_pressed && !last_button_pressed {
             if !screen_on {
                 screen_on = true;
-                let _ = display.set_backlight(backlight_on_state, &mut ets);
+                if let Err(err) = display.set_backlight(backlight_on_state, &mut ets) {
+                    log::warn!("Display: failed to turn backlight on: {:?}", err);
+                }
             } else {
                 current_page = current_page.next();
             }
@@ -255,7 +371,9 @@ fn main() -> anyhow::Result<()> {
             && (now_us - last_interaction_us) >= 15_000_000
         {
             screen_on = false;
-            let _ = display.set_backlight(display::backlight_off_state(), &mut ets);
+            if let Err(err) = display.set_backlight(display::backlight_off_state(), &mut ets) {
+                log::warn!("Display: failed to turn backlight off: {:?}", err);
+            }
         }
 
         if screen_on && (force_redraw || (now_us - last_draw_us) >= 5_000_000) {
@@ -292,6 +410,13 @@ fn main() -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "espidf"))]
+/// Host stub entrypoint used for non-ESP targets.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - No return value.
 fn main() {
     println!("This project targets ESP32 with ESP-IDF (run through cargo espflash).");
 }

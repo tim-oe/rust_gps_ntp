@@ -1,3 +1,8 @@
+//! TFT display initialization and page rendering helpers.
+//!
+//! The display pipeline renders four rotating pages with GPS, battery, and
+//! system-health information.
+
 use anyhow::anyhow;
 use core::sync::atomic::{AtomicBool, Ordering};
 // Official font docs (embedded-graphics mono/ascii):
@@ -22,6 +27,7 @@ const DISPLAY_WIDTH: u16 = 240;
 const DISPLAY_HEIGHT: u16 = 135;
 static BOOT_TEST_DRAWN: AtomicBool = AtomicBool::new(false);
 
+/// Application display pages shown by button rotation.
 #[derive(Debug, Copy, Clone)]
 pub enum Page {
     Time,
@@ -31,6 +37,13 @@ pub enum Page {
 }
 
 impl Page {
+    /// Return the next page in the cyclic page order.
+    ///
+    /// # Parameters
+    /// - `self`: Current page.
+    ///
+    /// # Returns
+    /// - Next page in the four-page rotation.
     pub fn next(self) -> Self {
         match self {
             Self::Time => Self::Location,
@@ -41,6 +54,7 @@ impl Page {
     }
 }
 
+/// Draw-target wrapper that maps logical coordinates into a fixed panel offset.
 pub struct OffsetDisplay<'a, DI, RST, BL>
 where
     DI: display_interface::WriteOnlyDataCommand,
@@ -60,6 +74,17 @@ where
     RST: embedded_hal_02::digital::v2::OutputPin,
     BL: embedded_hal_02::digital::v2::OutputPin,
 {
+    /// Build an offset viewport into an underlying ST7789 target.
+    ///
+    /// # Parameters
+    /// - `inner`: Backing ST7789 draw target.
+    /// - `x_off`: X-axis pixel offset from panel origin.
+    /// - `y_off`: Y-axis pixel offset from panel origin.
+    /// - `width`: Logical viewport width.
+    /// - `height`: Logical viewport height.
+    ///
+    /// # Returns
+    /// - Configured `OffsetDisplay` wrapper.
     fn new(
         inner: &'a mut ST7789<DI, RST, BL>,
         x_off: u16,
@@ -83,6 +108,13 @@ where
     RST: embedded_hal_02::digital::v2::OutputPin,
     BL: embedded_hal_02::digital::v2::OutputPin,
 {
+    /// Report logical viewport size rather than the full backing panel.
+    ///
+    /// # Parameters
+    /// - `self`: Offset viewport instance.
+    ///
+    /// # Returns
+    /// - Logical viewport dimensions as `Size`.
     fn size(&self) -> Size {
         Size::new(self.width as u32, self.height as u32)
     }
@@ -98,6 +130,15 @@ where
     type Color = Rgb565;
     type Error = st7789::Error<PinE>;
 
+    /// Translate incoming pixels by viewport offsets and clip out-of-bounds data.
+    ///
+    /// # Parameters
+    /// - `self`: Offset draw target receiving pixels.
+    /// - `pixels`: Pixel iterator in logical viewport coordinates.
+    ///
+    /// # Returns
+    /// - `Ok(())` when drawing succeeds.
+    /// - Driver-specific draw error on failure.
     fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
     where
         I: IntoIterator<Item = Pixel<Self::Color>>,
@@ -118,6 +159,15 @@ where
         self.inner.draw_iter(mapped)
     }
 
+    /// Clear the logical viewport by drawing into the offset region.
+    ///
+    /// # Parameters
+    /// - `self`: Offset draw target to clear.
+    /// - `color`: Fill color for all logical pixels.
+    ///
+    /// # Returns
+    /// - `Ok(())` when drawing succeeds.
+    /// - Driver-specific draw error on failure.
     fn clear(&mut self, color: Self::Color) -> Result<(), Self::Error> {
         let x_off = self.x_off as i32;
         let y_off = self.y_off as i32;
@@ -132,6 +182,13 @@ where
     }
 }
 
+/// Create the panel viewport and conditionally run the one-time boot test.
+///
+/// # Parameters
+/// - `display`: Mutable ST7789 panel driver.
+///
+/// # Returns
+/// - Offset viewport wrapper used for regular rendering.
 pub fn make_panel<'a, DI, RST, BL, PinE>(
     display: &'a mut ST7789<DI, RST, BL>,
 ) -> OffsetDisplay<'a, DI, RST, BL>
@@ -140,6 +197,7 @@ where
     RST: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
     BL: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
     ST7789<DI, RST, BL>: DrawTarget<Color = Rgb565, Error = st7789::Error<PinE>>,
+    PinE: core::fmt::Debug,
 {
     let mut panel = OffsetDisplay::new(
         display,
@@ -158,6 +216,13 @@ where
     panel
 }
 
+/// Return the ST7789 backlight state used to turn the panel off.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - Backlight state that corresponds to panel-off behavior.
 pub fn backlight_off_state() -> BacklightState {
     if DISPLAY_BACKLIGHT_ACTIVE_LOW {
         BacklightState::On
@@ -166,6 +231,15 @@ pub fn backlight_off_state() -> BacklightState {
     }
 }
 
+/// Initialize the ST7789 panel orientation and backlight defaults.
+///
+/// # Parameters
+/// - `display`: Mutable ST7789 panel driver.
+/// - `ets`: Delay provider required by panel init/backlight APIs.
+///
+/// # Returns
+/// - `Ok(BacklightState)` representing the panel-on state.
+/// - `Err` when panel initialization/orientation setup fails.
 pub fn init_display<DI, RST, BL, PinE>(
     display: &mut ST7789<DI, RST, BL>,
     ets: &mut Ets,
@@ -192,7 +266,12 @@ where
         BacklightState::On
     };
 
-    let _ = display.set_backlight(backlight_on_state, ets);
+    if let Err(err) = display.set_backlight(backlight_on_state, ets) {
+        log::warn!(
+            "Display: failed to set backlight state during init: {:?}",
+            err
+        );
+    }
     log::info!(
         "Display: backlight forced on (active_low={})",
         DISPLAY_BACKLIGHT_ACTIVE_LOW
@@ -201,24 +280,43 @@ where
     Ok(backlight_on_state)
 }
 
+/// Draw a one-time RGB stripe boot test to validate panel visibility.
+///
+/// # Parameters
+/// - `panel`: Draw target receiving the boot test pattern.
+///
+/// # Returns
+/// - No return value.
 fn draw_boot_test<D>(panel: &mut D)
 where
     D: DrawTarget<Color = Rgb565>,
+    D::Error: core::fmt::Debug,
 {
-    let _ = Rectangle::new(Point::new(0, 0), Size::new(240, 45))
+    if let Err(err) = Rectangle::new(Point::new(0, 0), Size::new(240, 45))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::RED))
-        .draw(panel);
-    let _ = Rectangle::new(Point::new(0, 45), Size::new(240, 45))
+        .draw(panel)
+    {
+        log::debug!("Display: boot test red band draw failed: {:?}", err);
+    }
+    if let Err(err) = Rectangle::new(Point::new(0, 45), Size::new(240, 45))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::GREEN))
-        .draw(panel);
-    let _ = Rectangle::new(Point::new(0, 90), Size::new(240, 45))
+        .draw(panel)
+    {
+        log::debug!("Display: boot test green band draw failed: {:?}", err);
+    }
+    if let Err(err) = Rectangle::new(Point::new(0, 90), Size::new(240, 45))
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
-        .draw(panel);
+        .draw(panel)
+    {
+        log::debug!("Display: boot test blue band draw failed: {:?}", err);
+    }
     let boot_style = MonoTextStyleBuilder::new()
         .font(&FONT_10X20)
         .text_color(Rgb565::WHITE)
         .build();
-    let _ = Text::new("Display boot test", Point::new(8, 20), boot_style).draw(panel);
+    if let Err(err) = Text::new("Display boot test", Point::new(8, 20), boot_style).draw(panel) {
+        log::debug!("Display: boot test text draw failed: {:?}", err);
+    }
     log::debug!(
         "Display: applying viewport offsets x={} y={}",
         DISPLAY_X_OFFSET,
@@ -228,6 +326,13 @@ where
     FreeRtos::delay_ms(800);
 }
 
+/// Format bytes using a compact IEC-like unit suffix.
+///
+/// # Parameters
+/// - `bytes`: Raw byte count.
+///
+/// # Returns
+/// - Human-readable storage string (for example `512B`, `2.0K`, `1.5M`).
 fn format_human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut value = bytes as f64;
@@ -243,6 +348,13 @@ fn format_human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Format a signed PPS offset with `us`/`ms` auto-scaling.
+///
+/// # Parameters
+/// - `offset_us`: Signed offset in microseconds.
+///
+/// # Returns
+/// - Formatted string with sign and either `us` or `ms` units.
 fn format_signed_offset_us(offset_us: i64) -> String {
     let abs_us = offset_us.unsigned_abs();
     if abs_us < 1_000 {
@@ -259,6 +371,17 @@ fn format_signed_offset_us(offset_us: i64) -> String {
     }
 }
 
+/// Draw the selected UI page onto the display target.
+///
+/// # Parameters
+/// - `display`: Draw target for rendering text and backgrounds.
+/// - `page`: Selected page to render.
+/// - `gps`: Latest GPS snapshot.
+/// - `battery`: Latest battery snapshot.
+/// - `pps_delta_us`: Last observed PPS interval delta in microseconds.
+///
+/// # Returns
+/// - No return value; draw errors are logged.
 pub fn draw_page<D>(
     display: &mut D,
     page: Page,

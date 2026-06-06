@@ -1,3 +1,5 @@
+//! Wi-Fi station credential loading and connection helpers.
+
 use anyhow::{Context, anyhow, bail};
 use core::convert::TryInto;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
@@ -5,12 +7,23 @@ use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
+/// Compile-time Wi-Fi station credentials captured during firmware build.
 #[derive(Debug, Clone)]
 pub struct WifiCredentials {
+    /// SSID string for station connection.
     pub ssid: String,
+    /// WPA/WPA2 passphrase (or empty for open network).
     pub pass: String,
 }
 
+/// Load required Wi-Fi credentials from compile-time environment variables.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - `Ok(WifiCredentials)` when both `WIFI_SSID` and `WIFI_PASS` are set.
+/// - `Err` when either value is missing.
 pub fn load_wifi_credentials_from_env() -> anyhow::Result<WifiCredentials> {
     let env_ssid = option_env!("WIFI_SSID")
         .map(str::trim)
@@ -29,6 +42,17 @@ pub fn load_wifi_credentials_from_env() -> anyhow::Result<WifiCredentials> {
     bail!("No Wi-Fi credentials found. Set WIFI_SSID and WIFI_PASS in your shell before flashing.");
 }
 
+/// Connect station Wi-Fi and block until the network interface is up.
+///
+/// # Parameters
+/// - `modem`: ESP modem peripheral.
+/// - `sys_loop`: System event loop handle.
+/// - `nvs`: Default NVS partition handle for Wi-Fi driver state.
+/// - `creds`: Wi-Fi credentials to apply.
+///
+/// # Returns
+/// - `Ok(BlockingWifi<EspWifi<'static>>)` when station link is up with DHCP info.
+/// - `Err` when setup, connect, or netif readiness fails.
 pub fn connect_wifi_sta(
     modem: Modem,
     sys_loop: EspSystemEventLoop,

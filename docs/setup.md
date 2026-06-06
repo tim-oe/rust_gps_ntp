@@ -104,12 +104,24 @@ Set Wi-Fi station credentials in your shell before flashing:
 ```bash
 export WIFI_SSID="your-ssid"
 export WIFI_PASS="your-password"
+# Optional: named timezone for rule-accurate DST conversion
+export LOCAL_TZ="America/Chicago"
 ```
 
 These env vars are compile-time inputs (captured during build/flash), not runtime
 shell variables on the board. Current firmware uses these env-based STA credentials
 at boot (credential persistence is disabled for now), while still using default NVS
 internally for ESP-IDF Wi-Fi operation.
+
+`LOCAL_TZ` is optional. When set, GPS UTC->local conversion uses that named
+timezone (including DST rules). When unset, firmware falls back to geodetermined
+offset from longitude.
+
+When `LOCAL_TZ` is unset and Wi-Fi is connected, firmware also attempts to
+resolve an IANA timezone from GPS coordinates via an online API and caches the
+result in NVS for future boots. Cached timezone is used immediately at boot and
+then refreshed periodically from network lookup; if the resolved zone changes,
+the new value is applied and persisted.
 
 From repo root:
 

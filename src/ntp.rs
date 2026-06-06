@@ -1,3 +1,8 @@
+//! Minimal NTP server with GPS/PPS-backed discipline and mode-6 diagnostics.
+//!
+//! The server responds to standard client time requests (mode 3/4 flow) and
+//! a focused subset of mode-6 control queries used by `ntpq`.
+
 use std::net::UdpSocket;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,10 +22,13 @@ const MODE6_ASSOC_ID: u16 = 1;
 
 #[derive(Clone, Copy)]
 struct ClockAnchor {
+    /// Unix epoch seconds at the anchor instant.
     unix_seconds: i64,
+    /// Monotonic microseconds when the anchor was captured.
     monotonic_us: i64,
 }
 
+/// Stateful NTP server engine and discipline metrics.
 pub struct NtpServer {
     socket: UdpSocket,
     served: u64,
@@ -35,6 +43,14 @@ pub struct NtpServer {
 }
 
 impl NtpServer {
+    /// Bind a nonblocking UDP socket on NTP port 123.
+    ///
+    /// # Parameters
+    /// - None.
+    ///
+    /// # Returns
+    /// - `Ok(NtpServer)` when socket bind and nonblocking setup succeed.
+    /// - `Err` when socket initialization fails.
     pub fn bind() -> anyhow::Result<Self> {
         let socket = UdpSocket::bind(("0.0.0.0", NTP_PORT))
             .context("failed to bind UDP socket on port 123")?;
@@ -56,6 +72,13 @@ impl NtpServer {
         })
     }
 
+    /// Update absolute UTC seconds from a parsed GPS RMC sample.
+    ///
+    /// # Parameters
+    /// - `utc_unix_seconds`: UTC seconds since Unix epoch from GPS.
+    ///
+    /// # Returns
+    /// - No return value.
     pub fn update_gps_utc_seconds(&mut self, utc_unix_seconds: i64) {
         self.last_gps_utc_seconds = Some(utc_unix_seconds);
         let now_us = monotonic_us_now();
@@ -82,6 +105,16 @@ impl NtpServer {
         }
     }
 
+    /// Feed PPS pulse timing into the discipline loop.
+    ///
+    /// Pass `None` for the first observed pulse to align to current GPS UTC,
+    /// then pass `Some(interval_us)` for subsequent pulse deltas.
+    ///
+    /// # Parameters
+    /// - `pps_interval_us`: `None` for first pulse alignment, or pulse interval in microseconds.
+    ///
+    /// # Returns
+    /// - No return value.
     pub fn observe_pps_pulse(&mut self, pps_interval_us: Option<u32>) {
         let now_us = monotonic_us_now();
 
@@ -110,6 +143,13 @@ impl NtpServer {
         }
     }
 
+    /// Update PPS-derived offset and jitter estimates used in diagnostics.
+    ///
+    /// # Parameters
+    /// - `pps_interval_us`: Interval between consecutive PPS pulses.
+    ///
+    /// # Returns
+    /// - No return value.
     fn update_pps_interval_us(&mut self, pps_interval_us: u32) {
         // Ignore obviously invalid intervals.
         if !(800_000..=1_200_000).contains(&pps_interval_us) {
@@ -127,6 +167,14 @@ impl NtpServer {
         }
     }
 
+    /// Poll and serve all immediately available NTP packets.
+    ///
+    /// # Parameters
+    /// - `gps_fix`: Current GPS fix status used to determine sync state.
+    ///
+    /// # Returns
+    /// - `Ok(())` when no more packets are pending or all served successfully.
+    /// - `Err` on socket receive/send failures.
     pub fn poll(&mut self, gps_fix: bool) -> anyhow::Result<()> {
         let mut req = [0_u8; NTP_MAX_PACKET_LEN];
 
@@ -158,9 +206,9 @@ impl NtpServer {
                                 self.pps_jitter_us,
                                 self.proc_delay_us,
                             );
-                            self.socket
-                                .send_to(&resp, peer)
-                                .with_context(|| format!("failed to send mode-6 response to {}", peer))?;
+                            self.socket.send_to(&resp, peer).with_context(|| {
+                                format!("failed to send mode-6 response to {}", peer)
+                            })?;
                         }
                         _ => {
                             if len < NTP_PACKET_LEN {
@@ -182,9 +230,9 @@ impl NtpServer {
                             let transmit_ts = self.current_ntp_timestamp();
                             write_u64_be(&mut resp[40..48], transmit_ts);
 
-                            self.socket
-                                .send_to(&resp, peer)
-                                .with_context(|| format!("failed to send NTP response to {}", peer))?;
+                            self.socket.send_to(&resp, peer).with_context(|| {
+                                format!("failed to send NTP response to {}", peer)
+                            })?;
                             let finished_us = monotonic_us_now();
                             let sample_us = (finished_us.saturating_sub(started_us)).max(1) as f32;
                             if self.proc_delay_has_sample {
@@ -209,6 +257,18 @@ impl NtpServer {
     }
 }
 
+/// Build a mode-6 control response for a request packet.
+///
+/// # Parameters
+/// - `req`: Raw mode-6 request bytes.
+/// - `version`: NTP version extracted from request header.
+/// - `synced`: Current synchronized-state flag.
+/// - `pps_offset_us`: Latest PPS-derived offset in microseconds.
+/// - `pps_jitter_us`: Smoothed jitter estimate in microseconds.
+/// - `proc_delay_us`: Smoothed processing delay estimate in microseconds.
+///
+/// # Returns
+/// - Serialized mode-6 response bytes ready to send.
 fn build_mode6_response(
     req: &[u8],
     version: u8,
@@ -299,10 +359,27 @@ fn build_mode6_response(
     resp
 }
 
-fn build_response(req: &[u8; NTP_PACKET_LEN], gps_fix: bool, receive_ts: u64) -> [u8; NTP_PACKET_LEN] {
+/// Build a standard 48-byte NTP server response template.
+///
+/// # Parameters
+/// - `req`: Parsed 48-byte client request.
+/// - `gps_fix`: Current synchronized-state flag.
+/// - `receive_ts`: Server receive timestamp in NTP 64-bit format.
+///
+/// # Returns
+/// - 48-byte response packet with originate/receive/reference fields populated.
+fn build_response(
+    req: &[u8; NTP_PACKET_LEN],
+    gps_fix: bool,
+    receive_ts: u64,
+) -> [u8; NTP_PACKET_LEN] {
     let mut resp = [0_u8; NTP_PACKET_LEN];
     let client_vn = (req[0] >> 3) & 0x07;
-    let version = if (1..=4).contains(&client_vn) { client_vn } else { 4 };
+    let version = if (1..=4).contains(&client_vn) {
+        client_vn
+    } else {
+        4
+    };
     let leap = if gps_fix { 0 } else { 3 };
     resp[0] = (leap << 6) | (version << 3) | 4; // server mode
     resp[1] = if gps_fix { 1 } else { 16 }; // stratum
@@ -331,19 +408,31 @@ fn build_response(req: &[u8; NTP_PACKET_LEN], gps_fix: bool, receive_ts: u64) ->
     resp
 }
 
+/// Compute current NTP timestamp directly from system wall clock.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - Current NTP timestamp (`seconds.fraction` packed into `u64`).
 fn ntp_timestamp_now() -> u64 {
     let unix = match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(v) => v,
         Err(_) => Duration::from_secs(0),
     };
-    let seconds = unix
-        .as_secs()
-        .saturating_add(NTP_UNIX_EPOCH_OFFSET_SECS);
+    let seconds = unix.as_secs().saturating_add(NTP_UNIX_EPOCH_OFFSET_SECS);
     let fraction = ((unix.subsec_nanos() as u128) * NTP_FRAC_SCALE / 1_000_000_000u128) as u64;
     (seconds << 32) | fraction
 }
 
 impl NtpServer {
+    /// Compute the current NTP timestamp from the disciplined anchor clock.
+    ///
+    /// # Parameters
+    /// - `self`: NTP server state containing discipline anchor.
+    ///
+    /// # Returns
+    /// - Current disciplined NTP timestamp.
     fn current_ntp_timestamp(&self) -> u64 {
         if let Some(anchor) = self.clock_anchor {
             let now_us = monotonic_us_now();
@@ -365,14 +454,37 @@ impl NtpServer {
     }
 }
 
+/// Return monotonic microseconds from ESP-IDF high-resolution timer.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - Monotonic microsecond count from ESP-IDF.
 fn monotonic_us_now() -> i64 {
     unsafe { sys::esp_timer_get_time() }
 }
 
+/// Write a big-endian `u32` into an output byte slice.
+///
+/// # Parameters
+/// - `dst`: Destination slice (must be length 4).
+/// - `value`: Integer value to encode.
+///
+/// # Returns
+/// - No return value.
 fn write_u32_be(dst: &mut [u8], value: u32) {
     dst.copy_from_slice(&value.to_be_bytes());
 }
 
+/// Write a big-endian `u64` into an output byte slice.
+///
+/// # Parameters
+/// - `dst`: Destination slice (must be length 8).
+/// - `value`: Integer value to encode.
+///
+/// # Returns
+/// - No return value.
 fn write_u64_be(dst: &mut [u8], value: u64) {
     dst.copy_from_slice(&value.to_be_bytes());
 }
