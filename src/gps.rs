@@ -5,6 +5,7 @@ pub struct GpsSnapshot {
     pub local_date: String,
     pub local_time: String,
     pub tz_offset_hours: i8,
+    pub utc_unix_seconds: Option<i64>,
     pub lat: f32,
     pub lon: f32,
     pub fix: bool,
@@ -70,6 +71,22 @@ fn local_datetime_from_utc(
     ))
 }
 
+fn utc_datetime_from_fields(utc_date: &str, utc_time: &str) -> Option<NaiveDateTime> {
+    let ddmmyy = parse_ddmmyy(utc_date)?;
+    let hhmmss = parse_hhmmss(utc_time)?;
+
+    let day: u32 = ddmmyy[0..2].parse().ok()?;
+    let month: u32 = ddmmyy[2..4].parse().ok()?;
+    let year: i32 = 2000 + ddmmyy[4..6].parse::<i32>().ok()?;
+    let hour: u32 = hhmmss[0..2].parse().ok()?;
+    let minute: u32 = hhmmss[2..4].parse().ok()?;
+    let second: u32 = hhmmss[4..6].parse().ok()?;
+
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
 pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     log::trace!("GPS RMC raw: {}", sentence);
     let fields: Vec<&str> = sentence.split(',').collect();
@@ -88,6 +105,7 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     gps.local_date = local_date;
     gps.local_time = local_time;
     gps.tz_offset_hours = tz_offset_hours;
+    gps.utc_unix_seconds = utc_datetime_from_fields(date, time).map(|dt| dt.and_utc().timestamp());
     gps.lat = lat;
     gps.lon = lon;
     gps.fix = status == "A";

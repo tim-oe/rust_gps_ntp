@@ -7,6 +7,8 @@ mod gps;
 #[cfg(target_os = "espidf")]
 mod logging;
 #[cfg(target_os = "espidf")]
+mod ntp;
+#[cfg(target_os = "espidf")]
 mod wifi;
 
 #[cfg(target_os = "espidf")]
@@ -134,6 +136,8 @@ fn main() -> anyhow::Result<()> {
     let mut last_interaction_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     let mut force_redraw = true;
     let mut rendered_once = false;
+    let mut ntp_server = ntp::NtpServer::bind()?;
+    log::info!("NTP: listening on UDP/123");
 
     log::info!("System: booted; Wi-Fi + GPS UART diagnostics mode");
     log::info!(
@@ -175,7 +179,11 @@ fn main() -> anyhow::Result<()> {
                             let trimmed = line.trim();
                             if trimmed.starts_with('$') {
                                 if trimmed.starts_with("$GNRMC") || trimmed.starts_with("$GPRMC") {
-                                    let _ = gps::parse_rmc(trimmed, &mut gps);
+                                    if gps::parse_rmc(trimmed, &mut gps).is_some() && gps.fix {
+                                        if let Some(utc_unix_seconds) = gps.utc_unix_seconds {
+                                            ntp_server.update_gps_utc_seconds(utc_unix_seconds);
+                                        }
+                                    }
                                 } else if trimmed.starts_with("$GNGGA")
                                     || trimmed.starts_with("$GPGGA")
                                 {
@@ -191,6 +199,10 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        if let Err(err) = ntp_server.poll(gps.fix) {
+            log::warn!("NTP: poll failed: {}", err);
+        }
+
         if bytes_seen > 0 && bytes_seen % 512 == 0 {
             log::debug!("GPS: diagnostics bytes received={}", bytes_seen);
         }
@@ -201,8 +213,10 @@ fn main() -> anyhow::Result<()> {
             if last_logged_pps_us > 0 {
                 pps_delta_us = now_us.wrapping_sub(last_logged_pps_us);
                 log::debug!("PPS: pulse #{} delta={}us", current_pps_count, pps_delta_us);
+                ntp_server.observe_pps_pulse(Some(pps_delta_us));
             } else {
                 log::debug!("PPS: pulse #{} detected", current_pps_count);
+                ntp_server.observe_pps_pulse(None);
             }
 
             last_logged_pps_count = current_pps_count;

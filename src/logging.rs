@@ -95,6 +95,7 @@ pub fn display_boot_test_enabled() -> bool {
 /// - LOG_GPS_LEVEL
 /// - LOG_DISPLAY_LEVEL
 /// - LOG_BATTERY_LEVEL
+/// - LOG_NTP_LEVEL
 /// - LOG_PPS_LEVEL (main loop / PPS ISR task context logs)
 pub fn init() {
     esp_idf_svc::log::EspLogger::initialize_default();
@@ -118,6 +119,11 @@ pub fn init() {
         "rust_gps_ntp::battery",
         "LOG_BATTERY_LEVEL",
         option_env!("LOG_BATTERY_LEVEL"),
+    );
+    set_level_from_key(
+        "rust_gps_ntp::ntp",
+        "LOG_NTP_LEVEL",
+        option_env!("LOG_NTP_LEVEL"),
     );
     set_level_from_key(
         "rust_gps_ntp",

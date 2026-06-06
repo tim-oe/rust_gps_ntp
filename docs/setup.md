@@ -199,6 +199,7 @@ Optional log overrides (either build-time env vars, or keys in `sdkconfig.defaul
 - `LOG_GPS_LEVEL`
 - `LOG_DISPLAY_LEVEL`
 - `LOG_BATTERY_LEVEL`
+- `LOG_NTP_LEVEL`
 - `LOG_PPS_LEVEL` (applies to crate-root/main logs, including PPS loop logs)
 
 Accepted values: `none`, `error`, `warn`, `info`, `debug`, `trace` (`verbose` alias is also accepted).
@@ -234,10 +235,34 @@ You should see:
 - boot message indicating Wi-Fi + GPS UART diagnostics mode
 - TFT page output with button page-toggle and 15-second auto-blank/wake behavior
 
-## 9) Next firmware milestone
+## 9) Verify NTP service
 
-Implement in this order:
+After `just flash-monitor`, wait until Wi-Fi is connected and GPS/PPS are active,
+then test from another host on the same network:
 
-1. GPS UART read and NMEA parsing
-2. PPS interrupt timestamping
-3. UDP port 123 NTP response generation
+```bash
+ntpdate -q <esp_ip>
+ntpq -pnu <esp_ip>
+```
+
+Expected healthy behavior:
+
+- `ntpdate -q` returns current date/time (not epoch/1970), with `s1 no-leap`
+- `ntpq -pnu` shows one selected source similar to `*GPS`
+- `stratum` is `1` once GPS fix + PPS lock are established
+- `reach` converges to `377` (octal), indicating stable recent replies
+- `offset`/`jitter` are small non-zero values (typically in microseconds)
+
+Example:
+
+```text
+remote           refid      st t when poll reach   delay   offset   jitter
+===============================================================================
+*GPS             .GPS.            1 u    -   64  377      1us      5us      4us
+```
+
+If NTP is not healthy:
+
+- If `ntpdate -q` shows 1970/epoch time, GPS UTC has not been accepted yet
+- If `ntpq` times out, verify port `123/udp` reachability and that the board is online
+- If `stratum` stays `16`, the server is still unsynchronized (no valid GPS fix/PPS lock)
