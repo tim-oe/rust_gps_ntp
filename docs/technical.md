@@ -20,6 +20,8 @@ GPS-disciplined Stratum-1 NTP server firmware written in Rust for the ESP32-S3 p
 | NTP mode-6 control protocol | [RFC 1305 §3.2 – Control Messages](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) · [ntpq reference](https://www.ntp.org/documentation/4.2.8-series/ntpq/) |
 | Mode-6 status word and variable encoding | [RFC 1305 §3.2.1-3.2.2 – System/Peer Status Words and Variable Sets](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) |
 | Clock source codes (ClkSrc field) | [RFC 1305 Table F-2 – Clock Source Codes (4 = UHF/GPS)](https://www.rfc-editor.org/rfc/rfc1305#appendix-F) |
+| Kiss-o'-Death (KoD) responses | [RFC 5905 §7.4 – Kiss-o'-Death (KoD) Packet](https://www.rfc-editor.org/rfc/rfc5905#section-7.4) |
+| RFC 1918 private address ranges | [RFC 1918 – Address Allocation for Private Internets](https://www.rfc-editor.org/rfc/rfc1918) |
 | PLL/FLL clock servo theory | [D. L. Mills, "Internet Time Synchronization: the Network Time Protocol", IEEE Trans. Comm. 1991](https://www.eecis.udel.edu/~mills/database/papers/trans.pdf) |
 | NTP clock filter and combine algorithms | [D. L. Mills, "Improved Algorithms for Synchronizing Computer Network Clocks", IEEE/ACM Trans. Netw. 1995](https://www.eecis.udel.edu/~mills/database/papers/tune2.pdf) |
 | NTP project clock discipline notes | [NTP 4.2.8 Clock Discipline](https://www.ntp.org/documentation/4.2.8-series/discipline/) |
@@ -307,6 +309,61 @@ Peer status = (Sel << 13) | (Config << 12) | (Reach << 9)
 #### Jitter and Delay Tracking
 
 Both `pps_jitter_us` and `proc_delay_us` are maintained as exponentially weighted moving averages with coefficient α=0.2 (80% weight on history). The PPS offset is the raw phase error `I − 1_000_000` µs; jitter is the EWMA of its absolute value.
+
+---
+
+### `ntp` – Service Protections
+
+**Relevant specs:**
+- [RFC 5905 §7.4 – Kiss-o'-Death](https://www.rfc-editor.org/rfc/rfc5905#section-7.4)
+- [RFC 1918 – Private Address Allocation](https://www.rfc-editor.org/rfc/rfc1918)
+
+#### Per-Client Rate Limiter
+
+A fixed-size table of 32 `ClientRecord` entries tracks the last accepted monotonic timestamp per IPv4 source address. On each mode-3 (client) or mode-1 (symmetric) request:
+
+1. Look up the source address in the table (O(32) linear scan).
+2. If found and `now − last_us < MIN_POLL_INTERVAL_US` (2 s): send a KoD RATE response, increment `rate_limited_total`, and skip normal processing.
+3. If found and interval is sufficient: update `last_us`, serve normally.
+4. If not found: add a new entry (evicting the oldest `last_us` when the table is full), serve normally.
+
+Mode-6 (ntpq) queries are never rate-limited so administrative monitoring is unaffected.
+
+#### Kiss-o'-Death (KoD) Response
+
+Per [RFC 5905 §7.4](https://www.rfc-editor.org/rfc/rfc5905#section-7.4), a KoD packet signals the client to stop polling:
+
+| Field | Value |
+|---|---|
+| LI / Mode | LI=3 (alarm), Mode=4 (server) |
+| Stratum | 0 (kiss packet) |
+| Reference ID | `RATE` (RFC 5905 Table 6 kiss code) |
+| Originate Timestamp | client's Transmit Timestamp (bytes 40–47) |
+| All other fields | 0 |
+
+The client MUST stop polling and MUST reduce its polling interval upon receiving KoD RATE.
+
+#### IP ACL Allowlist (`Acl`)
+
+A fixed-capacity (8-entry) CIDR allowlist controls which sources can receive responses. All packets from unlisted sources are silently dropped and counted in `acl_blocked_total`.
+
+| Factory method | Behaviour |
+|---|---|
+| `Acl::allow_all()` | Permit every IPv4 source (default) |
+| `Acl::deny_all()` | Block all; add entries with `add_ipv4_cidr` |
+| `Acl::private_lan()` | Allow RFC 1918 + loopback only (recommended for LAN deployment) |
+
+To configure a private-LAN ACL from `app.rs`:
+
+```rust
+ntp_server.set_acl(Acl::private_lan());
+```
+
+IPv6 sources always bypass the ACL (pass through unconditionally).
+
+#### Diagnostics Counters
+
+All three counters (`served`, `rate_limited`, `acl_blocked`) are exposed in `NtpSnapshot` and published to the UI task each second.
 
 ---
 

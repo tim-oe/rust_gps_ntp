@@ -55,11 +55,23 @@ Why: better observability and debugging from standard NTP tools.
 
 ESP32 feasibility: **Yes**, with scope control to avoid unnecessary complexity.
 
-## [ ] 4) Add NTP service protections
+## [x] 4) Add NTP service protections
 
-- Per-client rate limiting.
-- Optional Kiss-o'-Death responses for abusive polling patterns.
-- Simple ACL/allowlist option for trusted LAN deployments.
+- **Per-client rate limiting**: a fixed-capacity table (32 entries) tracks the
+  last accepted request timestamp per IPv4 address. Clients polling faster than
+  `MIN_POLL_INTERVAL_US = 2 s` receive a Kiss-o'-Death RATE response and are
+  counted in `rate_limited_total`.
+- **Kiss-o'-Death responses** (RFC 5905 §7.4): KoD RATE packets have
+  stratum=0, refid=`RATE`, and echo the client's transmit timestamp as the
+  originate timestamp. Mode-6 (ntpq) queries are exempt from rate limiting.
+- **ACL allowlist** (`Acl` type): fixed-capacity (8 CIDR entries). Presets:
+  - `Acl::allow_all()` — default, no restrictions.
+  - `Acl::deny_all()` — block everything, build explicit list with `add_ipv4_cidr`.
+  - `Acl::private_lan()` — allow `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`,
+    `192.168.0.0/16`. Recommended for trusted LAN deployments.
+  - ACL-blocked packets are silently dropped and counted in `acl_blocked_total`.
+- Counters (`served`, `rate_limited`, `acl_blocked`) exposed in `NtpSnapshot`
+  for display and diagnostics.
 
 Why: protects limited CPU/network resources on embedded hardware.
 

@@ -3,7 +3,7 @@
 //! The server responds to standard client time requests (mode 3/4 flow) and
 //! a focused subset of mode-6 control queries used by `ntpq`.
 
-use std::net::UdpSocket;
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -53,6 +53,196 @@ const MIN_HW_ACCURACY_US: i64 = 100;
 /// pin is modelled as zero; any GPS propagation delay is absorbed into precision.
 const ROOT_DELAY_MS: f64 = 0.0;
 
+// --- Service protection constants ---
+/// Kiss-o'-Death kiss code for rate limiting (RFC 5905 §7.4).
+const KOD_KISS_RATE: &[u8; 4] = b"RATE";
+/// Maximum number of IPv4 client entries tracked in the rate-limiter table.
+/// Entries are evicted LRU-style when the table is full.
+const RATE_TABLE_SIZE: usize = 32;
+/// Minimum inter-request interval for a single client before a KoD RATE is sent.
+/// 2 seconds is well below normal NTP polling (minpoll = 2^4 = 16 s) but
+/// still protects against accidental loops and flood attacks.
+const MIN_POLL_INTERVAL_US: i64 = 2_000_000;
+/// Maximum number of CIDR entries in the ACL allowlist.
+const ACL_MAX_ENTRIES: usize = 8;
+
+// --- Per-client rate limiter ---
+
+/// One slot in the per-client rate-limiter lookup table.
+#[derive(Clone, Copy)]
+struct ClientRecord {
+    /// IPv4 source address as a host-order `u32`.
+    addr: u32,
+    /// Monotonic microseconds of the most recent accepted request.
+    last_us: i64,
+}
+
+/// Fixed-capacity per-client rate limiter.
+///
+/// On each mode-3 request the caller checks the source IP. A request is
+/// accepted if the client has not been seen before, or if the time since
+/// its last accepted request exceeds `MIN_POLL_INTERVAL_US`. Otherwise the
+/// caller should send a KoD RATE response.
+///
+/// The table holds up to `RATE_TABLE_SIZE` entries. When full, the entry
+/// with the oldest `last_us` is evicted to make room for new clients.
+struct RateLimiter {
+    table: [Option<ClientRecord>; RATE_TABLE_SIZE],
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            table: [None; RATE_TABLE_SIZE],
+        }
+    }
+
+    /// Record a request from `addr` at `now_us`.
+    ///
+    /// Returns `true` if the request should be served, `false` if it should
+    /// receive a KoD RATE response.
+    fn check(&mut self, addr: u32, now_us: i64) -> bool {
+        // Look for an existing entry for this client.
+        for entry in self.table.iter_mut().flatten() {
+            if entry.addr == addr {
+                let elapsed = now_us.saturating_sub(entry.last_us);
+                if elapsed < MIN_POLL_INTERVAL_US {
+                    return false; // too fast → KoD
+                }
+                entry.last_us = now_us;
+                return true;
+            }
+        }
+        // New client: find an empty slot, or evict the oldest entry.
+        let slot = self
+            .table
+            .iter()
+            .position(|e| e.is_none())
+            .unwrap_or_else(|| {
+                self.table
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, e)| e.map(|r| r.last_us).unwrap_or(i64::MAX))
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            });
+        self.table[slot] = Some(ClientRecord { addr, last_us: now_us });
+        true
+    }
+}
+
+// --- ACL allowlist ---
+
+/// One CIDR prefix entry in an ACL allowlist.
+#[derive(Clone, Copy)]
+struct AclEntry {
+    /// Network address (host-order u32), e.g. `0xC0A80000` for 192.168.0.0.
+    network: u32,
+    /// Subnet mask (host-order u32), e.g. `0xFFFF0000` for /16.
+    mask: u32,
+}
+
+impl AclEntry {
+    fn contains(self, addr: u32) -> bool {
+        (addr & self.mask) == (self.network & self.mask)
+    }
+}
+
+/// Fixed-capacity IP allowlist for NTP service protection.
+///
+/// When the list is empty and `default_allow` is `true` (the default),
+/// all clients are accepted.  Set `default_allow = false` (via
+/// `Acl::deny_all()` or `Acl::private_lan()`) and then call
+/// `add_ipv4_cidr` to build a strict allowlist.
+///
+/// Only IPv4 addresses are matched; IPv6 sources always pass through.
+///
+/// # Examples
+/// ```
+/// use rust_gps_ntp::ntp::Acl;
+/// let mut acl = Acl::private_lan();   // allow all RFC 1918 + loopback
+/// ```
+#[derive(Clone)]
+pub struct Acl {
+    entries: [Option<AclEntry>; ACL_MAX_ENTRIES],
+    len: usize,
+    /// Whether to allow an address when no entry matches.
+    default_allow: bool,
+}
+
+impl Acl {
+    /// Create an ACL that allows all IPv4 addresses (no restrictions).
+    pub fn allow_all() -> Self {
+        Self {
+            entries: [None; ACL_MAX_ENTRIES],
+            len: 0,
+            default_allow: true,
+        }
+    }
+
+    /// Create an ACL that denies all addresses; use `add_ipv4_cidr` to
+    /// explicitly permit ranges.
+    pub fn deny_all() -> Self {
+        Self {
+            entries: [None; ACL_MAX_ENTRIES],
+            len: 0,
+            default_allow: false,
+        }
+    }
+
+    /// Create an ACL that allows only private RFC 1918 ranges and loopback:
+    /// `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
+    ///
+    /// This is the recommended setting for a trusted LAN deployment.
+    pub fn private_lan() -> Self {
+        let mut acl = Self::deny_all();
+        acl.add_ipv4_cidr(127, 0, 0, 0, 8); // loopback
+        acl.add_ipv4_cidr(10, 0, 0, 0, 8); // RFC 1918 class A
+        acl.add_ipv4_cidr(172, 16, 0, 0, 12); // RFC 1918 class B
+        acl.add_ipv4_cidr(192, 168, 0, 0, 16); // RFC 1918 class C
+        acl
+    }
+
+    /// Add a CIDR entry to the allowlist.
+    ///
+    /// # Parameters
+    /// - `a`–`d`: The four octets of the network address.
+    /// - `prefix_bits`: Prefix length (0–32).
+    ///
+    /// Returns `true` on success or `false` if the table is full
+    /// (`ACL_MAX_ENTRIES` entries already added).
+    pub fn add_ipv4_cidr(&mut self, a: u8, b: u8, c: u8, d: u8, prefix_bits: u8) -> bool {
+        if self.len >= ACL_MAX_ENTRIES {
+            return false;
+        }
+        let network = u32::from_be_bytes([a, b, c, d]);
+        let mask = if prefix_bits == 0 {
+            0
+        } else {
+            !((1u32 << (32 - prefix_bits as u32)) - 1)
+        };
+        let slot = self
+            .entries
+            .iter()
+            .position(|e| e.is_none())
+            .unwrap_or(0);
+        self.entries[slot] = Some(AclEntry { network, mask });
+        self.len += 1;
+        true
+    }
+
+    /// Returns `true` if `addr` (host-order u32) is permitted by this ACL.
+    fn allows(&self, addr: u32) -> bool {
+        if self.len == 0 {
+            return self.default_allow;
+        }
+        self.entries
+            .iter()
+            .filter_map(|e| *e)
+            .any(|e| e.contains(addr))
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ClockAnchor {
     /// Unix epoch seconds at the anchor instant.
@@ -85,6 +275,12 @@ pub struct NtpSnapshot {
     pub pps_jitter_us: f32,
     /// Current root dispersion in milliseconds.
     pub root_disp_ms: f64,
+    /// Total NTP requests served since boot.
+    pub served: u64,
+    /// Total Kiss-o'-Death RATE responses sent (rate-limited clients).
+    pub rate_limited: u64,
+    /// Total packets silently dropped by the ACL.
+    pub acl_blocked: u64,
 }
 
 impl Default for NtpSnapshot {
@@ -96,6 +292,9 @@ impl Default for NtpSnapshot {
             pps_offset_us: 0,
             pps_jitter_us: 0.0,
             root_disp_ms: 5_000.0,
+            served: 0,
+            rate_limited: 0,
+            acl_blocked: 0,
         }
     }
 }
@@ -139,6 +338,14 @@ pub struct NtpServer {
     /// NTP timestamp of the most recent PPS-based clock discipline event.
     /// Returned as the Reference Timestamp in NTP responses (RFC 5905 §7.3).
     last_sync_ntp_ts: u64,
+    /// Per-client rate limiter (mode-3 requests only).
+    rate_limiter: RateLimiter,
+    /// IP allowlist; checked for every incoming packet.
+    acl: Acl,
+    /// Total Kiss-o'-Death RATE responses sent to rate-limited clients.
+    rate_limited_total: u64,
+    /// Total packets dropped by the ACL.
+    acl_blocked_total: u64,
 }
 
 impl NtpServer {
@@ -171,7 +378,23 @@ impl NtpServer {
             freq_ppm: 0.0,
             last_pps_monotonic_us: None,
             last_sync_ntp_ts: 0,
+            rate_limiter: RateLimiter::new(),
+            acl: Acl::allow_all(),
+            rate_limited_total: 0,
+            acl_blocked_total: 0,
         })
+    }
+
+    /// Replace the ACL used by this server.
+    ///
+    /// Takes effect immediately on the next call to `poll()`.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// server.set_acl(Acl::private_lan());
+    /// ```
+    pub fn set_acl(&mut self, acl: Acl) {
+        self.acl = acl;
     }
 
     /// Update absolute UTC seconds from a parsed GPS RMC sample.
@@ -401,6 +624,9 @@ impl NtpServer {
             pps_offset_us: self.pps_offset_us,
             pps_jitter_us: self.pps_jitter_us,
             root_disp_ms: dp.root_disp_ms,
+            served: self.served,
+            rate_limited: self.rate_limited_total,
+            acl_blocked: self.acl_blocked_total,
         }
     }
 
@@ -420,6 +646,22 @@ impl NtpServer {
                 Ok((len, peer)) => {
                     if len == 0 {
                         continue;
+                    }
+
+                    // Extract IPv4 source address for ACL and rate limiting.
+                    // IPv6 sources bypass both (pass through unconditionally).
+                    let src_ip_v4: Option<u32> = match &peer {
+                        SocketAddr::V4(a) => Some(u32::from(*a.ip())),
+                        SocketAddr::V6(_) => None,
+                    };
+
+                    // ACL check: silently drop packets from disallowed sources.
+                    if let Some(ip) = src_ip_v4 {
+                        if !self.acl.allows(ip) {
+                            self.acl_blocked_total += 1;
+                            log::debug!("NTP: ACL blocked packet from {}", peer);
+                            continue;
+                        }
                     }
 
                     let mode = req[0] & 0x07;
@@ -456,6 +698,26 @@ impl NtpServer {
                                     peer
                                 );
                                 continue;
+                            }
+
+                            // Rate limit mode-3 (client) and mode-1 (symmetric) requests.
+                            // Mode-6 (ntpq) is exempt so admin queries are never throttled.
+                            if mode == 3 {
+                                if let Some(ip) = src_ip_v4 {
+                                    let now_us = monotonic_us_now();
+                                    if !self.rate_limiter.check(ip, now_us) {
+                                        self.rate_limited_total += 1;
+                                        let mut req48 = [0_u8; NTP_PACKET_LEN];
+                                        req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
+                                        let resp = build_kod_response(&req48, version);
+                                        let _ = self.socket.send_to(&resp, peer);
+                                        log::debug!(
+                                            "NTP: KoD RATE sent to {} (rate limited)",
+                                            peer
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
 
                             let mut req48 = [0_u8; NTP_PACKET_LEN];
@@ -672,6 +934,39 @@ fn build_mode6_response(
             resp.push(0);
         }
     }
+    resp
+}
+
+/// Build a Kiss-o'-Death (KoD) RATE response for a client that is polling
+/// too frequently.
+///
+/// Per RFC 5905 §7.4 the response has:
+/// - LI = 3 (alarm), VN mirrored, Mode = 4 (server)
+/// - Stratum = 0 (kiss packet)
+/// - Reference ID = "RATE" (RFC 5905 Table 6)
+/// - Originate Timestamp = client's Transmit Timestamp (bytes 40–47),
+///   allowing the client to validate the response.
+/// - All other fields zeroed.
+///
+/// The client MUST stop polling this server upon receiving KoD RATE and MUST
+/// reduce its polling interval before trying again.
+///
+/// # Parameters
+/// - `req`: Client's 48-byte NTP request packet.
+/// - `version`: NTP version extracted from the request header.
+///
+/// # Returns
+/// - 48-byte KoD response packet.
+fn build_kod_response(req: &[u8; NTP_PACKET_LEN], version: u8) -> [u8; NTP_PACKET_LEN] {
+    let mut resp = [0_u8; NTP_PACKET_LEN];
+    // LI=3 (alarm), VN mirrored from client, Mode=4 (server)
+    resp[0] = (3 << 6) | (version << 3) | 4;
+    // Stratum 0 = kiss packet (Reference ID carries kiss code, not a clock refid)
+    resp[1] = 0;
+    // Reference ID = "RATE" kiss code (RFC 5905 Table 6)
+    resp[12..16].copy_from_slice(KOD_KISS_RATE);
+    // Originate Timestamp = client's Transmit Timestamp (RFC 5905 §7.4)
+    resp[24..32].copy_from_slice(&req[40..48]);
     resp
 }
 
@@ -1022,6 +1317,10 @@ mod tests {
                 freq_ppm: 0.0,
                 last_pps_monotonic_us: None,
                 last_sync_ntp_ts: 0,
+                rate_limiter: RateLimiter::new(),
+                acl: Acl::allow_all(),
+                rate_limited_total: 0,
+                acl_blocked_total: 0,
             })
         }
     }
@@ -1587,5 +1886,221 @@ mod tests {
     #[test]
     fn ntp_ts_to_mode6_zero_is_epoch() {
         assert_eq!(ntp_ts_to_mode6(0), "0x00000000.00000000");
+    }
+
+    // --- Item 4: service protection tests ---
+
+    // -- ACL tests --
+
+    #[test]
+    fn acl_allow_all_permits_any_ipv4() {
+        let acl = Acl::allow_all();
+        assert!(acl.allows(0x08_08_08_08)); // 8.8.8.8 (public)
+        assert!(acl.allows(0xC0_A8_01_01)); // 192.168.1.1 (private)
+        assert!(acl.allows(0x00_00_00_00)); // 0.0.0.0
+    }
+
+    #[test]
+    fn acl_deny_all_blocks_any_ipv4() {
+        let acl = Acl::deny_all();
+        assert!(!acl.allows(0x08_08_08_08));
+        assert!(!acl.allows(0xC0_A8_01_01));
+        assert!(!acl.allows(0x7F_00_00_01)); // 127.0.0.1
+    }
+
+    #[test]
+    fn acl_private_lan_allows_rfc1918_and_loopback() {
+        let acl = Acl::private_lan();
+        assert!(acl.allows(0x7F_00_00_01), "127.0.0.1 (loopback)");
+        assert!(acl.allows(0x0A_00_00_01), "10.0.0.1 (RFC 1918 /8)");
+        assert!(acl.allows(0x0A_FF_FF_FF), "10.255.255.255 (RFC 1918 /8 edge)");
+        assert!(acl.allows(0xAC_10_00_01), "172.16.0.1 (RFC 1918 /12)");
+        assert!(acl.allows(0xAC_1F_FF_FF), "172.31.255.255 (RFC 1918 /12 edge)");
+        assert!(acl.allows(0xC0_A8_00_01), "192.168.0.1 (RFC 1918 /16)");
+        assert!(acl.allows(0xC0_A8_FF_FF), "192.168.255.255 (RFC 1918 /16 edge)");
+    }
+
+    #[test]
+    fn acl_private_lan_blocks_public_internet() {
+        let acl = Acl::private_lan();
+        assert!(!acl.allows(0x08_08_08_08), "8.8.8.8 (Google DNS)");
+        assert!(!acl.allows(0x01_01_01_01), "1.1.1.1 (Cloudflare)");
+        assert!(!acl.allows(0xAC_0F_FF_FF), "172.15.255.255 (just below RFC 1918 /12)");
+        assert!(!acl.allows(0xAC_20_00_00), "172.32.0.0 (just above RFC 1918 /12)");
+    }
+
+    #[test]
+    fn acl_add_ipv4_cidr_single_host() {
+        let mut acl = Acl::deny_all();
+        acl.add_ipv4_cidr(192, 168, 1, 100, 32);
+        assert!(acl.allows(0xC0_A8_01_64)); // 192.168.1.100
+        assert!(!acl.allows(0xC0_A8_01_65)); // 192.168.1.101
+    }
+
+    #[test]
+    fn acl_add_ipv4_cidr_slash24() {
+        let mut acl = Acl::deny_all();
+        acl.add_ipv4_cidr(10, 0, 1, 0, 24);
+        assert!(acl.allows(0x0A_00_01_01)); // 10.0.1.1
+        assert!(acl.allows(0x0A_00_01_FF)); // 10.0.1.255
+        assert!(!acl.allows(0x0A_00_02_01)); // 10.0.2.1 (different subnet)
+    }
+
+    #[test]
+    fn acl_table_full_returns_false() {
+        let mut acl = Acl::deny_all();
+        for i in 0..ACL_MAX_ENTRIES {
+            assert!(acl.add_ipv4_cidr(10, 0, i as u8, 0, 24));
+        }
+        // Table is now full; next add should fail.
+        assert!(!acl.add_ipv4_cidr(172, 16, 0, 0, 16));
+    }
+
+    // -- Rate limiter tests --
+
+    #[test]
+    fn rate_limiter_allows_first_request_from_new_client() {
+        let mut rl = RateLimiter::new();
+        assert!(rl.check(0xC0_A8_01_01, 1_000_000));
+    }
+
+    #[test]
+    fn rate_limiter_allows_request_after_sufficient_interval() {
+        let mut rl = RateLimiter::new();
+        let addr = 0xC0_A8_01_01_u32;
+        rl.check(addr, 0);
+        // 3 seconds later — well above MIN_POLL_INTERVAL_US.
+        assert!(rl.check(addr, 3 * MICROS_PER_SEC));
+    }
+
+    #[test]
+    fn rate_limiter_denies_request_within_min_interval() {
+        let mut rl = RateLimiter::new();
+        let addr = 0xC0_A8_01_02_u32;
+        rl.check(addr, 0);
+        // 0.5 seconds — below MIN_POLL_INTERVAL_US (2 s).
+        assert!(!rl.check(addr, 500_000));
+    }
+
+    #[test]
+    fn rate_limiter_allows_after_previous_deny() {
+        let mut rl = RateLimiter::new();
+        let addr = 0xC0_A8_01_03_u32;
+        rl.check(addr, 0);                        // allow (first)
+        rl.check(addr, 500_000);                  // deny  (too fast, but last_us not updated)
+        assert!(rl.check(addr, 3 * MICROS_PER_SEC)); // allow (enough time since first)
+    }
+
+    #[test]
+    fn rate_limiter_evicts_oldest_when_full() {
+        let mut rl = RateLimiter::new();
+        // Fill the table with distinct clients, oldest at t=0, newest at t=N.
+        for i in 0..RATE_TABLE_SIZE {
+            rl.check(0x0A_00_00_00 + i as u32, i as i64 * 1_000);
+        }
+        // A new client should be admitted (evicting the oldest).
+        assert!(rl.check(0xFF_FF_FF_FF, (RATE_TABLE_SIZE as i64) * 1_000));
+    }
+
+    // -- KoD packet tests --
+
+    #[test]
+    fn build_kod_response_has_stratum_0_and_rate_refid() {
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        // Simulate client transmit timestamp in bytes 40-47.
+        req[40..48].copy_from_slice(&0x1234_5678_ABCD_EF00_u64.to_be_bytes());
+        let resp = build_kod_response(&req, 4);
+        // Stratum must be 0 (kiss packet).
+        assert_eq!(resp[1], 0, "stratum should be 0");
+        // Reference ID must be "RATE".
+        assert_eq!(&resp[12..16], b"RATE", "refid should be RATE");
+        // LI = 3 (alarm).
+        assert_eq!((resp[0] >> 6) & 0x03, 3, "LI should be 3 (alarm)");
+        // Mode = 4 (server).
+        assert_eq!(resp[0] & 0x07, 4, "mode should be 4");
+        // Originate = client's transmit timestamp.
+        assert_eq!(&resp[24..32], &req[40..48], "originate should echo client transmit ts");
+    }
+
+    // -- poll() integration tests for service protections --
+
+    #[test]
+    fn poll_sends_kod_when_client_polls_too_fast() {
+        // Bind a server socket and configure a client that will poll twice in
+        // rapid succession. The second poll should receive a KoD RATE response.
+        let mut server = NtpServer::new_for_test().expect("server");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        // Build a minimal mode-3 NTP request packet.
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (4 << 3) | 3; // VN=4, Mode=3
+
+        // First request — should be served normally.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let mut buf = [0_u8; 64];
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_ne!(buf[1], 0, "first response should not be a kiss packet");
+
+        // Second request immediately after (no delay) — should get KoD.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_eq!(buf[1], 0, "second response should be stratum-0 KoD");
+        assert_eq!(&buf[12..16], b"RATE", "KoD refid should be RATE");
+        assert_eq!(server.rate_limited_total, 1, "rate_limited counter should increment");
+    }
+
+    #[test]
+    fn poll_drops_packet_from_acl_blocked_source() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        // Configure a deny-all ACL so even loopback is blocked.
+        server.set_acl(Acl::deny_all());
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_millis(100))).unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (4 << 3) | 3; // VN=4, Mode=3
+
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+
+        // The packet should be silently dropped — no response.
+        let mut buf = [0_u8; 64];
+        let result = client.recv_from(&mut buf);
+        assert!(result.is_err(), "ACL-blocked packet should not receive a response");
+        assert_eq!(server.acl_blocked_total, 1, "acl_blocked counter should increment");
+    }
+
+    #[test]
+    fn poll_mode6_not_rate_limited() {
+        // ntpq (mode-6) queries should never be rate-limited even if sent rapidly.
+        let mut server = NtpServer::new_for_test().expect("server");
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        // Mode-6 request.
+        let mut req = [0_u8; NTP_CONTROL_HEADER_LEN];
+        req[0] = (4 << 3) | 6; // VN=4, Mode=6
+        req[1] = MODE6_OPCODE_READVAR;
+
+        let mut buf = [0_u8; 256];
+        for _ in 0..3 {
+            client.send_to(&req, server_addr).unwrap();
+            server.poll(false).unwrap();
+            let (n, _) = client.recv_from(&mut buf).unwrap();
+            assert!(n >= NTP_CONTROL_HEADER_LEN, "mode-6 should always get a response");
+        }
+        assert_eq!(server.rate_limited_total, 0, "mode-6 should not be rate-limited");
     }
 }

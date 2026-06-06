@@ -46,6 +46,8 @@ using GPS NMEA + PPS.
 ### M5 - robustness
 
 - [x] Holdover behavior when GPS fix is lost (PLL/FLL servo + growing root dispersion, stratum demotion at 1 s)
+- [x] Per-client rate limiting with Kiss-o'-Death RATE responses (RFC 5905 §7.4)
+- [x] IP ACL allowlist (`Acl::allow_all` / `deny_all` / `private_lan`)
 - [ ] Basic metrics (fix age, PPS age, clients served)
 - [ ] Boot-time self-check logs for UART/PPS/network state
 
