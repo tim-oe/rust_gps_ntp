@@ -2,9 +2,9 @@ use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime};
 
 #[derive(Debug, Clone, Default)]
 pub struct GpsSnapshot {
-    pub utc_date: String,
-    pub utc_time: String,
+    pub local_date: String,
     pub local_time: String,
+    pub tz_offset_hours: i8,
     pub lat: f32,
     pub lon: f32,
     pub fix: bool,
@@ -44,8 +44,8 @@ fn nmea_to_decimal(value: &str, dir: &str) -> Option<f32> {
     Some(decimal)
 }
 
-fn local_time_from_utc(utc_date: &str, utc_time: &str, lon: f32) -> Option<String> {
-    let tz_offset_h = (lon / 15.0).round() as i64;
+fn local_datetime_from_utc(utc_date: &str, utc_time: &str, lon: f32) -> Option<(String, String, i8)> {
+    let tz_offset_h = (lon / 15.0).round() as i8;
     let ddmmyy = parse_ddmmyy(utc_date)?;
     let hhmmss = parse_hhmmss(utc_time)?;
 
@@ -58,12 +58,11 @@ fn local_time_from_utc(utc_date: &str, utc_time: &str, lon: f32) -> Option<Strin
 
     let date = NaiveDate::from_ymd_opt(year, month, day)?;
     let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-    let dt = NaiveDateTime::new(date, time) + ChronoDuration::hours(tz_offset_h);
-
-    Some(format!(
-        "{} ({:+}h)",
-        dt.time().format("%H:%M:%S"),
-        tz_offset_h
+    let dt = NaiveDateTime::new(date, time) + ChronoDuration::hours(tz_offset_h as i64);
+    Some((
+        dt.date().format("%Y-%m-%d").to_string(),
+        dt.time().format("%H:%M:%S").to_string(),
+        tz_offset_h,
     ))
 }
 
@@ -80,16 +79,25 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     let lat = nmea_to_decimal(fields[3], fields[4])?;
     let lon = nmea_to_decimal(fields[5], fields[6])?;
 
-    gps.utc_date = format_ddmmyy(date);
-    gps.utc_time = format_hhmmss(time);
-    gps.local_time = local_time_from_utc(date, time, lon).unwrap_or_else(|| "n/a".to_owned());
+    let (local_date, local_time, tz_offset_hours) =
+        local_datetime_from_utc(date, time, lon).unwrap_or_else(|| {
+            (
+                format_ddmmyy(date),
+                format_hhmmss(time),
+                0,
+            )
+        });
+    gps.local_date = local_date;
+    gps.local_time = local_time;
+    gps.tz_offset_hours = tz_offset_hours;
     gps.lat = lat;
     gps.lon = lon;
     gps.fix = status == "A";
     log::trace!(
-        "GPS RMC parsed: utc={} {} fix={} lat={:.6} lon={:.6}",
-        gps.utc_date,
-        gps.utc_time,
+        "GPS RMC parsed: local={} {} tz={:+}h fix={} lat={:.6} lon={:.6}",
+        gps.local_date,
+        gps.local_time,
+        gps.tz_offset_hours,
         gps.fix,
         gps.lat,
         gps.lon

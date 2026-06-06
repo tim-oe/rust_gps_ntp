@@ -246,8 +246,6 @@ fn main() -> anyhow::Result<()> {
                 &gps,
                 &battery,
                 pps_delta_us,
-                current_pps_count,
-                bytes_seen,
             );
             last_draw_us = now_us;
             force_redraw = false;

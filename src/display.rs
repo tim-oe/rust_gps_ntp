@@ -1,6 +1,8 @@
 use anyhow::anyhow;
 use core::sync::atomic::{AtomicBool, Ordering};
-use embedded_graphics::mono_font::ascii::FONT_8X13_BOLD;
+// Official font docs (embedded-graphics mono/ascii):
+// https://docs.rs/embedded-graphics/latest/embedded_graphics/mono_font/ascii/index.html
+use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
@@ -213,7 +215,7 @@ where
         .into_styled(PrimitiveStyle::with_fill(Rgb565::BLUE))
         .draw(panel);
     let boot_style = MonoTextStyleBuilder::new()
-        .font(&FONT_8X13_BOLD)
+        .font(&FONT_10X20)
         .text_color(Rgb565::WHITE)
         .build();
     let _ = Text::new("Display boot test", Point::new(8, 20), boot_style).draw(panel);
@@ -226,81 +228,101 @@ where
     FreeRtos::delay_ms(800);
 }
 
+fn format_human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut value = bytes as f64;
+    let mut unit_idx = 0usize;
+    while value >= 1024.0 && unit_idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit_idx += 1;
+    }
+    if unit_idx == 0 {
+        format!("{}{}", bytes, UNITS[unit_idx])
+    } else {
+        format!("{:.1}{}", value, UNITS[unit_idx])
+    }
+}
+
+fn format_signed_offset_us(offset_us: i64) -> String {
+    let abs_us = offset_us.unsigned_abs();
+    if abs_us < 1_000 {
+        format!("{:+}us", offset_us)
+    } else {
+        let mut ms = format!("{:+.3}", (offset_us as f64) / 1000.0);
+        while ms.contains('.') && ms.ends_with('0') {
+            ms.pop();
+        }
+        if ms.ends_with('.') {
+            ms.pop();
+        }
+        format!("{}ms", ms)
+    }
+}
+
 pub fn draw_page<D>(
     display: &mut D,
     page: Page,
     gps: &GpsSnapshot,
     battery: &BatterySnapshot,
     pps_delta_us: u32,
-    pps_count: u32,
-    bytes_seen: u64,
 )
 where
     D: DrawTarget<Color = Rgb565>,
 {
     let style = MonoTextStyleBuilder::new()
-        .font(&FONT_8X13_BOLD)
+        .font(&FONT_10X20)
         .text_color(Rgb565::WHITE)
         .build();
 
     let _ = display.clear(Rgb565::BLACK);
 
-    let mut y = 14;
+    let mut y = 20;
     let mut line = |text: String| {
         let _ = Text::new(&text, Point::new(4, y), style).draw(display);
-        y += 14;
+        y += 21;
     };
 
     match page {
         Page::Time => {
             line("Page 1/4  TIME".to_owned());
-            line(format!("UTC:   {} {}", gps.utc_date, gps.utc_time));
-            line(format!("Local: {}", gps.local_time));
-            line(format!("Fix:   {}", if gps.fix { "yes" } else { "no" }));
-            line(format!("Lat:   {:.5}", gps.lat));
-            line(format!("Lon:   {:.5}", gps.lon));
+            line(format!("Time:  {}", gps.local_time));
+            line(format!("Date:  {}", gps.local_date));
+            line(format!("TZ:    {:+}h", gps.tz_offset_hours));
         }
         Page::Location => {
             line("Page 2/4  LOCATION".to_owned());
             line(format!("Lat: {:.6}", gps.lat));
             line(format!("Lon: {:.6}", gps.lon));
             line(format!("Sats: {}", gps.sats));
-            line(format!("PPS count: {}", pps_count));
-            line(format!("PPS offset: {}us", pps_delta_us));
         }
         Page::Resources => {
             let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
             let min_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
-            let largest = unsafe {
-                esp_idf_svc::sys::heap_caps_get_largest_free_block(
-                    esp_idf_svc::sys::MALLOC_CAP_8BIT as u32,
-                )
-            };
-            let cpu_freq_label = "n/a";
-            let part_size_kb = unsafe {
+            // We don't have a filesystem yet, so show app partition size as storage capacity.
+            let storage_part_bytes = unsafe {
                 let p = esp_idf_svc::sys::esp_ota_get_running_partition();
                 if p.is_null() {
-                    0
+                    0_u64
                 } else {
-                    ((*p).size / 1024) as u32
+                    (*p).size as u64
                 }
             };
-
             line("Page 3/4  RESOURCES".to_owned());
-            line(format!("Storage(part): {} KB", part_size_kb));
-            line(format!("Heap free: {} B", free_heap));
-            line(format!("Heap min:  {} B", min_heap));
-            line(format!("Heap block: {} B", largest));
-            line(format!("CPU freq: {}", cpu_freq_label));
-            line(format!("GPS bytes: {}", bytes_seen));
+            line(format!("Storage part: {}", format_human_bytes(storage_part_bytes)));
+            line(format!("Heap free: {}", format_human_bytes(free_heap as u64)));
+            line(format!("Heap min: {}", format_human_bytes(min_heap as u64)));
         }
         Page::Battery => {
+            let pps_label = if pps_delta_us == 0 {
+                "PPS: n/a".to_owned()
+            } else {
+                let offset_us = pps_delta_us as i64 - 1_000_000_i64;
+                format!("PPS: {}", format_signed_offset_us(offset_us))
+            };
             line("Page 4/4  BATTERY".to_owned());
-            line("MAX17048 over I2C".to_owned());
             line(format!("Voltage: {:.3} V", battery.voltage_v));
             line(format!("Charge:  {:.1} %", battery.percent));
-            line(format!("PPS last: {} us", pps_delta_us));
-            line(format!("UTC: {}", gps.utc_time));
+            line(pps_label);
         }
     }
 }
