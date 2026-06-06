@@ -10,7 +10,7 @@ for your connected board at `/dev/ttyACM0`.
 
 ## Requirements
 
-- Follow `docs/setup.md` for Rust + Espressif toolchain installation and flashing tools.
+- Follow [setup doc](docs/setup.md) for Rust + Espressif toolchain installation and flashing tools.
 
 ## Current Status
 
@@ -24,7 +24,7 @@ for your connected board at `/dev/ttyACM0`.
 - PPS discipline on `GPIO12` (rising-edge interrupt)
 - NTP UDP/123 responder with GPS/PPS-backed timestamps and mode-6 diagnostics
 - IANA timezone lookup (background worker) with NVS cache
-
+- [docs/ntp-todo.md](docs/ntp-todo.md) - outstanding NTP work
 ## Rust code organization
 
 Logic lives in the library crate (`src/lib.rs`); `src/main.rs` is a thin ESP-IDF
@@ -38,15 +38,16 @@ entrypoint. Modules include `gps`, `pps`, `ntp`, `display`, `battery`, `wifi`,
 - `.cargo/config.toml` - default target and flash runner
 - `justfile` - development, CI, and flash commands
 - `partitions.csv` - custom partition table with larger app partition
-- `docs/setup.md` - one-time toolchain install and build/flash commands
-- `docs/hardware.md` - board pairing, wiring, and bring-up checklist
-- `docs/rfp.md` - implementation roadmap for GPS-disciplined NTP
+- [docs/setup.md](docs/setup.md) - one-time toolchain install and build/flash commands
+- [docs/hardware.md](docs/hardware.md) - board pairing, wiring, and bring-up checklist
+- [docs/rfp.md](docs/rfp.md) - implementation roadmap for GPS-disciplined NTP
+- [docs/technical.md](docs/technical.md) - technical implementation: module design, data flow, NTP packet layout, external spec links
+- [docs/rust-error-handling.md](docs/rust-error-handling.md) - project error-handling conventions (Result/Option/anyhow patterns)
 
 ## Quick Start
 
-1. Follow `docs/setup.md`.
-2. Confirm board appears at `/dev/ttyACM0`.
-3. Flash and monitor:
+1. Follow [setup doc](docs/setup.md).
+2. Flash and monitor:
 
 ```bash
 just flash-monitor
@@ -54,14 +55,8 @@ just flash-monitor
 
 ## Development
 
-Host checks (format, clippy, unit tests):
+see just recipes for details
 
 ```bash
-just ci
-```
-
-Full firmware check (includes ESP target):
-
-```bash
-just ci-esp
+just --list
 ```

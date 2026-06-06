@@ -26,4 +26,4 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Host CI with coverage gate
-        run: just ci-coverage
+        run: just ci-no-esp

@@ -12,66 +12,68 @@ coverage_min_lines := "90"
 coverage_min_functions := "90"
 coverage_min_regions := "90"
 
-coverage_llvm_cov := "cargo llvm-cov --target " + host_target + " --ignore-filename-regex 'src/main\\.rs$' --fail-under-lines " + coverage_min_lines + " --fail-under-functions " + coverage_min_functions + " --fail-under-regions " + coverage_min_regions
+coverage_llvm_cov_run := "cargo llvm-cov --target " + host_target + " --no-report"
+coverage_llvm_cov_report := "cargo llvm-cov report --target " + host_target + " --ignore-filename-regex 'src/main\\.rs$'"
+coverage_llvm_cov_gate := coverage_llvm_cov_report + " --summary-only --fail-under-lines " + coverage_min_lines + " --fail-under-functions " + coverage_min_functions + " --fail-under-regions " + coverage_min_regions
 
+# List available recipes.
 default:
     @just --list
 
+# Auto-format all Rust source files.
 fmt:
     cargo fmt --all
 
+# Check formatting without modifying files (used in CI).
 fmt-check:
     cargo fmt --all -- --check
 
+# Run Clippy on host target; treats warnings as errors.
 lint:
-    cargo clippy --all-targets --all-features -- -D warnings
-
-lint-host:
     cargo clippy --target {{host_target}} --all-targets --all-features -- -D warnings
 
-test: test-host
-
-test-host:
+# Run unit tests on host target (ESP modules are excluded via cfg).
+test:
     cargo test --target {{host_target}}
 
+# Run tests with coverage; enforces 90% minimums and writes HTML + LCOV reports.
 coverage:
-    {{coverage_llvm_cov}} --summary-only
-
-coverage-html:
-    {{coverage_llvm_cov}} --html
-
-coverage-gate:
-    {{coverage_llvm_cov}} --summary-only
-
-coverage-lcov:
     mkdir -p target/llvm-cov
-    {{coverage_llvm_cov}} --lcov --output-path target/llvm-cov/lcov.info
+    {{coverage_llvm_cov_run}}
+    {{coverage_llvm_cov_gate}}
+    {{coverage_llvm_cov_report}} --html
+    {{coverage_llvm_cov_report}} --lcov --output-path target/llvm-cov/lcov.info
 
+# Type-check the ESP32 firmware target (requires export-esp.sh).
 check:
-    cargo check
-
-check-esp:
     source {{esp_export}} && cargo +esp check
 
+# Flash app partition only — fast iterative deploy; skips bootloader and partition table.
+flash-app:
+    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}}
+
+# Flash app partition only and attach serial monitor.
+flash-app-monitor:
+    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --monitor
+
+# Full flash (bootloader + partition table + app); run after partitions.csv changes or first flash.
 flash:
-    just coverage-gate
-    just check-esp
+    just coverage
+    just check
     source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}}
 
-flash-lib: flash
+# Full flash and attach serial monitor.
+flash-monitor:
+    just coverage
+    just check
+    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}} --monitor
 
+# Attach serial monitor to the connected board without flashing.
 monitor:
     source {{esp_export}} && cargo +esp espflash monitor --chip {{chip}} --port {{port}}
 
-flash-monitor:
-    just coverage-gate
-    just check-esp
-    source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}} --monitor
+# Full firmware CI: fmt-check + lint + gated coverage + ESP target check. Requires export-esp.sh.
+ci: fmt-check lint coverage check
 
-# Host-only CI (works without ESP toolchain); default for local dev and GitHub Actions.
-ci: fmt-check lint-host test-host
-
-# Full firmware CI including ESP target check (requires export-esp.sh).
-ci-esp: fmt-check lint-host test-host check-esp
-
-ci-coverage: fmt-check lint-host coverage-lcov
+# Host-only CI: fmt-check + lint + gated coverage. Works without ESP toolchain.
+ci-no-esp: fmt-check lint coverage

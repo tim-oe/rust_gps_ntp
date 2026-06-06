@@ -123,22 +123,23 @@ result in NVS for future boots. Cached timezone is used immediately at boot and
 then refreshed periodically from network lookup; if the resolved zone changes,
 the new value is applied and persisted.
 
-From repo root:
+There are two flash workflows:
+
+**First flash or after changing `partitions.csv`** — writes bootloader, partition table, and app; runs coverage gate and ESP check first:
 
 ```bash
-just flash-monitor
+just flash          # flash only
+just flash-monitor  # flash then attach monitor
 ```
 
-`just flash` and `just flash-monitor` use:
-
-- `--release` builds (smaller binary)
-- custom `partitions.csv` with a larger factory app slot for ESP32-S3
-
-Alternative (uses runner from `.cargo/config.toml`):
+**Iterative development** — writes app partition only; faster, no coverage gate:
 
 ```bash
-cargo +esp run
+just flash-app          # flash only
+just flash-app-monitor  # flash then attach monitor
 ```
+
+All flash recipes use `--release` builds. The full-flash recipes also write `partitions.csv`, which configures a larger factory app slot for ESP32-S3.
 
 Other useful tasks:
 
@@ -146,16 +147,10 @@ Other useful tasks:
 just fmt
 just lint
 just test
-just test-host
 just coverage
-just coverage-html
-just coverage-lcov
-just ci-esp
 just ci
+just ci-no-esp
 ```
-
-Note: `just flash` and `just flash-monitor` now run an ESP compile check
-(`just check-esp`) before flashing.
 
 ## 6) Test and coverage reporting
 
@@ -172,34 +167,25 @@ cargo install cargo-llvm-cov
 Run tests:
 
 ```bash
-just test-host
+just test
 ```
 
-Generate coverage reports (all enforce **80%** minimums on lines, functions, and regions):
+Coverage enforces **90%** minimums on lines, functions, and regions:
 
 ```bash
-# terminal summary (fails if below minimums)
 just coverage
 
-# same gate, explicit recipe name
-just coverage-gate
-
-# HTML report (open target/llvm-cov/html/index.html)
-just coverage-html
-
-# LCOV file for CI tools (Codecov/Sonar/etc.)
-just coverage-lcov
-
-# fmt + clippy + gated coverage + lcov export
-just ci-coverage
+# fmt + clippy + coverage (same as ci-no-esp)
+just ci-no-esp
 ```
 
-Minimums are defined in `justfile` (`coverage_min_*`, currently **90%** for lines, functions, and regions). Host `main.rs` is excluded from coverage totals.
-`just flash` and `just flash-monitor` run `just coverage-gate` before the ESP build.
+`just flash` and `just flash-monitor` run `just coverage` before the ESP build.
+
+Minimums are defined in `justfile` (`coverage_min_*`, currently **90%**). Host `main.rs` is excluded from coverage totals.
 
 Outputs:
 
-- HTML report directory: `target/llvm-cov/html/`
+- HTML report: `target/llvm-cov/html/index.html`
 - LCOV file: `target/llvm-cov/lcov.info`
 
 ## 7) Logging configuration
