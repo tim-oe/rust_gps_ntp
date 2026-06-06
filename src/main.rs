@@ -5,6 +5,8 @@ mod display;
 #[cfg(target_os = "espidf")]
 mod gps;
 #[cfg(target_os = "espidf")]
+mod logging;
+#[cfg(target_os = "espidf")]
 mod wifi;
 
 #[cfg(target_os = "espidf")]
@@ -25,7 +27,7 @@ fn main() -> anyhow::Result<()> {
     use std::sync::Arc;
 
     esp_idf_svc::sys::link_patches();
-    esp_idf_svc::log::EspLogger::initialize_default();
+    logging::init();
     let wifi_creds = wifi::load_wifi_credentials_from_env()?;
 
     let peripherals = Peripherals::take().context("failed to take ESP32 peripherals")?;
@@ -55,15 +57,36 @@ fn main() -> anyhow::Result<()> {
     )
     .context("failed to initialize GPS UART diagnostics")?;
 
-    let i2c_cfg = i2c::config::Config::new().baudrate(100.kHz().into());
-    let mut i2c_drv = i2c::I2cDriver::new(i2c0, pins.gpio3, pins.gpio4, &i2c_cfg)
-        .context("failed to initialize I2C for battery monitor")?;
-
     let mut tft_power =
         PinDriver::output(pins.gpio21).context("failed to init TFT power enable")?;
     tft_power
         .set_high()
         .context("failed to enable TFT power rail")?;
+    // TFT_I2C_POWER gates power for onboard I2C peripherals on this Feather.
+    FreeRtos::delay_ms(10);
+
+    const BOARD_I2C_SDA_PIN: i32 = 42;
+    const BOARD_I2C_SCL_PIN: i32 = 41;
+    let i2c_cfg = i2c::config::Config::new().baudrate(100.kHz().into());
+    let mut i2c_drv = i2c::I2cDriver::new(i2c0, pins.gpio42, pins.gpio41, &i2c_cfg)
+        .context("failed to initialize I2C for battery monitor")?;
+    log::info!(
+        "Battery I2C bus initialized on SDA=GPIO{}, SCL=GPIO{}",
+        BOARD_I2C_SDA_PIN,
+        BOARD_I2C_SCL_PIN
+    );
+    let battery_monitor = battery::detect_monitor(&mut i2c_drv);
+    match battery_monitor {
+        Some(battery::BatteryMonitor::Max17048) => {
+            log::info!("Battery monitor detected: MAX17048 @ 0x36");
+        }
+        Some(battery::BatteryMonitor::Lc709203) => {
+            log::info!("Battery monitor detected: LC709203 @ 0x0B");
+        }
+        None => {
+            log::warn!("Battery monitor not detected on I2C (tried 0x36 MAX17048 and 0x0B LC709203)");
+        }
+    }
 
     let spi_drv = spi::SpiDeviceDriver::new_single(
         spi2,
@@ -160,14 +183,14 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(_) => {
-                        log::warn!("GPS UART received {} non-UTF8 bytes", read);
+                        log::info!("GPS UART received {} non-UTF8 bytes", read);
                     }
                 }
             }
         }
 
         if bytes_seen > 0 && bytes_seen % 512 == 0 {
-            log::info!("GPS diagnostics bytes received: {}", bytes_seen);
+            log::debug!("GPS diagnostics bytes received: {}", bytes_seen);
         }
 
         let current_pps_count = pps_count.load(Ordering::Relaxed);
@@ -175,9 +198,9 @@ fn main() -> anyhow::Result<()> {
             let now_us = pps_edge_us.load(Ordering::Relaxed);
             if last_logged_pps_us > 0 {
                 pps_delta_us = now_us.wrapping_sub(last_logged_pps_us);
-                log::info!("PPS pulse #{} delta={}us", current_pps_count, pps_delta_us);
+                log::debug!("PPS pulse #{} delta={}us", current_pps_count, pps_delta_us);
             } else {
-                log::info!("PPS pulse #{} detected", current_pps_count);
+                log::debug!("PPS pulse #{} detected", current_pps_count);
             }
 
             last_logged_pps_count = current_pps_count;
@@ -190,8 +213,10 @@ fn main() -> anyhow::Result<()> {
 
         let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
         if last_battery_us == 0 || (now_us - last_battery_us) >= 5_000_000 {
-            if let Some(reading) = battery::read_battery(&mut i2c_drv) {
-                battery = reading;
+            if let Some(kind) = battery_monitor {
+                if let Some(reading) = battery::read_battery(&mut i2c_drv, kind) {
+                    battery = reading;
+                }
             }
             last_battery_us = now_us;
         }

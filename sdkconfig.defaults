@@ -6,3 +6,13 @@
 # Rust app_main has substantial stack usage (Wi-Fi, display, parsing, logging).
 # Prevent early reboot loops from main task stack overflow.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+
+# Keep production logs at info by default.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Allow per-module overrides to raise debug/trace at runtime.
+CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
+
+# module log levels
+# LOG_GPS_LEVEL=trace
+# LOG_PPS_LEVEL=trace

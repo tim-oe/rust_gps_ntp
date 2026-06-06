@@ -137,7 +137,45 @@ just test
 just ci
 ```
 
-## 6) Verify boot logs
+## 6) Logging configuration
+
+The project uses `src/logging.rs` to centralize logger initialization and optional
+per-module log-level overrides.
+
+Default behavior:
+
+- global ESP-IDF log level is `INFO` via `sdkconfig.defaults`
+- ESP-IDF maximum log level is `VERBOSE` so per-module runtime overrides can
+  raise a module to `debug`/`trace`
+- module logs use the Rust module path (for example `rust_gps_ntp::battery`)
+
+Optional module overrides (either build-time env vars, or keys in `sdkconfig.defaults`):
+
+- `LOG_WIFI_LEVEL`
+- `LOG_GPS_LEVEL`
+- `LOG_DISPLAY_LEVEL`
+- `LOG_BATTERY_LEVEL`
+- `LOG_PPS_LEVEL`
+
+Accepted values: `none`, `error`, `warn`, `info`, `debug`, `trace`.
+
+Example (battery debug only):
+
+```bash
+export LOG_BATTERY_LEVEL=debug
+just flash-monitor
+```
+
+These are compile-time inputs (same pattern as `WIFI_SSID`/`WIFI_PASS`), so
+re-flash after changing them.
+
+Example (`sdkconfig.defaults`):
+
+```text
+LOG_GPS_LEVEL=trace
+```
+
+## 7) Verify boot logs
 
 You should see:
 
@@ -145,11 +183,9 @@ You should see:
 - STA connection success
 - assigned DHCP address, e.g. `Wi-Fi connected; STA IP: 192.168.1.42`
 - boot message indicating Wi-Fi + GPS UART diagnostics mode
-- raw NMEA logs when GPS serial data is present, e.g. `GPS NMEA: $GPRMC,...`
-- parsed UTC display from RMC sentences, e.g. `GPS UTC: 2026-06-04 02:35:01`
 - TFT page output with button page-toggle and 15-second auto-blank/wake behavior
 
-## 7) Next firmware milestone
+## 8) Next firmware milestone
 
 Implement in this order:
 
