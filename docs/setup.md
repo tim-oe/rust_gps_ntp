@@ -175,18 +175,27 @@ Run tests:
 just test-host
 ```
 
-Generate coverage reports:
+Generate coverage reports (all enforce **80%** minimums on lines, functions, and regions):
 
 ```bash
-# terminal summary
+# terminal summary (fails if below minimums)
 just coverage
+
+# same gate, explicit recipe name
+just coverage-gate
 
 # HTML report (open target/llvm-cov/html/index.html)
 just coverage-html
 
 # LCOV file for CI tools (Codecov/Sonar/etc.)
 just coverage-lcov
+
+# fmt + clippy + gated coverage + lcov export
+just ci-coverage
 ```
+
+Minimums are defined in `justfile` (`coverage_min_*`, currently **90%** for lines, functions, and regions). Host `main.rs` is excluded from coverage totals.
+`just flash` and `just flash-monitor` run `just coverage-gate` before the ESP build.
 
 Outputs:
 

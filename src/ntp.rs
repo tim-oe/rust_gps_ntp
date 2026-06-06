@@ -544,4 +544,240 @@ mod tests {
         write_u64_be(&mut buf, 0x0123_4567_89ab_cdef);
         assert_eq!(buf, 0x0123_4567_89ab_cdef_u64.to_be_bytes());
     }
+
+    #[test]
+    fn write_u32_be_roundtrip() {
+        let mut buf = [0_u8; 4];
+        write_u32_be(&mut buf, 0x0123_4567);
+        assert_eq!(buf, 0x0123_4567_u32.to_be_bytes());
+    }
+
+    #[test]
+    fn ntp_timestamp_now_is_nonzero() {
+        assert_ne!(ntp_timestamp_now(), 0);
+    }
+
+    #[test]
+    fn build_mode6_readstat_returns_association_row() {
+        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 4, true, 0, 0.0, 0.0);
+        assert_eq!(resp.len(), NTP_CONTROL_HEADER_LEN + 4);
+    }
+
+    #[test]
+    fn build_mode6_readvar_unsynced_system_vars() {
+        let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 4, false, 0, 0.0, 0.0);
+        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
+        assert!(payload.contains("stratum=16"));
+        assert!(payload.contains("refid=INIT"));
+    }
+
+    #[test]
+    fn build_mode6_readvar_unsynced_peer_vars() {
+        let req = [
+            0,
+            MODE6_OPCODE_READVAR,
+            0,
+            0,
+            0,
+            0,
+            0,
+            MODE6_ASSOC_ID as u8,
+            0,
+            0,
+            0,
+            0,
+        ];
+        let resp = build_mode6_response(&req, 4, false, 0, 0.0, 0.0);
+        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
+        assert!(payload.contains("srcadr=INIT"));
+    }
+
+    #[test]
+    fn build_mode6_unsupported_opcode_sets_error_bit() {
+        let req = [0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 4, true, 0, 0.0, 0.0);
+        assert_ne!(resp[1] & 0x40, 0);
+    }
+
+    #[test]
+    fn build_mode6_invalid_version_defaults_to_v4() {
+        let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 0, false, 0, 0.0, 0.0);
+        assert_eq!((resp[0] >> 3) & 0x07, 4);
+    }
+
+    impl NtpServer {
+        fn new_for_test() -> anyhow::Result<Self> {
+            let socket = UdpSocket::bind("127.0.0.1:0")?;
+            socket.set_nonblocking(true)?;
+            Ok(Self {
+                socket,
+                served: 0,
+                clock_anchor: None,
+                last_gps_utc_seconds: None,
+                pps_locked: false,
+                pps_offset_us: 0,
+                pps_jitter_us: 0.0,
+                pps_has_sample: false,
+                proc_delay_us: 0.0,
+                proc_delay_has_sample: false,
+            })
+        }
+    }
+
+    fn client_ntp_request() -> [u8; NTP_PACKET_LEN] {
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (4 << 3) | 3;
+        req
+    }
+
+    #[test]
+    fn update_gps_utc_seconds_establishes_anchor() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        assert!(server.clock_anchor.is_some());
+        assert_eq!(server.last_gps_utc_seconds, Some(1_700_000_000));
+    }
+
+    #[test]
+    fn update_gps_utc_seconds_reanchors_on_large_drift() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.update_gps_utc_seconds(1_700_000_010);
+        let anchor = server.clock_anchor.expect("anchor");
+        assert_eq!(anchor.unix_seconds, 1_700_000_010);
+    }
+
+    #[test]
+    fn observe_pps_pulse_first_pulse_locks_to_gps() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        assert!(server.pps_locked);
+    }
+
+    #[test]
+    fn observe_pps_pulse_valid_interval_advances_anchor() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        let before = server.clock_anchor.expect("anchor").unix_seconds;
+        server.observe_pps_pulse(Some(1_000_000));
+        assert_eq!(
+            server.clock_anchor.expect("anchor").unix_seconds,
+            before + 1
+        );
+        assert!(server.pps_has_sample);
+    }
+
+    #[test]
+    fn observe_pps_pulse_ignores_invalid_interval() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(Some(2_000_000));
+        assert!(!server.pps_has_sample);
+    }
+
+    #[test]
+    fn poll_serves_client_time_request() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let addr = server.socket.local_addr().expect("local addr");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        client
+            .send_to(&client_ntp_request(), addr)
+            .expect("send request");
+
+        server.poll(true).expect("poll");
+        let mut resp = [0_u8; NTP_PACKET_LEN];
+        let (len, _) = client.recv_from(&mut resp).expect("response");
+        assert_eq!(len, NTP_PACKET_LEN);
+        assert_eq!(resp[0] & 0x07, 4);
+        assert_eq!(resp[1], 1);
+    }
+
+    #[test]
+    fn poll_serves_mode6_readvar() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let addr = server.socket.local_addr().expect("local addr");
+        let mut req = [0_u8; NTP_CONTROL_HEADER_LEN];
+        req[0] = (4 << 3) | 6;
+        req[1] = MODE6_OPCODE_READVAR;
+        req[7] = MODE6_ASSOC_ID as u8;
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        client.send_to(&req, addr).expect("send mode-6");
+
+        server.poll(false).expect("poll");
+        let mut resp = vec![0_u8; 512];
+        let (len, _) = client.recv_from(&mut resp).expect("mode-6 response");
+        assert!(len >= NTP_CONTROL_HEADER_LEN);
+    }
+
+    #[test]
+    fn poll_serves_unsynced_time_request_without_anchor() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let addr = server.socket.local_addr().expect("local addr");
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        client
+            .send_to(&client_ntp_request(), addr)
+            .expect("send request");
+
+        server.poll(false).expect("poll");
+        let mut resp = [0_u8; NTP_PACKET_LEN];
+        let (len, _) = client.recv_from(&mut resp).expect("response");
+        assert_eq!(len, NTP_PACKET_LEN);
+        assert_eq!(resp[1], 16);
+    }
+
+    #[test]
+    fn poll_smoothes_processing_delay_after_second_request() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let addr = server.socket.local_addr().expect("local addr");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        for _ in 0..2 {
+            client
+                .send_to(&client_ntp_request(), addr)
+                .expect("send request");
+            server.poll(true).expect("poll");
+            let mut resp = [0_u8; NTP_PACKET_LEN];
+            client.recv_from(&mut resp).expect("response");
+        }
+        assert!(server.proc_delay_has_sample);
+        assert!(server.proc_delay_us >= 1.0);
+    }
+
+    #[test]
+    fn observe_pps_pulse_smoothes_jitter_on_second_valid_interval() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        server.observe_pps_pulse(Some(1_000_250));
+        server.observe_pps_pulse(Some(1_000_500));
+        assert!(server.pps_has_sample);
+        assert_eq!(server.pps_offset_us, 500);
+        assert!(server.pps_jitter_us > 0.0);
+    }
+
+    #[test]
+    fn poll_ignores_short_client_packet() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let addr = server.socket.local_addr().expect("local addr");
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        client.send_to(&[0_u8; 8], addr).expect("send short");
+        server.poll(false).expect("poll");
+        client
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("timeout");
+        let mut resp = [0_u8; 64];
+        assert!(client.recv_from(&mut resp).is_err());
+    }
 }

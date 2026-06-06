@@ -1,4 +1,7 @@
-//! Firmware orchestrator: peripheral init and the main service loop.
+//! Firmware orchestrator: peripheral init, UI task spawn, and the main service loop.
+//!
+//! The main loop handles GPS ingest, PPS discipline, NTP polling, and timezone
+//! coordination. Display, button, and battery sampling run on [`crate::ui_task`].
 
 use anyhow::Context;
 use display_interface_spi::SPIInterfaceNoCS;
@@ -23,16 +26,28 @@ use crate::timezone::{TimezoneStore, TimezoneWorker};
 use crate::ui_task::{UiFeed, UiTaskHandle};
 use crate::wifi;
 
+/// GPS module UART TX pin used for NMEA output from the FeatherWing.
 pub const GPS_UART_TX_PIN: i32 = 1;
+/// GPS module UART RX pin used for NMEA input to the ESP32.
 pub const GPS_UART_RX_PIN: i32 = 2;
+/// PPS input pin monitored with a rising-edge GPIO interrupt.
 pub const PPS_GPIO_PIN: i32 = 12;
+/// Board I2C SDA pin for the battery fuel gauge.
 pub const BOARD_I2C_SDA_PIN: i32 = 42;
+/// Board I2C SCL pin for the battery fuel gauge.
 pub const BOARD_I2C_SCL_PIN: i32 = 41;
 
 const TZ_LOOKUP_RETRY_US: i64 = 300_000_000;
 const TZ_LOOKUP_REFRESH_US: i64 = 21_600_000_000;
 
-/// Initialize peripherals and run the firmware service loop.
+/// Initialize peripherals, spawn the UI task, and run the main service loop.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - `Ok(())` only if the main loop exits cleanly (normally it runs forever).
+/// - `Err` when peripheral init, UI task spawn, or NTP bind fails.
 pub fn run() -> anyhow::Result<()> {
     logging::init();
     let wifi_creds = wifi::load_wifi_credentials_from_env()?;
@@ -243,10 +258,33 @@ pub fn run() -> anyhow::Result<()> {
     }
 }
 
+/// Read monotonic time from the ESP high-resolution timer.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - Monotonic timestamp in microseconds since boot.
 fn monotonic_us() -> i64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() }
 }
 
+/// Read and parse available GPS UART bytes, updating shared state and NTP inputs.
+///
+/// # Parameters
+/// - `gps_uart`: GPS NMEA UART driver.
+/// - `rx_buf`: Scratch buffer for UART reads.
+/// - `line_buf`: Accumulator for partial NMEA lines spanning reads.
+/// - `bytes_seen`: Running total of UART bytes received (diagnostics).
+/// - `gps`: Mutable GPS snapshot updated by parsed sentences.
+/// - `ui_feed`: Shared feed published to the UI task after successful parses.
+/// - `ntp_server`: NTP server receiving UTC updates from valid RMC fixes.
+/// - `tz_worker`: Optional background timezone lookup worker.
+/// - `tz_initialized`: Whether a valid runtime timezone is already configured.
+/// - `last_tz_lookup_us`: Monotonic timestamp of the last timezone lookup request.
+///
+/// # Returns
+/// - No return value.
 fn poll_gps_uart(
     gps_uart: &UartDriver<'_>,
     rx_buf: &mut [u8; 256],
@@ -309,6 +347,16 @@ fn poll_gps_uart(
     }
 }
 
+/// Queue a timezone lookup when the refresh interval has elapsed.
+///
+/// # Parameters
+/// - `gps`: GPS snapshot supplying latitude and longitude for lookup.
+/// - `worker`: Background timezone worker receiving coordinate requests.
+/// - `tz_initialized`: Whether a valid timezone is already active.
+/// - `last_tz_lookup_us`: Updated when a new lookup request is queued.
+///
+/// # Returns
+/// - No return value.
 fn maybe_schedule_timezone_lookup(
     gps: &GpsSnapshot,
     worker: &mut TimezoneWorker,
@@ -328,6 +376,18 @@ fn maybe_schedule_timezone_lookup(
     }
 }
 
+/// Apply a completed timezone lookup result to runtime and NVS state.
+///
+/// # Parameters
+/// - `result`: Worker result containing an IANA timezone name, empty, or error.
+/// - `lat`: Latitude logged when lookup returns no timezone.
+/// - `lon`: Longitude logged when lookup returns no timezone.
+/// - `tz_store`: Optional NVS store for persisting resolved timezone names.
+/// - `tz_initialized`: Set to `true` when a valid timezone is applied.
+/// - `current_tz_name`: Updated to the active IANA timezone name.
+///
+/// # Returns
+/// - No return value.
 fn apply_timezone_lookup_result(
     result: anyhow::Result<Option<String>>,
     lat: f32,

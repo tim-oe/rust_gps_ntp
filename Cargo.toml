@@ -21,3 +21,6 @@ st7789 = "0.7"
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
+
+[dev-dependencies]
+serial_test = "3"

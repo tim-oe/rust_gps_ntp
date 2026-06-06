@@ -24,14 +24,20 @@ const DRAW_INTERVAL_US: i64 = 5_000_000;
 const SCREEN_BLANK_US: i64 = 15_000_000;
 const UI_LOOP_DELAY_MS: u32 = 10;
 
-/// GPS and PPS values produced by the main loop for UI rendering.
+/// Shared GPS and PPS samples written by the main loop and read by the UI task.
 pub struct UiFeed {
     gps: RwLock<GpsSnapshot>,
     pps_delta_us: AtomicU32,
 }
 
 impl UiFeed {
-    /// Create feed state with empty GPS and zero PPS delta.
+    /// Create a new feed with an empty GPS snapshot and zero PPS delta.
+    ///
+    /// # Parameters
+    /// - None.
+    ///
+    /// # Returns
+    /// - `Arc<UiFeed>` ready to share between the main loop and UI task.
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             gps: RwLock::new(GpsSnapshot::default()),
@@ -39,18 +45,37 @@ impl UiFeed {
         })
     }
 
-    /// Publish the latest GPS snapshot for the UI task.
+    /// Publish the latest GPS snapshot for UI rendering.
+    ///
+    /// # Parameters
+    /// - `gps`: Current GPS snapshot to copy into shared feed state.
+    ///
+    /// # Returns
+    /// - No return value. Silently no-ops if the feed lock is poisoned.
     pub fn publish_gps(&self, gps: &GpsSnapshot) {
         if let Ok(mut guard) = self.gps.write() {
             *guard = gps.clone();
         }
     }
 
-    /// Publish the latest PPS interval delta in microseconds.
+    /// Publish the latest PPS pulse interval for UI rendering.
+    ///
+    /// # Parameters
+    /// - `delta_us`: Interval between consecutive PPS edges in microseconds.
+    ///
+    /// # Returns
+    /// - No return value.
     pub fn publish_pps_delta(&self, delta_us: u32) {
         self.pps_delta_us.store(delta_us, Ordering::Relaxed);
     }
 
+    /// Read a consistent GPS snapshot and PPS delta for one draw pass.
+    ///
+    /// # Parameters
+    /// - `self`: Shared feed state.
+    ///
+    /// # Returns
+    /// - `(GpsSnapshot, u32)` containing a cloned GPS snapshot and PPS delta.
     fn snapshot(&self) -> (GpsSnapshot, u32) {
         let gps = self
             .gps
@@ -62,13 +87,25 @@ impl UiFeed {
     }
 }
 
-/// Handle keeping the UI worker thread alive for the lifetime of the firmware.
+/// Join handle that keeps the UI worker thread alive for the firmware lifetime.
 pub struct UiTaskHandle {
     _thread: JoinHandle<()>,
 }
 
 impl UiTaskHandle {
-    /// Spawn the UI task with exclusive ownership of display and button hardware.
+    /// Spawn the UI task with exclusive ownership of display and input hardware.
+    ///
+    /// # Parameters
+    /// - `feed`: Shared feed updated by the main service loop.
+    /// - `display`: Initialized ST7789 panel driver (moved into the UI task).
+    /// - `button`: Page/wake button on `GPIO0` (moved into the UI task).
+    /// - `i2c_drv`: I2C driver for battery monitor reads (moved into the UI task).
+    /// - `battery_monitor`: Detected gauge type, if any, for periodic sampling.
+    /// - `backlight_on_state`: Backlight level that represents the panel-on state.
+    ///
+    /// # Returns
+    /// - `Ok(UiTaskHandle)` when the UI thread starts successfully.
+    /// - `Err` when pull-up setup or thread spawn fails.
     #[allow(clippy::too_many_arguments)]
     pub fn spawn<DI, RST, BL, PinE>(
         feed: Arc<UiFeed>,
@@ -116,6 +153,18 @@ impl UiTaskHandle {
     }
 }
 
+/// UI task body: sample battery, handle button input, and redraw the TFT.
+///
+/// # Parameters
+/// - `feed`: Shared GPS/PPS feed written by the main loop.
+/// - `display`: ST7789 panel used for SPI drawing.
+/// - `button`: Active-low page button with internal pull-up.
+/// - `i2c_drv`: I2C bus used for battery monitor register reads.
+/// - `battery_monitor`: Detected gauge type, if any.
+/// - `backlight_on_state`: Backlight level representing panel-on.
+///
+/// # Returns
+/// - Never returns under normal operation (infinite UI loop).
 fn ui_task_main<DI, RST, BL, PinE>(
     feed: Arc<UiFeed>,
     display: &mut ST7789<DI, RST, BL>,
@@ -198,6 +247,13 @@ fn ui_task_main<DI, RST, BL, PinE>(
     }
 }
 
+/// Read monotonic time from the ESP high-resolution timer.
+///
+/// # Parameters
+/// - None.
+///
+/// # Returns
+/// - Monotonic timestamp in microseconds since boot.
 fn monotonic_us() -> i64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() }
 }

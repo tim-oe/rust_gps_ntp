@@ -18,15 +18,12 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - name: Host CI (fmt, clippy, tests)
-        run: just ci
+          components: rustfmt, clippy, llvm-tools-preview
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
 
-      - name: Test coverage summary
-        run: just coverage
+      - name: Host CI with coverage gate
+        run: just ci-coverage

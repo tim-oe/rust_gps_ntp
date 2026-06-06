@@ -25,22 +25,46 @@ pub enum BatteryMonitor {
 }
 
 /// Decode MAX17048 VCELL register bytes into volts.
+///
+/// # Parameters
+/// - `vcell`: Big-endian two-byte VCELL register value.
+///
+/// # Returns
+/// - Cell voltage in volts.
 pub fn decode_max17048_vcell(vcell: [u8; 2]) -> f32 {
     let vraw = u16::from_be_bytes(vcell);
     (vraw as f32) * 78.125e-6
 }
 
 /// Decode MAX17048 SOC register bytes into percent.
+///
+/// # Parameters
+/// - `soc`: Two-byte SOC register value from the gauge.
+///
+/// # Returns
+/// - State-of-charge percentage.
 pub fn decode_max17048_soc(soc: [u8; 2]) -> f32 {
     (soc[0] as f32) + ((soc[1] as f32) / 256.0)
 }
 
 /// Decode LC709203 cell voltage register bytes into millivolts.
+///
+/// # Parameters
+/// - `vcell`: Little-endian two-byte VCELL register value.
+///
+/// # Returns
+/// - Cell voltage in millivolts.
 pub fn decode_lc709203_voltage_mv(vcell: [u8; 2]) -> f32 {
     u16::from_le_bytes(vcell) as f32
 }
 
 /// Decode LC709203 RSOC register bytes into percent.
+///
+/// # Parameters
+/// - `rsoc`: Little-endian two-byte RSOC register value.
+///
+/// # Returns
+/// - Reported state-of-charge percentage.
 pub fn decode_lc709203_percent(rsoc: [u8; 2]) -> f32 {
     u16::from_le_bytes(rsoc) as f32
 }
@@ -85,6 +109,13 @@ fn read_lc709203(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<BatterySnapshot
 }
 
 /// Probe known battery monitor addresses and return the detected chip.
+///
+/// # Parameters
+/// - `i2c`: I2C driver used for probe reads.
+///
+/// # Returns
+/// - `Some(BatteryMonitor)` for the first recognized gauge.
+/// - `None` when no supported monitor responds.
 #[cfg(target_os = "espidf")]
 pub fn detect_monitor(i2c: &mut i2c::I2cDriver<'_>) -> Option<BatteryMonitor> {
     if read_max17048(i2c).is_ok() {
@@ -97,6 +128,14 @@ pub fn detect_monitor(i2c: &mut i2c::I2cDriver<'_>) -> Option<BatteryMonitor> {
 }
 
 /// Read battery telemetry using the previously detected monitor type.
+///
+/// # Parameters
+/// - `i2c`: I2C driver used for register access.
+/// - `monitor`: Detected monitor type to query.
+///
+/// # Returns
+/// - `Ok(BatterySnapshot)` when a read succeeds for the selected monitor.
+/// - `Err` when the underlying monitor read fails.
 #[cfg(target_os = "espidf")]
 pub fn read_battery(
     i2c: &mut i2c::I2cDriver<'_>,

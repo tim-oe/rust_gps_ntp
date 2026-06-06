@@ -7,20 +7,20 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
 
-/// Shared handles updated from the GPIO ISR.
+/// Atomic state shared between the PPS GPIO ISR and the main service loop.
 pub struct PpsMonitor {
     edge_us: Arc<AtomicU64>,
     count: Arc<AtomicU32>,
 }
 
-/// Tracks the last observed pulse for delta computation in the main loop.
+/// Last pulse observed by the main loop when computing PPS intervals.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PpsPollState {
     last_count: u32,
     last_edge_us: u64,
 }
 
-/// Result of polling the PPS monitor for a new pulse.
+/// Result of polling [`PpsMonitor`] for a newly captured PPS edge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpsEvent {
     /// First pulse since boot; no interval available yet.
@@ -30,7 +30,13 @@ pub enum PpsEvent {
 }
 
 impl PpsPollState {
-    /// Pulse count observed by the monitor at the last poll.
+    /// Return the pulse count recorded at the last successful poll.
+    ///
+    /// # Parameters
+    /// - `self`: Poll state updated by the most recent [`PpsMonitor::poll`] call.
+    ///
+    /// # Returns
+    /// - Total PPS pulse count last observed by the main loop.
     pub fn pulse_count(&self) -> u32 {
         self.last_count
     }
@@ -43,7 +49,13 @@ impl Default for PpsMonitor {
 }
 
 impl PpsMonitor {
-    /// Create a new monitor with zeroed atomic state.
+    /// Create a monitor with zeroed edge timestamp and pulse count.
+    ///
+    /// # Parameters
+    /// - None.
+    ///
+    /// # Returns
+    /// - New [`PpsMonitor`] ready for ISR registration and polling.
     pub fn new() -> Self {
         Self {
             edge_us: Arc::new(AtomicU64::new(0)),
@@ -51,23 +63,52 @@ impl PpsMonitor {
         }
     }
 
-    /// Clone the edge timestamp handle for ISR registration.
+    /// Clone the edge timestamp handle for GPIO ISR registration.
+    ///
+    /// # Parameters
+    /// - `self`: Monitor providing shared atomic state.
+    ///
+    /// # Returns
+    /// - `Arc<AtomicU64>` storing the latest PPS edge timestamp in microseconds.
     pub fn edge_us(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.edge_us)
     }
 
-    /// Clone the pulse counter handle for ISR registration.
+    /// Clone the pulse counter handle for GPIO ISR registration.
+    ///
+    /// # Parameters
+    /// - `self`: Monitor providing shared atomic state.
+    ///
+    /// # Returns
+    /// - `Arc<AtomicU32>` incremented on each PPS rising edge.
     pub fn count(&self) -> Arc<AtomicU32> {
         Arc::clone(&self.count)
     }
 
     /// Record a rising edge from interrupt context.
+    ///
+    /// # Parameters
+    /// - `edge_us`: Shared atomic storing the latest edge timestamp.
+    /// - `count`: Shared atomic incremented once per pulse.
+    /// - `now_us`: Monotonic timestamp in microseconds for the current edge.
+    ///
+    /// # Returns
+    /// - No return value.
     pub fn record_edge(edge_us: &AtomicU64, count: &AtomicU32, now_us: u64) {
         edge_us.store(now_us, Ordering::Relaxed);
         count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Poll for a new pulse and compute the interval since the previous edge.
+    ///
+    /// # Parameters
+    /// - `self`: Monitor holding ISR-updated atomic state.
+    /// - `state`: Mutable poll cursor updated when a new pulse is observed.
+    ///
+    /// # Returns
+    /// - `Some(PpsEvent::First)` on the first observed pulse after boot.
+    /// - `Some(PpsEvent::Delta(us))` when a later pulse arrives.
+    /// - `None` when no new pulse has occurred since the last poll.
     pub fn poll(&self, state: &mut PpsPollState) -> Option<PpsEvent> {
         let current_count = self.count.load(Ordering::Relaxed);
         if current_count <= state.last_count {
@@ -87,7 +128,14 @@ impl PpsMonitor {
     }
 }
 
-/// Compute microsecond delta between consecutive PPS edges with `u64` wrap safety.
+/// Compute the microsecond interval between consecutive PPS edges.
+///
+/// # Parameters
+/// - `current_us`: Monotonic timestamp of the latest edge.
+/// - `previous_us`: Monotonic timestamp of the previous edge.
+///
+/// # Returns
+/// - Interval in microseconds, safe across `u64` timer wraparound.
 pub fn pps_delta_us(current_us: u64, previous_us: u64) -> u32 {
     current_us.wrapping_sub(previous_us) as u32
 }
@@ -95,6 +143,12 @@ pub fn pps_delta_us(current_us: u64, previous_us: u64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::Ordering;
+
+    #[test]
+    fn pps_monitor_default_matches_new() {
+        assert_eq!(PpsMonitor::default().count().load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn pps_delta_one_second_apart() {
@@ -120,5 +174,6 @@ mod tests {
 
         PpsMonitor::record_edge(&edge, &count, 2_001_000);
         assert_eq!(monitor.poll(&mut state), Some(PpsEvent::Delta(1_001_000)));
+        assert_eq!(state.pulse_count(), 2);
     }
 }

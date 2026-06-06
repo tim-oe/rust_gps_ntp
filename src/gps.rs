@@ -32,6 +32,13 @@ pub struct GpsSnapshot {
 }
 
 /// Validate the NMEA XOR checksum suffix (`*$HH`).
+///
+/// # Parameters
+/// - `sentence`: Full NMEA sentence including `$` prefix and `*HH` checksum field.
+///
+/// # Returns
+/// - `true` when the checksum field matches the XOR of bytes between `$` and `*`.
+/// - `false` when the sentence format is invalid or the checksum does not match.
 pub fn nmea_checksum_valid(sentence: &str) -> bool {
     let bytes = sentence.as_bytes();
     if bytes.first() != Some(&b'$') {
@@ -306,6 +313,76 @@ pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+
+    fn reset_runtime_timezone() {
+        let lock = RUNTIME_TZ.get_or_init(|| RwLock::new(None));
+        if let Ok(mut guard) = lock.write() {
+            *guard = None;
+        }
+    }
+
+    #[test]
+    fn nmea_checksum_rejects_missing_dollar_prefix() {
+        assert!(!nmea_checksum_valid("GPRMC,123519,A*00"));
+    }
+
+    #[test]
+    fn nmea_checksum_rejects_truncated_checksum_field() {
+        assert!(!nmea_checksum_valid("$GPRMC,123519,A*0"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_rmc_falls_back_to_raw_date_time_on_invalid_calendar() {
+        reset_runtime_timezone();
+        let mut gps = GpsSnapshot::default();
+        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,320266,003.1,W*66";
+
+        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
+        assert_eq!(gps.local_date, "2066-02-32");
+        assert_eq!(gps.local_time, "12:35:19");
+        assert_eq!(gps.tz_offset_hours, 0);
+        assert!(gps.utc_unix_seconds.is_none());
+    }
+
+    #[test]
+    fn parse_gga_rejects_short_sentence() {
+        let mut gps = GpsSnapshot::default();
+        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08*7D";
+        assert_eq!(parse_gga(gga, &mut gps), None);
+    }
+
+    #[test]
+    fn nmea_checksum_rejects_missing_star() {
+        assert!(!nmea_checksum_valid("$GPRMC,123519,A"));
+    }
+
+    #[test]
+    fn nmea_checksum_rejects_non_hex_suffix() {
+        assert!(!nmea_checksum_valid("$GPRMC,123519,A*GH"));
+    }
+
+    #[test]
+    fn set_runtime_timezone_rejects_invalid_name() {
+        assert!(!set_runtime_timezone("Not/A/Timezone"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_rmc_rejects_short_sentence() {
+        reset_runtime_timezone();
+        let mut gps = GpsSnapshot::default();
+        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4*32";
+        assert_eq!(parse_rmc(rmc, &mut gps), None);
+    }
+
+    #[test]
+    fn parse_gga_rejects_invalid_checksum() {
+        let mut gps = GpsSnapshot::default();
+        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08,1.0,545.4,M,46.9,M,,*00";
+        assert_eq!(parse_gga(gga, &mut gps), None);
+    }
 
     #[test]
     fn nmea_checksum_valid_accepts_known_sentence() {
@@ -322,7 +399,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn parse_rmc_populates_local_fields_and_coords() {
+        reset_runtime_timezone();
         let mut gps = GpsSnapshot::default();
         let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
 
@@ -336,7 +415,9 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn parse_rmc_marks_invalid_fix_status() {
+        reset_runtime_timezone();
         let mut gps = GpsSnapshot::default();
         let rmc = "$GPRMC,225446,V,4916.45,N,12311.12,W,000.5,054.7,191194,020.3,E*7F";
 
@@ -355,6 +436,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn runtime_timezone_override_applies_dst_rules_for_summer() {
         assert!(set_runtime_timezone("America/Chicago"));
         let mut gps = GpsSnapshot::default();
@@ -368,6 +450,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn runtime_timezone_override_applies_dst_rules_for_winter() {
         assert!(set_runtime_timezone("America/Chicago"));
         let mut gps = GpsSnapshot::default();

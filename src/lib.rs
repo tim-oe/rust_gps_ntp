@@ -1,4 +1,8 @@
 //! Host-testable library surface and ESP-IDF firmware modules.
+//!
+//! Core logic lives here; [`app`] wires peripherals and spawns [`ui_task`] on
+//! ESP-IDF targets while host builds exercise pure modules such as [`gps`],
+//! [`ntp`], [`pps`], [`timezone`], and [`battery`].
 
 pub mod battery;
 pub mod gps;

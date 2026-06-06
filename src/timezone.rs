@@ -1,4 +1,7 @@
 //! IANA timezone resolution, NVS cache, and background HTTP lookup.
+//!
+//! HTTP lookups run on a background worker thread; JSON field extraction is
+//! host-testable without ESP-IDF dependencies.
 
 #[cfg(target_os = "espidf")]
 use anyhow::{Context, anyhow};
@@ -16,7 +19,7 @@ const NVS_NAMESPACE: &str = "rust_gps_ntp";
 #[cfg(target_os = "espidf")]
 const NVS_KEY_LOCAL_TZ: &str = "local_tz";
 
-/// NVS-backed storage for resolved timezone values.
+/// NVS-backed storage for resolved IANA timezone names.
 #[cfg(target_os = "espidf")]
 pub struct TimezoneStore {
     nvs: EspDefaultNvs,
@@ -24,14 +27,29 @@ pub struct TimezoneStore {
 
 #[cfg(target_os = "espidf")]
 impl TimezoneStore {
-    /// Open timezone cache namespace in default NVS partition.
+    /// Open the timezone cache namespace in the default NVS partition.
+    ///
+    /// # Parameters
+    /// - `partition`: Default NVS partition handle taken at boot.
+    ///
+    /// # Returns
+    /// - `Ok(TimezoneStore)` when the namespace opens successfully.
+    /// - `Err` when the NVS namespace cannot be created or opened.
     pub fn new(partition: EspDefaultNvsPartition) -> anyhow::Result<Self> {
         let nvs = EspNvs::new(partition, NVS_NAMESPACE, true)
             .map_err(|e| anyhow!("failed to open NVS namespace {NVS_NAMESPACE}: {e}"))?;
         Ok(Self { nvs })
     }
 
-    /// Load cached IANA timezone string from NVS.
+    /// Load a cached IANA timezone string from NVS.
+    ///
+    /// # Parameters
+    /// - `self`: Open timezone cache store.
+    ///
+    /// # Returns
+    /// - `Ok(Some(String))` when a cached timezone name is present.
+    /// - `Ok(None)` when no value has been stored yet.
+    /// - `Err` when the NVS read fails.
     pub fn load_cached(&self) -> anyhow::Result<Option<String>> {
         let mut buf = [0_u8; 64];
         self.nvs
@@ -40,7 +58,15 @@ impl TimezoneStore {
             .map_err(|e| anyhow!("failed to read NVS key {NVS_KEY_LOCAL_TZ}: {e}"))
     }
 
-    /// Save IANA timezone string to NVS.
+    /// Persist an IANA timezone string to NVS.
+    ///
+    /// # Parameters
+    /// - `self`: Open timezone cache store.
+    /// - `tz_name`: IANA timezone identifier to store.
+    ///
+    /// # Returns
+    /// - `Ok(())` when the value is written successfully.
+    /// - `Err` when the NVS write fails.
     pub fn save(&mut self, tz_name: &str) -> anyhow::Result<()> {
         self.nvs
             .set_str(NVS_KEY_LOCAL_TZ, tz_name)
@@ -48,7 +74,16 @@ impl TimezoneStore {
     }
 }
 
-/// Resolve timezone from latitude/longitude using an online API.
+/// Resolve a timezone name from latitude and longitude using online APIs.
+///
+/// # Parameters
+/// - `lat`: Latitude in decimal degrees.
+/// - `lon`: Longitude in decimal degrees.
+///
+/// # Returns
+/// - `Ok(Some(String))` when an IANA timezone name is resolved.
+/// - `Ok(None)` when providers respond but contain no usable timezone field.
+/// - `Err` when HTTP transport or parsing fails.
 #[cfg(target_os = "espidf")]
 pub fn fetch_timezone_for_coords(lat: f32, lon: f32) -> anyhow::Result<Option<String>> {
     // Primary provider: Open-Meteo (no key required).
@@ -67,7 +102,7 @@ pub fn fetch_timezone_for_coords(lat: f32, lon: f32) -> anyhow::Result<Option<St
     fetch_timezone_from_url(&geonames_url).context("timezone lookup request failed (geonames)")
 }
 
-/// Non-blocking timezone lookup worker backed by a background thread.
+/// Background worker that performs blocking HTTP timezone lookups off the main loop.
 #[cfg(target_os = "espidf")]
 pub struct TimezoneWorker {
     request_tx: std::sync::mpsc::Sender<(f32, f32)>,
@@ -79,6 +114,13 @@ pub struct TimezoneWorker {
 #[cfg(target_os = "espidf")]
 impl TimezoneWorker {
     /// Spawn a worker thread that executes HTTP lookups off the main loop.
+    ///
+    /// # Parameters
+    /// - None.
+    ///
+    /// # Returns
+    /// - `Ok(TimezoneWorker)` when the background thread starts successfully.
+    /// - `Err` when thread spawn fails.
     pub fn spawn() -> anyhow::Result<Self> {
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
@@ -103,12 +145,28 @@ impl TimezoneWorker {
         })
     }
 
-    /// Return true while a lookup request is in flight.
+    /// Return whether a lookup request is currently in flight.
+    ///
+    /// # Parameters
+    /// - `self`: Background timezone worker.
+    ///
+    /// # Returns
+    /// - `true` while a queued lookup has not yet completed.
+    /// - `false` when the worker is idle and accepts new requests.
     pub fn is_pending(&self) -> bool {
         self.pending
     }
 
     /// Queue a coordinate lookup when no request is pending.
+    ///
+    /// # Parameters
+    /// - `self`: Background timezone worker.
+    /// - `lat`: Latitude in decimal degrees.
+    /// - `lon`: Longitude in decimal degrees.
+    ///
+    /// # Returns
+    /// - `true` when the request is queued successfully.
+    /// - `false` when a request is already pending or the worker channel is closed.
     pub fn try_request(&mut self, lat: f32, lon: f32) -> bool {
         if self.pending {
             return false;
@@ -123,6 +181,15 @@ impl TimezoneWorker {
     }
 
     /// Poll for a completed lookup result without blocking the main loop.
+    ///
+    /// # Parameters
+    /// - `self`: Background timezone worker.
+    ///
+    /// # Returns
+    /// - `None` when no completed result is available yet.
+    /// - `Some(Ok(Some(name)))` when a timezone name was resolved.
+    /// - `Some(Ok(None))` when lookup succeeded but returned no timezone.
+    /// - `Some(Err(..))` when lookup failed or the worker disconnected.
     pub fn poll(&mut self) -> Option<anyhow::Result<Option<String>>> {
         use std::sync::mpsc::TryRecvError;
 
@@ -140,6 +207,15 @@ impl TimezoneWorker {
     }
 }
 
+/// Perform one HTTP GET and extract a timezone field from the JSON body.
+///
+/// # Parameters
+/// - `url`: Fully formed timezone lookup URL.
+///
+/// # Returns
+/// - `Ok(Some(String))` when a supported timezone field is found.
+/// - `Ok(None)` when the response parses but contains no timezone field.
+/// - `Err` on HTTP, read, or UTF-8 failures.
 #[cfg(target_os = "espidf")]
 fn fetch_timezone_from_url(url: &str) -> anyhow::Result<Option<String>> {
     let mut client = HttpClient::wrap(
@@ -169,6 +245,14 @@ fn fetch_timezone_from_url(url: &str) -> anyhow::Result<Option<String>> {
 }
 
 /// Extract a JSON string field value from a minimal API response body.
+///
+/// # Parameters
+/// - `json`: Raw JSON response text.
+/// - `key`: Object key to locate (for example `"timezone"` or `"timezoneId"`).
+///
+/// # Returns
+/// - `Some(String)` when the key exists and its value is a JSON string.
+/// - `None` when the key is missing or the value is not a quoted string.
 pub fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
     let key_needle = format!("\"{key}\"");
     let key_pos = json.find(&key_needle)?;
@@ -187,6 +271,12 @@ pub fn extract_json_string_field(json: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::extract_json_string_field;
+
+    #[test]
+    fn extract_json_string_field_rejects_non_string_value() {
+        let body = r#"{"timezone":123}"#;
+        assert_eq!(extract_json_string_field(body, "timezone"), None);
+    }
 
     #[test]
     fn extract_json_string_field_reads_timezone_key() {
