@@ -281,7 +281,7 @@ pub fn draw_page<D>(
     let mut y = 20;
     let mut line = |text: String| {
         if let Err(err) = Text::new(&text, Point::new(4, y), style).draw(display) {
-            log::warn!("Display: text draw failed (\"{}\"): {:?}", text, err);
+            log::trace!("Display diag: text draw failed (\"{}\"): {:?}", text, err);
         }
         y += 21;
     };

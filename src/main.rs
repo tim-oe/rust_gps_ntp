@@ -248,7 +248,7 @@ fn main() -> anyhow::Result<()> {
             let mut panel = display::make_panel(&mut display);
             display::draw_page(&mut panel, current_page, &gps, &battery, pps_delta_us);
             if !rendered_once {
-                log::info!("Display: first frame rendered");
+                log::trace!("Display diag: first frame rendered");
                 rendered_once = true;
             }
             last_draw_us = now_us;
