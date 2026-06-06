@@ -39,6 +39,9 @@ using GPS NMEA + PPS.
 - [x] Set stratum/reference fields to GPS source
 - [x] Populate transmit timestamps from disciplined clock
 - [x] Mode-6 diagnostics for `ntpq`
+- [x] Model-driven root delay and root dispersion (PHI×age + jitter floor)
+- [x] Reference timestamp set to last PPS discipline event (RFC 5905 §7.3)
+- [x] Mode-6 correctness: fix ClkSrc=4 (GPS), peer sel=6, expanded READVAR variables
 
 ### M5 - robustness
 

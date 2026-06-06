@@ -41,6 +41,18 @@ const MAX_DISP_US: i64 = 2_000_000;
 /// Dispersion threshold above which stratum=16 and leap=unsync are declared (1 s).
 const HOLDOVER_UNSYNC_US: i64 = 1_000_000;
 
+// --- RFC 5905 §11.1 correctness-field constants ---
+/// Maximum oscillator drift rate per RFC 5905 §11.1 (symbol PHI = 15 ppm).
+/// Governs how fast root dispersion accumulates within an NTP polling interval.
+const PHI_US_PER_S: i64 = 15;
+/// Hardware accuracy floor for GPS + PPS: MTK3339 PPS accuracy is ±10 ns, but
+/// ISR capture latency and ESP32 timer jitter make 100 µs a conservative floor.
+const MIN_HW_ACCURACY_US: i64 = 100;
+/// Root delay for a GPS + PPS primary reference (RFC 5905 §6).
+/// The round-trip delay to a hardware reference clock wired directly to a GPIO
+/// pin is modelled as zero; any GPS propagation delay is absorbed into precision.
+const ROOT_DELAY_MS: f64 = 0.0;
+
 #[derive(Clone, Copy)]
 struct ClockAnchor {
     /// Unix epoch seconds at the anchor instant.
@@ -99,6 +111,12 @@ struct DisciplineParams {
     root_disp_short: u32,
     /// Root dispersion in milliseconds, for mode-6 text variable output.
     root_disp_ms: f64,
+    /// NTP timestamp of the most recent clock discipline event (last PPS pulse).
+    /// Used as the Reference Timestamp field per RFC 5905 §7.3.
+    ref_ts: u64,
+    /// Current NTP timestamp, captured when DisciplineParams was computed.
+    /// Used as the system clock value in mode-6 READVAR responses.
+    current_ts: u64,
 }
 
 /// Stateful NTP server engine and discipline metrics.
@@ -118,6 +136,9 @@ pub struct NtpServer {
     freq_ppm: f64,
     /// Monotonic timestamp of the last accepted PPS pulse.
     last_pps_monotonic_us: Option<i64>,
+    /// NTP timestamp of the most recent PPS-based clock discipline event.
+    /// Returned as the Reference Timestamp in NTP responses (RFC 5905 §7.3).
+    last_sync_ntp_ts: u64,
 }
 
 impl NtpServer {
@@ -149,6 +170,7 @@ impl NtpServer {
             proc_delay_has_sample: false,
             freq_ppm: 0.0,
             last_pps_monotonic_us: None,
+            last_sync_ntp_ts: 0,
         })
     }
 
@@ -211,6 +233,9 @@ impl NtpServer {
                     });
                     self.pps_locked = true;
                     self.last_pps_monotonic_us = Some(now_us);
+                    // Record the NTP timestamp of this discipline event as the
+                    // reference timestamp returned to NTP clients (RFC 5905 §7.3).
+                    self.last_sync_ntp_ts = self.current_ntp_timestamp();
                     log::debug!("NTP: PPS first pulse, aligned to GPS UTC {}", gps_utc);
                 }
             }
@@ -255,6 +280,9 @@ impl NtpServer {
 
                 self.pps_locked = true;
                 self.last_pps_monotonic_us = Some(now_us);
+                // Record the NTP timestamp of this discipline event so clients
+                // can observe reference timestamp aging (RFC 5905 §7.3).
+                self.last_sync_ntp_ts = self.current_ntp_timestamp();
                 log::debug!(
                     "NTP: PPS servo phase_err={}us freq={:.3}ppm",
                     phase_error_us,
@@ -266,15 +294,21 @@ impl NtpServer {
 
     /// Compute discipline parameters from current servo and holdover state.
     ///
-    /// Stratum and leap indicator follow GPS+PPS sync status. Root dispersion
-    /// starts at 1 ms when locked and grows at 0.5 ms/s during holdover.
-    /// When dispersion exceeds 1 s the server declares stratum=16 / leap=unsync.
+    /// **Root dispersion** follows RFC 5905 §11.1: when PPS-locked the base is
+    /// `max(jitter, MIN_HW_ACCURACY_US) + PHI × age_since_last_pulse` where PHI
+    /// is 15 ppm. During holdover it grows at 0.5 ms/s until stratum=16 is
+    /// declared at 1 s.
+    ///
+    /// **Root delay** is 0 for a hardware-referenced GPS+PPS server (RFC 5905 §6).
+    ///
+    /// **Reference timestamp** (`ref_ts`) is the NTP timestamp of the last PPS
+    /// discipline event, so clients can observe reference aging (RFC 5905 §7.3).
     ///
     /// # Parameters
     /// - `gps_fix`: Whether the GPS module currently reports a valid fix.
     ///
     /// # Returns
-    /// - `DisciplineParams` with stratum, leap, and dispersion fields.
+    /// - `DisciplineParams` with all correctness fields populated.
     fn discipline_params(&self, gps_fix: bool) -> DisciplineParams {
         let now_us = monotonic_us_now();
 
@@ -288,7 +322,19 @@ impl NtpServer {
         let fully_synced = gps_fix && pps_fresh && has_anchor;
 
         let disp_us = if fully_synced {
-            BASE_DISP_US
+            // Model-driven dispersion per RFC 5905 §11.1:
+            //   disp = max(jitter, hw_accuracy_floor) + PHI × age_since_last_pulse
+            // PHI = 15 ppm is the RFC's assumed maximum frequency tolerance.
+            // This shrinks to the jitter floor just after a PPS pulse and grows
+            // by at most 15 µs before the next one (≈ 1 s interval).
+            let hw_accuracy = if self.pps_has_sample {
+                (self.pps_jitter_us.round() as i64).max(MIN_HW_ACCURACY_US)
+            } else {
+                MIN_HW_ACCURACY_US
+            };
+            let age_us = pps_age_us.min(MICROS_PER_SEC);
+            let phi_component = PHI_US_PER_S * age_us / MICROS_PER_SEC;
+            hw_accuracy + phi_component
         } else if has_anchor {
             // Holdover: dispersion grows linearly after HOLDOVER_ENTRY_US elapses.
             let holdover_us = pps_age_us.saturating_sub(HOLDOVER_ENTRY_US).max(0);
@@ -317,6 +363,8 @@ impl NtpServer {
             leap,
             root_disp_short,
             root_disp_ms,
+            ref_ts: self.last_sync_ntp_ts,
+            current_ts: self.current_ntp_timestamp(),
         }
     }
 
@@ -394,6 +442,7 @@ impl NtpServer {
                                 self.pps_offset_us,
                                 self.pps_jitter_us,
                                 self.proc_delay_us,
+                                self.freq_ppm,
                             );
                             self.socket.send_to(&resp, peer).with_context(|| {
                                 format!("failed to send mode-6 response to {}", peer)
@@ -446,15 +495,31 @@ impl NtpServer {
     }
 }
 
+/// Format an NTP 64-bit timestamp as a mode-6 text value: `0xSSSSSSSS.FFFFFFFF`.
+///
+/// RFC 1305 §3.2 convention for NTP timestamps in control-message text is
+/// the hex representation of the 32-bit seconds field followed by the 32-bit
+/// fraction field, separated by `.`.  ntpq parses and displays this form.
+///
+/// # Parameters
+/// - `ts`: 64-bit NTP timestamp (seconds in high 32 bits, fraction in low 32 bits).
+///
+/// # Returns
+/// - Formatted timestamp string, e.g. `0xE9D1E7B4.8A3D71A0`.
+fn ntp_ts_to_mode6(ts: u64) -> String {
+    format!("0x{:08X}.{:08X}", (ts >> 32) as u32, ts as u32)
+}
+
 /// Build a mode-6 control response for a request packet.
 ///
 /// # Parameters
 /// - `req`: Raw mode-6 request bytes.
 /// - `version`: NTP version extracted from request header.
-/// - `dp`: Discipline parameters (stratum, leap, dispersion).
-/// - `pps_offset_us`: Latest PPS-derived offset in microseconds.
+/// - `dp`: Discipline parameters (stratum, leap, dispersion, timestamps).
+/// - `pps_offset_us`: Latest PPS-derived phase offset in microseconds.
 /// - `pps_jitter_us`: Smoothed jitter estimate in microseconds.
 /// - `proc_delay_us`: Smoothed processing delay estimate in microseconds.
+/// - `freq_ppm`: Current oscillator frequency offset estimate in ppm.
 ///
 /// # Returns
 /// - Serialized mode-6 response bytes ready to send.
@@ -465,6 +530,7 @@ fn build_mode6_response(
     pps_offset_us: i32,
     pps_jitter_us: f32,
     proc_delay_us: f32,
+    freq_ppm: f64,
 ) -> Vec<u8> {
     let mut resp = vec![0_u8; NTP_CONTROL_HEADER_LEN];
     let vn = if (1..=4).contains(&version) {
@@ -485,36 +551,88 @@ fn build_mode6_response(
     resp[0] = (vn << 3) | 6;
     match opcode {
         MODE6_OPCODE_READSTAT => {
-            // Return one pseudo-association so `ntpq -p` can continue querying it.
-            let peer_status = if synced { 0x9624_u16 } else { 0x16_u16 };
+            // RFC 1305 §3.2.2 peer status word: [Sel:3][Cfg:1][Auth:1][AuthOK:1][Reach:1][Bcast:1][EvtCode:4][EvtCnt:4]
+            // sel=6 (system peer, shown as '*' by ntpq), cfg=1, reach=1.
+            // sel=0 (rejected) when unsynced.
+            let peer_status: u16 = if synced {
+                (6_u16 << 13) | (1 << 12) | (1 << 9) // 0xD200
+            } else {
+                1 << 12 // 0x1000: configured but not selected
+            };
             payload.extend_from_slice(&MODE6_ASSOC_ID.to_be_bytes());
             payload.extend_from_slice(&peer_status.to_be_bytes());
         }
         MODE6_OPCODE_READVAR => {
             let vars = if associd == 0 {
+                // System variables (RFC 5905 §7.3 + common ntpq fields).
+                // Expanded with frequency, reference timestamp, clock, jitter,
+                // and wander so ntpq -c rv gives a complete diagnostic picture.
                 if synced {
+                    let offset_ms = pps_offset_us as f64 / 1_000.0;
+                    let jitter_ms = (pps_jitter_us.max(1.0)) as f64 / 1_000.0;
+                    let freq_sign = if freq_ppm >= 0.0 { "+" } else { "" };
                     format!(
-                        "stratum={},leap={},precision=-20,rootdelay=0.000,rootdisp={:.3},refid=GPS,peer=1,system=\"rust_gps_ntp\"",
-                        dp.stratum, leap_str, dp.root_disp_ms
+                        "stratum={},leap={},precision=-20,\
+                         rootdelay={:.3},rootdisp={:.3},refid=GPS,\
+                         reftime={},clock={},\
+                         offset={:.3},frequency={}{:.3},\
+                         sys_jitter={:.3},clk_jitter={:.3},clk_wander={:.3},\
+                         tc=7,mintc=3,peer=1,system=\"rust_gps_ntp\"",
+                        dp.stratum,
+                        leap_str,
+                        ROOT_DELAY_MS,
+                        dp.root_disp_ms,
+                        ntp_ts_to_mode6(dp.ref_ts),
+                        ntp_ts_to_mode6(dp.current_ts),
+                        offset_ms,
+                        freq_sign,
+                        freq_ppm,
+                        jitter_ms,
+                        jitter_ms,
+                        freq_ppm.abs(),
                     )
                 } else {
                     format!(
-                        "stratum=16,leap=11,precision=-20,rootdelay=0.000,rootdisp={:.3},refid=INIT,peer=0,system=\"rust_gps_ntp\"",
-                        dp.root_disp_ms
+                        "stratum=16,leap=11,precision=-20,\
+                         rootdelay={:.3},rootdisp={:.3},refid=INIT,\
+                         reftime={},clock={},\
+                         offset=0.000,frequency=+0.000,\
+                         sys_jitter=0.000,clk_jitter=0.000,clk_wander=0.000,\
+                         tc=7,mintc=3,peer=0,system=\"rust_gps_ntp\"",
+                        ROOT_DELAY_MS,
+                        dp.root_disp_ms,
+                        ntp_ts_to_mode6(dp.ref_ts),
+                        ntp_ts_to_mode6(dp.current_ts),
                     )
                 }
             } else if associd == MODE6_ASSOC_ID {
+                // Peer variables (RFC 5905 §7.3 + ntpq filter columns).
+                // filtdelay / filtoffset / filtdisp echo the last measured values;
+                // we do not maintain a full 8-sample filter register.
                 if synced {
-                    let offset_ms = (pps_offset_us as f32) / 1_000.0;
-                    let jitter_ms = (pps_jitter_us.max(1.0)) / 1_000.0;
-                    let delay_ms = (proc_delay_us.max(1.0)) / 1_000.0;
+                    let offset_ms = pps_offset_us as f64 / 1_000.0;
+                    let jitter_ms = (pps_jitter_us.max(1.0)) as f64 / 1_000.0;
+                    let delay_ms = (proc_delay_us.max(1.0)) as f64 / 1_000.0;
                     format!(
-                        "srcadr=GPS,srcport=123,refid=GPS,stratum={},leap={},hmode=3,pmode=4,hpoll=6,ppoll=6,reach=255,delay={delay_ms:.3},offset={offset_ms:.3},jitter={jitter_ms:.3}",
-                        dp.stratum, leap_str
+                        "srcadr=GPS,srcport=123,refid=GPS,\
+                         stratum={},leap={},hmode=3,pmode=4,\
+                         hpoll=6,ppoll=6,reach=255,\
+                         delay={delay_ms:.3},offset={offset_ms:.3},jitter={jitter_ms:.3},\
+                         dispersion={:.3},xleave=0.000,\
+                         filtdelay={delay_ms:.3},filtoffset={offset_ms:.3},filtdisp={:.3}",
+                        dp.stratum,
+                        leap_str,
+                        dp.root_disp_ms,
+                        jitter_ms,
                     )
                 } else {
                     String::from(
-                        "srcadr=INIT,srcport=123,refid=INIT,stratum=16,leap=11,hmode=3,pmode=4,hpoll=6,ppoll=6,reach=0,delay=0.001,offset=0.000,jitter=0.000",
+                        "srcadr=INIT,srcport=123,refid=INIT,\
+                         stratum=16,leap=11,hmode=3,pmode=4,\
+                         hpoll=6,ppoll=6,reach=0,\
+                         delay=0.001,offset=0.000,jitter=0.000,\
+                         dispersion=5000.000,xleave=0.000,\
+                         filtdelay=0.001,filtoffset=0.000,filtdisp=5000.000",
                     )
                 }
             } else {
@@ -534,8 +652,10 @@ fn build_mode6_response(
     resp[2] = req[2];
     resp[3] = req[3];
 
-    // status
-    let sys_status = if synced { 0x0604_u16 } else { 0x0_u16 };
+    // RFC 1305 §3.2.1 system status: [LI:2][ClkSrc:6][EvtCode:4][EvtCnt:4]
+    // ClkSrc = 4 = UHF/GPS per RFC 1305 Table F-2.
+    let clksrc: u16 = if synced { 4 } else { 0 };
+    let sys_status: u16 = ((dp.leap as u16) << 14) | (clksrc << 8);
     resp[4..6].copy_from_slice(&sys_status.to_be_bytes());
     // associd (echo request association)
     resp[6..8].copy_from_slice(&associd.to_be_bytes());
@@ -592,7 +712,10 @@ fn build_response(
         resp[12..16].copy_from_slice(b"INIT");
     }
 
-    let reference_ts = if dp.stratum == 1 { receive_ts } else { 0 };
+    // Reference timestamp: time of the last clock discipline event (RFC 5905 §7.3).
+    // Remains fixed between PPS pulses so clients can measure reference aging.
+    // Zero when unsynced.
+    let reference_ts = if dp.stratum == 1 { dp.ref_ts } else { 0 };
     write_u64_be(&mut resp[16..24], reference_ts);
 
     // Originate timestamp = client's transmit timestamp.
@@ -715,6 +838,8 @@ mod tests {
             leap: 0,
             root_disp_short: 1 << 16,
             root_disp_ms: 1.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [0_u8; NTP_PACKET_LEN];
         let resp = build_response(&req, &dp, 0x0123_0000_0000_0000);
@@ -730,6 +855,8 @@ mod tests {
             leap: 3,
             root_disp_short: 5 << 16,
             root_disp_ms: 5000.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [0_u8; NTP_PACKET_LEN];
         let resp = build_response(&req, &dp, 0);
@@ -744,6 +871,8 @@ mod tests {
             leap: 0,
             root_disp_short: 1 << 16,
             root_disp_ms: 1.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [
             0,
@@ -759,7 +888,7 @@ mod tests {
             0,
             0,
         ];
-        let resp = build_mode6_response(&req, 4, &dp, 250, 500.0, 1200.0);
+        let resp = build_mode6_response(&req, 4, &dp, 250, 500.0, 1200.0, 0.0);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
         assert!(payload.contains("refid=GPS"));
         assert!(payload.contains("stratum=1"));
@@ -791,9 +920,11 @@ mod tests {
             leap: 0,
             root_disp_short: 1 << 16,
             root_disp_ms: 1.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
         assert_eq!(resp.len(), NTP_CONTROL_HEADER_LEN + 4);
     }
 
@@ -804,9 +935,11 @@ mod tests {
             leap: 3,
             root_disp_short: 5 << 16,
             root_disp_ms: 5000.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
         assert!(payload.contains("stratum=16"));
         assert!(payload.contains("refid=INIT"));
@@ -819,6 +952,8 @@ mod tests {
             leap: 3,
             root_disp_short: 5 << 16,
             root_disp_ms: 5000.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [
             0,
@@ -834,7 +969,7 @@ mod tests {
             0,
             0,
         ];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
         assert!(payload.contains("srcadr=INIT"));
     }
@@ -846,9 +981,11 @@ mod tests {
             leap: 0,
             root_disp_short: 1 << 16,
             root_disp_ms: 1.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
         assert_ne!(resp[1] & 0x40, 0);
     }
 
@@ -859,9 +996,11 @@ mod tests {
             leap: 3,
             root_disp_short: 5 << 16,
             root_disp_ms: 5000.0,
+            ref_ts: 0,
+            current_ts: 0,
         };
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 0, &dp, 0, 0.0, 0.0);
+        let resp = build_mode6_response(&req, 0, &dp, 0, 0.0, 0.0, 0.0);
         assert_eq!((resp[0] >> 3) & 0x07, 4);
     }
 
@@ -882,6 +1021,7 @@ mod tests {
                 proc_delay_has_sample: false,
                 freq_ppm: 0.0,
                 last_pps_monotonic_us: None,
+                last_sync_ntp_ts: 0,
             })
         }
     }
@@ -1112,15 +1252,22 @@ mod tests {
 
     #[test]
     fn discipline_params_fully_synced_gives_stratum_1_and_base_dispersion() {
+        // With the PHI model, locked dispersion is max(jitter, MIN_HW_ACCURACY_US) +
+        // PHI × age_since_last_pulse. After the first pulse with no jitter sample
+        // yet, this equals MIN_HW_ACCURACY_US (0.1 ms) — well below the old fixed
+        // 1 ms — and stratum must be 1.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
         server.observe_pps_pulse(None);
         let dp = server.discipline_params(true);
         assert_eq!(dp.stratum, 1);
         assert_eq!(dp.leap, 0);
-        let expected_short = ((BASE_DISP_US as u64 * (1u64 << 16)) / 1_000_000) as u32;
-        assert_eq!(dp.root_disp_short, expected_short);
-        assert!((dp.root_disp_ms - 1.0).abs() < 0.01);
+        // Dispersion should be in the hardware-floor range (0.1 ms + up to PHI×1s = 0.115 ms).
+        assert!(
+            dp.root_disp_ms >= 0.09 && dp.root_disp_ms < 0.5,
+            "locked dispersion should be in [0.09, 0.5) ms, got {:.3}",
+            dp.root_disp_ms
+        );
     }
 
     #[test]
@@ -1220,5 +1367,225 @@ mod tests {
         // current_ntp_timestamp should not panic or produce obviously wrong output.
         let ts = server.current_ntp_timestamp();
         assert_ne!(ts, 0);
+    }
+
+    // --- Item 2: NTP correctness field tests ---
+
+    #[test]
+    fn last_sync_ntp_ts_set_on_first_pulse() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        assert_eq!(server.last_sync_ntp_ts, 0);
+        server.observe_pps_pulse(None);
+        assert_ne!(server.last_sync_ntp_ts, 0, "ref ts should be set after first pulse");
+    }
+
+    #[test]
+    fn last_sync_ntp_ts_updated_on_subsequent_pulse() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        let first_ref = server.last_sync_ntp_ts;
+        server.observe_pps_pulse(Some(1_000_000));
+        // After the second pulse, ref_ts should advance by approximately 1 NTP second.
+        let delta_secs = ((server.last_sync_ntp_ts >> 32) as i64)
+            - ((first_ref >> 32) as i64);
+        assert_eq!(delta_secs, 1, "ref_ts should advance by 1 s per PPS pulse");
+    }
+
+    #[test]
+    fn build_response_uses_last_sync_ts_as_reference_timestamp() {
+        // When synced, the reference timestamp in the NTP response should be the
+        // last discipline event time (ref_ts), NOT the current receive time.
+        let fixed_ref_ts = 0xE9D1_E7B4_0000_0000_u64;
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 0.1,
+            ref_ts: fixed_ref_ts,
+            current_ts: fixed_ref_ts + 0x1_0000_0000,
+        };
+        let req = [0_u8; NTP_PACKET_LEN];
+        // Pass a different receive_ts so we can distinguish ref_ts from it.
+        let receive_ts = fixed_ref_ts + 0x5_0000_0000;
+        let resp = build_response(&req, &dp, receive_ts);
+        let ref_ts_in_resp = u64::from_be_bytes(resp[16..24].try_into().unwrap());
+        assert_eq!(
+            ref_ts_in_resp, fixed_ref_ts,
+            "reference timestamp should be last_sync_ntp_ts, not receive_ts"
+        );
+    }
+
+    #[test]
+    fn build_response_reference_timestamp_zero_when_unsynced() {
+        let dp = DisciplineParams {
+            stratum: 16,
+            leap: 3,
+            root_disp_short: 5 << 16,
+            root_disp_ms: 5000.0,
+            ref_ts: 0xDEAD_BEEF_0000_0000,
+            current_ts: 0,
+        };
+        let req = [0_u8; NTP_PACKET_LEN];
+        let resp = build_response(&req, &dp, 0x1234);
+        let ref_ts_in_resp = u64::from_be_bytes(resp[16..24].try_into().unwrap());
+        assert_eq!(ref_ts_in_resp, 0, "reference timestamp must be 0 when stratum=16");
+    }
+
+    #[test]
+    fn discipline_params_locked_dispersion_uses_phi_model() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Simulate jitter = 200 µs (above MIN_HW_ACCURACY_US = 100 µs).
+        server.pps_jitter_us = 200.0;
+        server.pps_has_sample = true;
+        let dp = server.discipline_params(true);
+        // Expected: max(200, 100) + PHI×0 ≈ 0.2 ms (PPS just fired, age≈0).
+        // Dispersion should be well below the old fixed 1 ms.
+        assert!(
+            dp.root_disp_ms < 1.0,
+            "locked dispersion should be < 1 ms with PHI model, got {:.3} ms",
+            dp.root_disp_ms
+        );
+        assert!(
+            dp.root_disp_ms >= 0.1,
+            "locked dispersion should be >= MIN_HW_ACCURACY (0.1 ms), got {:.3} ms",
+            dp.root_disp_ms
+        );
+    }
+
+    #[test]
+    fn discipline_params_locked_dispersion_minimum_is_hw_floor() {
+        // With no PPS sample yet, dispersion should equal the hardware floor.
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // pps_has_sample is still false after first pulse.
+        server.pps_has_sample = false;
+        let dp = server.discipline_params(true);
+        assert!(
+            (dp.root_disp_ms - (MIN_HW_ACCURACY_US as f64 / 1_000.0)).abs() < 0.02,
+            "dispersion should be ~MIN_HW_ACCURACY when no jitter sample yet"
+        );
+    }
+
+    // --- Item 3: mode-6 correctness field tests ---
+
+    #[test]
+    fn build_mode6_system_status_clksrc_is_gps_when_synced() {
+        // RFC 1305 §3.2.1: ClkSrc field must be 4 (UHF/GPS) for a GPS reference.
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 0.1,
+            ref_ts: 0,
+            current_ts: 0,
+        };
+        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
+        let sys_status = u16::from_be_bytes([resp[4], resp[5]]);
+        let clksrc = (sys_status >> 8) & 0x3f;
+        assert_eq!(clksrc, 4, "ClkSrc should be 4 (UHF/GPS) per RFC 1305 Table F-2");
+        let li = sys_status >> 14;
+        assert_eq!(li, 0, "LI should be 0 (no warning) when synced");
+    }
+
+    #[test]
+    fn build_mode6_system_status_unsynced_has_li_alarm() {
+        let dp = DisciplineParams {
+            stratum: 16,
+            leap: 3,
+            root_disp_short: 5 << 16,
+            root_disp_ms: 5000.0,
+            ref_ts: 0,
+            current_ts: 0,
+        };
+        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
+        let sys_status = u16::from_be_bytes([resp[4], resp[5]]);
+        let li = sys_status >> 14;
+        assert_eq!(li, 3, "LI should be 3 (alarm) when unsynced");
+    }
+
+    #[test]
+    fn build_mode6_readstat_peer_status_sel_is_system_peer_when_synced() {
+        // sel=6 in the peer status word causes ntpq to display '*' (system peer).
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 0.1,
+            ref_ts: 0,
+            current_ts: 0,
+        };
+        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
+        // READSTAT payload: 2-byte assoc ID + 2-byte peer status.
+        let peer_status = u16::from_be_bytes([
+            resp[NTP_CONTROL_HEADER_LEN + 2],
+            resp[NTP_CONTROL_HEADER_LEN + 3],
+        ]);
+        let sel = peer_status >> 13;
+        assert_eq!(sel, 6, "peer sel should be 6 (system peer) when synced");
+    }
+
+    #[test]
+    fn build_mode6_readvar_system_includes_reftime_and_frequency() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 0.1,
+            ref_ts: 0xE9D1_E7B4_8A3D_71A0,
+            current_ts: 0xE9D1_E7B5_0000_0000,
+        };
+        let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let resp = build_mode6_response(&req, 4, &dp, 500, 200.0, 1000.0, 5.321);
+        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
+        assert!(payload.contains("reftime=0x"), "should include reftime in hex");
+        assert!(payload.contains("clock=0x"), "should include clock in hex");
+        assert!(payload.contains("frequency="), "should include frequency");
+        assert!(payload.contains("sys_jitter="), "should include sys_jitter");
+        assert!(payload.contains("rootdelay=0.000"), "root delay should be 0");
+    }
+
+    #[test]
+    fn build_mode6_readvar_peer_includes_dispersion_and_filter_vars() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 0.5,
+            ref_ts: 0,
+            current_ts: 0,
+        };
+        let req = [
+            0, MODE6_OPCODE_READVAR,
+            0, 0, 0, 0, 0, MODE6_ASSOC_ID as u8,
+            0, 0, 0, 0,
+        ];
+        let resp = build_mode6_response(&req, 4, &dp, 250, 100.0, 800.0, 3.0);
+        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
+        assert!(payload.contains("dispersion="), "should include dispersion");
+        assert!(payload.contains("xleave="), "should include xleave");
+        assert!(payload.contains("filtdelay="), "should include filtdelay");
+        assert!(payload.contains("filtoffset="), "should include filtoffset");
+        assert!(payload.contains("filtdisp="), "should include filtdisp");
+    }
+
+    #[test]
+    fn ntp_ts_to_mode6_formats_correctly() {
+        // 0xE9D1E7B48A3D71A0 → "0xE9D1E7B4.8A3D71A0"
+        let ts: u64 = 0xE9D1_E7B4_8A3D_71A0;
+        let s = ntp_ts_to_mode6(ts);
+        assert_eq!(s, "0xE9D1E7B4.8A3D71A0");
+    }
+
+    #[test]
+    fn ntp_ts_to_mode6_zero_is_epoch() {
+        assert_eq!(ntp_ts_to_mode6(0), "0x00000000.00000000");
     }
 }

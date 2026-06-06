@@ -13,9 +13,13 @@ GPS-disciplined Stratum-1 NTP server firmware written in Rust for the ESP32-S3 p
 | NTPv4 clock discipline algorithm | [RFC 5905 §11 – Poll Process and Clock Discipline](https://www.rfc-editor.org/rfc/rfc5905#section-11) |
 | NTPv4 data types (timestamp format) | [RFC 5905 §6 – Data Types](https://www.rfc-editor.org/rfc/rfc5905#section-6) |
 | NTPv4 on-wire packet format | [RFC 5905 §7.3 – NTP Extension Fields](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
-| Root dispersion definition | [RFC 5905 §11.1 – Clock Discipline Procedures](https://www.rfc-editor.org/rfc/rfc5905#section-11.1) |
+| Root dispersion and PHI model | [RFC 5905 §11.1 – Clock Discipline Procedures](https://www.rfc-editor.org/rfc/rfc5905#section-11.1) |
+| Root delay for primary reference | [RFC 5905 §6 – Data Types (rootdelay = 0 for hardware reference)](https://www.rfc-editor.org/rfc/rfc5905#section-6) |
+| Reference Timestamp semantics | [RFC 5905 §7.3 – Packet Header Variables](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
 | Leap indicator and stratum encoding | [RFC 5905 §7.3 – Packet Header Variables](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
-| NTP mode-6 control | [RFC 1305 §3.2 – Control Messages](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) · [ntpq reference](https://www.ntp.org/documentation/4.2.8-series/ntpq/) |
+| NTP mode-6 control protocol | [RFC 1305 §3.2 – Control Messages](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) · [ntpq reference](https://www.ntp.org/documentation/4.2.8-series/ntpq/) |
+| Mode-6 status word and variable encoding | [RFC 1305 §3.2.1-3.2.2 – System/Peer Status Words and Variable Sets](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) |
+| Clock source codes (ClkSrc field) | [RFC 1305 Table F-2 – Clock Source Codes (4 = UHF/GPS)](https://www.rfc-editor.org/rfc/rfc1305#appendix-F) |
 | PLL/FLL clock servo theory | [D. L. Mills, "Internet Time Synchronization: the Network Time Protocol", IEEE Trans. Comm. 1991](https://www.eecis.udel.edu/~mills/database/papers/trans.pdf) |
 | NTP clock filter and combine algorithms | [D. L. Mills, "Improved Algorithms for Synchronizing Computer Network Clocks", IEEE/ACM Trans. Netw. 1995](https://www.eecis.udel.edu/~mills/database/papers/tune2.pdf) |
 | NTP project clock discipline notes | [NTP 4.2.8 Clock Discipline](https://www.ntp.org/documentation/4.2.8-series/discipline/) |
@@ -195,7 +199,7 @@ When PPS pulses stop arriving, the server enters holdover and continues serving 
 
 | PPS age | State | Stratum | Root dispersion |
 |---|---|---|---|
-| < 10 s | `Locked` | 1 | 1 ms (base) |
+| < 10 s | `Locked` | 1 | `max(jitter, 0.1 ms) + PHI × age` |
 | 10 s – ~33 min | `Holdover` | 1 | 1 ms + 0.5 ms/s |
 | > ~33 min (disp ≥ 1 s) | `Unsync` | 16 | capped at 2 s |
 
@@ -215,6 +219,27 @@ ntp_fraction = corrected_remainder_us × (2³² / 1_000_000)
 ntp_timestamp = (ntp_seconds << 32) | ntp_fraction
 ```
 
+#### NTP Correctness Fields
+
+**Root delay** ([RFC 5905 §6](https://www.rfc-editor.org/rfc/rfc5905#section-6)): Set to 0 in all states. For a GPS+PPS primary reference the hardware reference clock is wired directly to a GPIO pin, so the round-trip delay to the reference is modelled as zero. This is consistent with how desktop GPS-disciplined NTP implementations treat the PPS reference.
+
+**Root dispersion** ([RFC 5905 §11.1](https://www.rfc-editor.org/rfc/rfc5905#section-11.1)): Model-driven rather than a fixed constant:
+
+```
+When PPS-locked:
+  disp = max(pps_jitter_us, MIN_HW_ACCURACY_US)   ← hardware accuracy floor
+        + PHI × pps_age_us                         ← drift accumulation
+
+Where:
+  MIN_HW_ACCURACY_US = 100 µs   (GPS+PPS measurement latency floor)
+  PHI                = 15 ppm   (RFC 5905 maximum frequency tolerance)
+  pps_age_us         = time since last PPS pulse (capped at 1 s)
+```
+
+This gives a dispersion that shrinks to the jitter floor just after each PPS pulse and grows by at most 15 µs before the next one. A typical locked value is 100–300 µs (vs. the old fixed 1 ms).
+
+**Reference timestamp** ([RFC 5905 §7.3](https://www.rfc-editor.org/rfc/rfc5905#section-7.3)): The NTP timestamp of the most recent PPS discipline event, stored in `last_sync_ntp_ts`. This is the correct value per the RFC ("time when the system clock was last set or corrected"). Between PPS pulses the field stays fixed, so clients can observe reference aging as `current_time − reference_timestamp`. Previously this was incorrectly set to the current receive time on every request.
+
 #### Packet Building (`build_response`)
 
 Standard mode-3 client → mode-4 server exchange per [RFC 5905 §7.3](https://www.rfc-editor.org/rfc/rfc5905#section-7.3):
@@ -225,23 +250,59 @@ Standard mode-3 client → mode-4 server exchange per [RFC 5905 §7.3](https://w
 | 1 | Stratum | 1 (GPS primary reference) or 16 (unsync) |
 | 2 | Poll | mirrored from client |
 | 3 | Precision | −20 (≈1 µs) |
-| 4–7 | Root Delay | 0 |
-| 8–11 | Root Dispersion | computed from servo state (16.16 NTP short format) |
+| 4–7 | Root Delay | 0 (hardware reference, per RFC 5905 §6) |
+| 8–11 | Root Dispersion | model-driven: `max(jitter, 100 µs) + PHI × age` |
 | 12–15 | Reference ID | `GPS\0` (stratum 1) or `INIT` (stratum 16) |
-| 16–23 | Reference Timestamp | server receive timestamp |
+| 16–23 | Reference Timestamp | `last_sync_ntp_ts` (time of last PPS discipline event) |
 | 24–31 | Originate Timestamp | client transmit timestamp (echoed) |
 | 32–39 | Receive Timestamp | server receive timestamp |
 | 40–47 | Transmit Timestamp | filled immediately before send |
 
 #### Mode-6 Diagnostics
 
-Mode-6 (control) packets from `ntpq` are answered with a minimal subset of opcodes:
+**Relevant spec:** [RFC 1305 §3.2](https://www.rfc-editor.org/rfc/rfc1305#section-3.2)
 
-- **READSTAT (op=1)**: Returns one pseudo-association entry so `ntpq -p` can proceed.
-- **READVAR (op=2, assoc=0)**: System variables (`stratum`, `leap`, `refid`, `precision`, `rootdelay`, `rootdisp`). Dispersion reflects current holdover state.
-- **READVAR (op=2, assoc=1)**: Peer variables including live PPS offset, jitter, and processing delay (EWMA smoothed, α=0.2).
+Mode-6 (control) packets from `ntpq` are answered with the following opcodes:
 
-**Reference:** [RFC 1305 §3.2](https://www.rfc-editor.org/rfc/rfc1305#section-3.2)
+- **READSTAT (op=1)**: Returns one pseudo-association entry. The system status word encodes `[LI:2][ClkSrc:6][EvtCode:4][EvtCnt:4]` per RFC 1305 §3.2.1, with `ClkSrc = 4` (UHF/GPS, per RFC 1305 Table F-2). The peer status word uses `sel = 6` (system peer), which causes `ntpq -p` to display the `*` tally mark.
+- **READVAR (op=2, assoc=0)**: System variables. When synced, includes:
+
+  | Variable | Description |
+  |---|---|
+  | `stratum`, `leap`, `precision` | RFC 5905 §7.3 fields |
+  | `rootdelay` | 0 (hardware reference; RFC 5905 §6) |
+  | `rootdisp` | model-driven dispersion in ms |
+  | `refid` | `GPS` (synced) or `INIT` (unsynced) |
+  | `reftime` | `0xSSSSSSSS.FFFFFFFF` — last discipline event timestamp |
+  | `clock` | `0xSSSSSSSS.FFFFFFFF` — current system NTP timestamp |
+  | `offset` | PPS phase offset in ms |
+  | `frequency` | oscillator offset in ppm (±sign) |
+  | `sys_jitter` | smoothed PPS jitter in ms |
+  | `clk_jitter` | same as `sys_jitter` (PPS-derived) |
+  | `clk_wander` | `\|freq_ppm\|` (approximation of frequency wander) |
+  | `tc`, `mintc` | servo time constant (7) and minimum (3) |
+  | `peer`, `system` | association ID and firmware string |
+
+- **READVAR (op=2, assoc=1)**: Peer variables. When synced, includes all standard columns `ntpq -p` uses plus:
+
+  | Variable | Description |
+  |---|---|
+  | `delay`, `offset`, `jitter` | processing delay, PPS offset, jitter (ms) |
+  | `dispersion` | root dispersion in ms |
+  | `xleave` | interleave delay (always 0.000) |
+  | `filtdelay`, `filtoffset`, `filtdisp` | last-sample filter values (no 8-entry ring buffer maintained) |
+
+**Status word encoding** (per RFC 1305 §3.2.1):
+```
+System status = (LI << 14) | (ClkSrc << 8) | (EvtCode << 4) | EvtCnt
+  LI     = 0 (no warning) when stratum=1, 3 (alarm) when stratum=16
+  ClkSrc = 4 (UHF/GPS) when synced, 0 (unspecified) when unsynced
+
+Peer status = (Sel << 13) | (Config << 12) | (Reach << 9)
+  Sel    = 6 (system peer, '*' in ntpq) when synced, 0 when not
+  Config = 1 (always configured)
+  Reach  = 1 when synced, 0 when not
+```
 
 #### Jitter and Delay Tracking
 

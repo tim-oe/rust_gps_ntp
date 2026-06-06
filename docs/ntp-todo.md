@@ -22,23 +22,34 @@ Why: this gives the biggest real-world stability improvement.
 
 ESP32 feasibility: **Yes**.
 
-## [ ] 2) Improve NTP correctness fields
+## [x] 2) Improve NTP correctness fields
 
 - Replace synthetic values with measured/model-driven values:
-  - root delay,
-  - root dispersion,
-  - reference timestamp aging behavior.
-- Keep stratum/leap transitions consistent with sync state machine.
+  - root delay: set to 0 per RFC 5905 §6 (hardware reference, zero round-trip delay to PPS pin).
+  - root dispersion: model-driven as `max(jitter, MIN_HW_ACCURACY_US) + PHI × pps_age`
+    where `PHI = 15 ppm` (RFC 5905 §11.1 maximum clock drift assumption) and
+    `MIN_HW_ACCURACY_US = 100 µs` (GPS+PPS ISR capture floor).
+    Locked dispersion is now 100–300 µs vs. the old fixed 1 ms.
+  - reference timestamp aging: stored as `last_sync_ntp_ts`, the NTP timestamp of the
+    most recent PPS discipline event, per RFC 5905 §7.3. Stays fixed between pulses so
+    clients can observe reference aging as `current_time − reference_timestamp`.
+- Stratum/leap transitions remain consistent with the holdover state machine from item 1.
 
 Why: improves standards compliance and client trust decisions.
 
 ESP32 feasibility: **Yes**.
 
-## [ ] 3) Expand mode-6 control support
+## [x] 3) Expand mode-6 control support
 
-- Flesh out `READVAR`/`READSTAT` variable coverage.
-- Improve association/system status encoding for better `ntpq` output.
-- Optionally support additional mode-6 opcodes used by common tooling.
+- READVAR assoc=0 (system vars) expanded with `reftime`, `clock`, `offset`,
+  `frequency`, `sys_jitter`, `clk_jitter`, `clk_wander`, `tc`, `mintc`.
+- READVAR assoc=1 (peer vars) expanded with `dispersion`, `xleave`,
+  `filtdelay`, `filtoffset`, `filtdisp`.
+- System status word corrected: `ClkSrc = 4` (UHF/GPS) per RFC 1305 Table F-2
+  instead of the previous synthetic `0x0604`.
+- Peer status word corrected: `sel = 6` (system peer) causes ntpq to display `*`.
+- NTP timestamp helper `ntp_ts_to_mode6` formats 64-bit NTP timestamps as
+  `0xSSSSSSSS.FFFFFFFF` per RFC 1305 §3.2 text-protocol convention.
 
 Why: better observability and debugging from standard NTP tools.
 
