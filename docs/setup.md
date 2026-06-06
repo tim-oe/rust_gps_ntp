@@ -149,15 +149,15 @@ Default behavior:
   raise a module to `debug`/`trace`
 - module logs use the Rust module path (for example `rust_gps_ntp::battery`)
 
-Optional module overrides (either build-time env vars, or keys in `sdkconfig.defaults`):
+Optional log overrides (either build-time env vars, or keys in `sdkconfig.defaults`):
 
 - `LOG_WIFI_LEVEL`
 - `LOG_GPS_LEVEL`
 - `LOG_DISPLAY_LEVEL`
 - `LOG_BATTERY_LEVEL`
-- `LOG_PPS_LEVEL`
+- `LOG_PPS_LEVEL` (applies to crate-root/main logs, including PPS loop logs)
 
-Accepted values: `none`, `error`, `warn`, `info`, `debug`, `trace`.
+Accepted values: `none`, `error`, `warn`, `info`, `debug`, `trace` (`verbose` alias is also accepted).
 
 Example (battery debug only):
 
@@ -174,6 +174,11 @@ Example (`sdkconfig.defaults`):
 ```text
 LOG_GPS_LEVEL=trace
 ```
+
+Display boot test behavior:
+
+- runs once at startup only when effective display log level is `debug` or `trace/verbose`
+- does not run at default `info`
 
 ## 7) Verify boot logs
 

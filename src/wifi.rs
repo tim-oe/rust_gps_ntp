@@ -24,7 +24,7 @@ pub fn load_wifi_credentials_from_env() -> anyhow::Result<WifiCredentials> {
         .map(str::to_owned);
 
     if let (Some(ssid), Some(pass)) = (env_ssid, env_pass) {
-        log::info!("Wi-Fi STA SSID loaded: {}", ssid);
+        log::info!("Wi-Fi: STA SSID loaded: {}", ssid);
         return Ok(WifiCredentials { ssid, pass });
     }
 
@@ -77,7 +77,7 @@ pub fn connect_wifi_sta(
         .sta_netif()
         .get_ip_info()
         .context("failed to read DHCP IP info")?;
-    log::info!("Wi-Fi connected; STA IP: {}", ip_info.ip);
+    log::info!("Wi-Fi: connected; STA IP: {}", ip_info.ip);
 
     Ok(wifi)
 }

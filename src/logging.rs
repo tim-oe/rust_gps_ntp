@@ -67,9 +67,9 @@ fn set_level_from_key(tag: &str, key: &str, build_env_value: Option<&'static str
     if let Some(raw) = build_env_value.or_else(|| level_from_sdkconfig_defaults(key)) {
         if let Some(level) = level_from_key(key, build_env_value) {
             set_level(tag, level);
-            log::info!("log level override: {}={} (key: {})", tag, raw, key);
+            log::info!("Logging: override {}={} (key={})", tag, raw, key);
         } else {
-            log::warn!("invalid log level for {}: '{}'", key, raw);
+            log::warn!("Logging: invalid level for {}: '{}'", key, raw);
         }
     }
 }

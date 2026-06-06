@@ -68,7 +68,7 @@ fn local_time_from_utc(utc_date: &str, utc_time: &str, lon: f32) -> Option<Strin
 }
 
 pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
-    log::trace!("RMC raw: {}", sentence);
+    log::trace!("GPS RMC raw: {}", sentence);
     let fields: Vec<&str> = sentence.split(',').collect();
     if fields.len() < 10 {
         return None;
@@ -87,7 +87,7 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     gps.lon = lon;
     gps.fix = status == "A";
     log::trace!(
-        "RMC parsed: utc={} {} fix={} lat={:.6} lon={:.6}",
+        "GPS RMC parsed: utc={} {} fix={} lat={:.6} lon={:.6}",
         gps.utc_date,
         gps.utc_time,
         gps.fix,
@@ -99,12 +99,12 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
 }
 
 pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
-    log::trace!("GGA raw: {}", sentence);
+    log::trace!("GPS GGA raw: {}", sentence);
     let fields: Vec<&str> = sentence.split(',').collect();
     if fields.len() < 8 {
         return None;
     }
     gps.sats = fields[7].parse::<u8>().ok()?;
-    log::trace!("GGA parsed: sats={}", gps.sats);
+    log::trace!("GPS GGA parsed: sats={}", gps.sats);
     Some(())
 }

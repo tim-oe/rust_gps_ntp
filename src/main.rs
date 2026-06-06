@@ -78,13 +78,15 @@ fn main() -> anyhow::Result<()> {
     let battery_monitor = battery::detect_monitor(&mut i2c_drv);
     match battery_monitor {
         Some(battery::BatteryMonitor::Max17048) => {
-            log::info!("Battery monitor detected: MAX17048 @ 0x36");
+            log::info!("Battery: monitor detected MAX17048 @ 0x36");
         }
         Some(battery::BatteryMonitor::Lc709203) => {
-            log::info!("Battery monitor detected: LC709203 @ 0x0B");
+            log::info!("Battery: monitor detected LC709203 @ 0x0B");
         }
         None => {
-            log::warn!("Battery monitor not detected on I2C (tried 0x36 MAX17048 and 0x0B LC709203)");
+            log::warn!(
+                "Battery: monitor not detected on I2C (tried 0x36 MAX17048 and 0x0B LC709203)"
+            );
         }
     }
 
@@ -132,7 +134,7 @@ fn main() -> anyhow::Result<()> {
     let mut last_interaction_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() };
     let mut force_redraw = true;
 
-    log::info!("ESP32 booted; Wi-Fi + GPS UART diagnostics mode");
+    log::info!("System: booted; Wi-Fi + GPS UART diagnostics mode");
     log::info!(
         "Listening for raw NMEA on UART1 (9600 baud), TX=GPIO{}, RX=GPIO{}",
         GPS_UART_TX_PIN,
@@ -153,7 +155,7 @@ fn main() -> anyhow::Result<()> {
     pps_pin
         .enable_interrupt()
         .context("failed to enable PPS interrupt")?;
-    log::info!("Monitoring PPS on GPIO{} (rising-edge interrupt)", PPS_GPIO_PIN);
+    log::info!("PPS: monitoring GPIO{} (rising-edge interrupt)", PPS_GPIO_PIN);
 
     loop {
         if let Ok(read) = gps_uart.read(&mut rx_buf, 25) {
@@ -179,14 +181,14 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(_) => {
-                        log::info!("GPS UART received {} non-UTF8 bytes", read);
+                        log::info!("GPS: UART received {} non-UTF8 bytes", read);
                     }
                 }
             }
         }
 
         if bytes_seen > 0 && bytes_seen % 512 == 0 {
-            log::debug!("GPS diagnostics bytes received: {}", bytes_seen);
+            log::debug!("GPS: diagnostics bytes received={}", bytes_seen);
         }
 
         let current_pps_count = pps_count.load(Ordering::Relaxed);
@@ -194,16 +196,16 @@ fn main() -> anyhow::Result<()> {
             let now_us = pps_edge_us.load(Ordering::Relaxed);
             if last_logged_pps_us > 0 {
                 pps_delta_us = now_us.wrapping_sub(last_logged_pps_us);
-                log::debug!("PPS pulse #{} delta={}us", current_pps_count, pps_delta_us);
+                log::debug!("PPS: pulse #{} delta={}us", current_pps_count, pps_delta_us);
             } else {
-                log::debug!("PPS pulse #{} detected", current_pps_count);
+                log::debug!("PPS: pulse #{} detected", current_pps_count);
             }
 
             last_logged_pps_count = current_pps_count;
             last_logged_pps_us = now_us;
 
             if let Err(err) = pps_pin.enable_interrupt() {
-                log::warn!("Failed to re-enable PPS interrupt: {}", err);
+                log::warn!("PPS: failed to re-enable interrupt: {}", err);
             }
         }
 

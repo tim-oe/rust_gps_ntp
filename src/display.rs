@@ -177,12 +177,12 @@ where
     display
         .init(ets)
         .map_err(|e| anyhow!("failed to initialize ST7789 display: {:?}", e))?;
-    log::info!("Display init: ST7789 initialized");
+    log::info!("Display: ST7789 initialized");
 
     display
         .set_orientation(Orientation::LandscapeSwapped)
         .map_err(|e| anyhow!("failed to set display orientation: {:?}", e))?;
-    log::info!("Display init: orientation set to LandscapeSwapped (CP rot=270)");
+    log::info!("Display: orientation set to LandscapeSwapped (CP rot=270)");
 
     let backlight_on_state = if DISPLAY_BACKLIGHT_ACTIVE_LOW {
         BacklightState::Off
@@ -192,7 +192,7 @@ where
 
     let _ = display.set_backlight(backlight_on_state, ets);
     log::info!(
-        "Display init: backlight forced on (active_low={})",
+        "Display: backlight forced on (active_low={})",
         DISPLAY_BACKLIGHT_ACTIVE_LOW
     );
 
@@ -218,11 +218,11 @@ where
         .build();
     let _ = Text::new("Display boot test", Point::new(8, 20), boot_style).draw(panel);
     log::debug!(
-        "Display init: applying viewport offsets x={} y={}",
+        "Display: applying viewport offsets x={} y={}",
         DISPLAY_X_OFFSET,
         DISPLAY_Y_OFFSET
     );
-    log::debug!("Display init: boot test pattern drawn");
+    log::debug!("Display: boot test pattern drawn");
     FreeRtos::delay_ms(800);
 }
 
