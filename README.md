@@ -24,7 +24,7 @@ for your connected board at `/dev/ttyACM0`.
 - PPS discipline on `GPIO12` (rising-edge interrupt)
 - NTP UDP/123 responder with GPS/PPS-backed timestamps and mode-6 diagnostics
 - IANA timezone lookup (background worker) with NVS cache
-- [docs/ntp-todo.md](docs/ntp-todo.md) - outstanding NTP work
+- [docs/rfp.md](docs/rfp.md) - project record: milestones, data model, test plan
 ## Rust code organization
 
 Logic lives in the library crate (`src/lib.rs`); `src/main.rs` is a thin ESP-IDF

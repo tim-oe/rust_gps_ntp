@@ -203,6 +203,15 @@ pub fn run() -> anyhow::Result<()> {
         GPS_UART_RX_PIN
     );
 
+    // --- Self-check state: track first-event milestones and emit timeout warnings. ---
+    let boot_us = monotonic_us();
+    let mut first_nmea_logged = false;
+    let mut first_fix_logged = false;
+    let mut first_pps_logged = false;
+    let mut first_ntp_client_logged = false;
+    let mut warn_no_nmea_done = false;
+    let mut warn_no_pps_done = false;
+
     loop {
         poll_gps_uart(
             &gps_uart,
@@ -241,7 +250,11 @@ pub fn run() -> anyhow::Result<()> {
         if let Some(event) = pps.poll(&mut pps_poll) {
             match event {
                 PpsEvent::First => {
-                    log::debug!("PPS: pulse #{} detected", pps_poll.pulse_count());
+                    first_pps_logged = true;
+                    log::info!(
+                        "PPS: first pulse received (+{}s)",
+                        (monotonic_us() - boot_us) / 1_000_000
+                    );
                     ntp_server.observe_pps_pulse(None);
                 }
                 PpsEvent::Delta(delta) => {
@@ -267,6 +280,54 @@ pub fn run() -> anyhow::Result<()> {
         }
 
         FreeRtos::delay_ms(10);
+
+        // --- Boot self-checks: log key lifecycle milestones once, warn on stalls. ---
+        let elapsed_s = (monotonic_us() - boot_us) / 1_000_000;
+
+        if !first_nmea_logged && bytes_seen > 0 {
+            first_nmea_logged = true;
+            log::info!("GPS UART: first NMEA data received (+{}s)", elapsed_s);
+        }
+
+        if !first_fix_logged && gps.fix {
+            first_fix_logged = true;
+            log::info!(
+                "GPS: first fix acquired — sats={} lat={:.5} lon={:.5} (+{}s)",
+                gps.sats,
+                gps.lat,
+                gps.lon,
+                elapsed_s
+            );
+        }
+
+        if !first_ntp_client_logged {
+            let snap = ntp_server.ntp_snapshot(gps.fix);
+            if snap.served > 0 {
+                first_ntp_client_logged = true;
+                log::info!("NTP: first client request served (+{}s)", elapsed_s);
+            }
+        }
+
+        // Warn once if expected events don't arrive within the expected window.
+        if !warn_no_nmea_done && !first_nmea_logged && elapsed_s >= 10 {
+            warn_no_nmea_done = true;
+            log::warn!(
+                "GPS UART: no data in {}s — check GPS module power and wiring \
+                 (UART1 TX=GPIO{} RX=GPIO{})",
+                elapsed_s,
+                GPS_UART_TX_PIN,
+                GPS_UART_RX_PIN
+            );
+        }
+
+        if !warn_no_pps_done && first_nmea_logged && !first_pps_logged && elapsed_s >= 30 {
+            warn_no_pps_done = true;
+            log::warn!(
+                "PPS: no pulse in {}s since boot — check PPS pin wiring (GPIO{})",
+                elapsed_s,
+                PPS_GPIO_PIN
+            );
+        }
     }
 }
 
