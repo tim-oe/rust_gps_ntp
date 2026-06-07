@@ -41,6 +41,12 @@ CONFIG_LWIP_LOCAL_HOSTNAME="gps-ntp"
 # Set to 0 for modules that output NMEA *before* the PPS edge (uncommon).
 CONFIG_GPS_NTP_NMEA_PPS_FUDGE_S=1
 
+# NTP client IPv4 ACL. Leave empty to allow RFC 1918 private networks only
+# (127/8, 10/8, 172.16/12, 192.168/16). Set a CIDR to restrict to one subnet;
+# all other sources are silently dropped.
+# Example: CONFIG_GPS_NTP_ACL_CIDR="192.168.1.0/24"
+CONFIG_GPS_NTP_ACL_CIDR="192.168.1.0/24"
+
 # module log levels
 # LOG_GPS_LEVEL=trace
 # LOG_PPS_LEVEL=trace

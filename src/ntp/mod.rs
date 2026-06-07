@@ -255,6 +255,9 @@ impl NtpServer {
     ///
     /// # Example
     /// ```rust,no_run
+    /// use rust_gps_ntp::ntp::{Acl, NtpServer};
+    ///
+    /// let mut server = NtpServer::bind().unwrap();
     /// server.set_acl(Acl::private_lan());
     /// ```
     pub fn set_acl(&mut self, acl: Acl) {
@@ -281,6 +284,9 @@ impl NtpServer {
     ///
     /// # Example
     /// ```rust,no_run
+    /// use rust_gps_ntp::ntp::NtpServer;
+    ///
+    /// let mut server = NtpServer::bind().unwrap();
     /// // Announce a positive leap second at end of the current UTC day.
     /// server.set_leap_indicator(1);
     /// // … after midnight UTC …

@@ -159,6 +159,20 @@ impl Acl {
         }
     }
 
+    /// Build the ACL from `CONFIG_GPS_NTP_ACL_CIDR` in `sdkconfig.defaults`.
+    ///
+    /// When the CIDR string is empty, returns [`Self::private_lan`]. Otherwise
+    /// denies all sources except the configured prefix (validated at build time).
+    pub fn from_config(cidr: &str) -> Self {
+        if let Some((a, b, c, d, prefix)) = parse_ipv4_cidr(cidr) {
+            let mut acl = Self::deny_all();
+            acl.add_ipv4_cidr(a, b, c, d, prefix);
+            acl
+        } else {
+            Self::private_lan()
+        }
+    }
+
     /// Create an ACL that allows only private RFC 1918 ranges and loopback:
     /// `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`.
     ///
@@ -208,11 +222,66 @@ impl Acl {
     }
 }
 
+/// Parse an IPv4 CIDR string (`a.b.c.d/prefix`, prefix 0–32).
+pub fn parse_ipv4_cidr(s: &str) -> Option<(u8, u8, u8, u8, u8)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (addr, prefix) = s.split_once('/')?;
+    let prefix: u8 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let mut octets = addr.split('.');
+    let a: u8 = octets.next()?.parse().ok()?;
+    let b: u8 = octets.next()?.parse().ok()?;
+    let c: u8 = octets.next()?.parse().ok()?;
+    let d: u8 = octets.next()?.parse().ok()?;
+    if octets.next().is_some() {
+        return None;
+    }
+    Some((a, b, c, d, prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // --- ACL tests ---
+
+    #[test]
+    fn parse_ipv4_cidr_accepts_slash24() {
+        assert_eq!(
+            parse_ipv4_cidr("192.168.1.0/24"),
+            Some((192, 168, 1, 0, 24))
+        );
+    }
+
+    #[test]
+    fn parse_ipv4_cidr_rejects_missing_prefix() {
+        assert_eq!(parse_ipv4_cidr("192.168.1.0"), None);
+    }
+
+    #[test]
+    fn parse_ipv4_cidr_rejects_prefix_out_of_range() {
+        assert_eq!(parse_ipv4_cidr("10.0.0.0/33"), None);
+    }
+
+    #[test]
+    fn from_config_empty_uses_private_lan() {
+        let acl = Acl::from_config("");
+        assert!(acl.allows(0xC0_A8_00_01));
+        assert!(!acl.allows(0x08_08_08_08));
+    }
+
+    #[test]
+    fn from_config_cidr_restricts_to_subnet() {
+        let acl = Acl::from_config("192.168.1.0/24");
+        assert!(acl.allows(0xC0_A8_01_01));
+        assert!(!acl.allows(0xC0_A8_02_01));
+        assert!(!acl.allows(0x08_08_08_08));
+    }
 
     #[test]
     fn acl_allow_all_permits_any_ipv4() {

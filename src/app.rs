@@ -228,6 +228,14 @@ pub fn run() -> anyhow::Result<()> {
     );
 
     let mut ntp_server = ntp::NtpServer::bind()?;
+    let acl_cidr = env!("NTP_ACL_CIDR");
+    ntp_server.set_acl(ntp::Acl::from_config(acl_cidr));
+    if acl_cidr.is_empty() {
+        log::info!("NTP: ACL restricted to RFC 1918 private networks");
+    } else {
+        log::info!("NTP: ACL restricted to {acl_cidr}");
+    }
+
     let mut tz_store = TimezoneStore::new(default_nvs_tz).ok();
     let mut tz_worker = TimezoneWorker::spawn().ok();
     let mut tz_initialized = false;
