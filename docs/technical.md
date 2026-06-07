@@ -470,8 +470,8 @@ On first GPS fix the device looks up the IANA timezone for the current coordinat
 
 **Providers (tried in order):**
 
-1. [Open-Meteo forecast API](https://open-meteo.com/en/docs) – no API key required; JSON field `timezone`.
-2. [GeoNames timezoneJSON](http://api.geonames.org/timezoneJSON) – demo account, rate-limited; JSON field `timezoneId`.
+1. [Open-Meteo forecast API](https://open-meteo.com/en/docs) – no API key required; JSON field `timezone` (HTTPS).
+2. [GeoNames timezoneJSON](https://secure.geonames.org/) – demo account, rate-limited; JSON field `timezoneId` (HTTPS via `secure.geonames.org`; `api.geonames.org` has a mismatched TLS certificate).
 
 The timezone string is persisted to the ESP-IDF NVS partition (namespace `rust_gps_ntp`, key `local_tz`) so it survives power cycles. The cache is refreshed every 6 hours (`TZ_LOOKUP_REFRESH_US = 21_600_000_000 µs`); on cache miss a retry fires every 5 minutes (`TZ_LOOKUP_RETRY_US = 300_000_000 µs`).
 
@@ -502,7 +502,7 @@ The main loop iteration budget is 10 ms (`FreeRtos::delay_ms(10)`). GPS sentence
 
 ### `wifi` – Wi-Fi STA
 
-Uses `esp_idf_svc::wifi::EspWifi` to connect to a WPA2 access point. Credentials are injected at compile time via environment variables (`WIFI_SSID`, `WIFI_PASS`). The connection is established before any GPS or NTP activity begins; Wi-Fi is required for NTP clients to reach the server and for timezone HTTP lookups.
+Uses `esp_idf_svc::wifi::EspWifi` to connect to a WPA2 access point. Credentials are injected at compile time via environment variables (`WIFI_SSID`, `WIFI_PASS`) and stored in the firmware binary in plaintext. The SSID (not the password) is logged at boot. See [`docs/setup.md`](setup.md#security-considerations) for deployment guidance.
 
 ---
 

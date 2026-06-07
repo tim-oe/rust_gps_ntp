@@ -58,11 +58,11 @@ Status legend: `[ ]` open · `[x]` resolved.
   restrict served modes), then align comment/docs.
 
 ### P1-4 · Lower-risk hardening notes
-- [ ] Wi-Fi credentials are compiled into the firmware image in plaintext
-  (`src/wifi.rs:27`); SSID is logged (`src/wifi.rs:38`). Acceptable for the
-  device class — document the exposure.
-- [ ] Timezone lookups use plain `http://` (`src/timezone.rs:90,101`). Low risk
-  (result validated via `Tz::from_str`) but unauthenticated/MITM-able.
+- [x] Wi-Fi credentials are compiled into the firmware image in plaintext
+  (`src/wifi.rs:27`); SSID is logged (`src/wifi.rs:38`). Documented in
+  `docs/setup.md` and `docs/technical.md`.
+- [x] Timezone lookups use plain `http://` (`src/timezone.rs:90,101`) → switched
+  to HTTPS with mbedTLS cert bundle (`sdkconfig.defaults`).
 
 ---
 

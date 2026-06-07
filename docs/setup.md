@@ -123,6 +123,19 @@ result in NVS for future boots. Cached timezone is used immediately at boot and
 then refreshed periodically from network lookup; if the resolved zone changes,
 the new value is applied and persisted.
 
+### Security considerations
+
+**Wi-Fi credentials (compile-time).** `WIFI_SSID` and `WIFI_PASS` are embedded
+in the firmware image at build time via `option_env!`. Anyone with access to
+the flash binary can recover them. This is acceptable for a single-purpose LAN
+appliance but not for devices deployed outside a trusted network. Only the
+SSID (never the password) is logged at boot.
+
+**Timezone lookups (HTTPS).** When `LOCAL_TZ` is unset, coordinate lookups use
+HTTPS against Open-Meteo and GeoNames (`secure.geonames.org`). The IANA name is
+validated with `Tz::from_str` before use; a MITM could influence display local
+time only, not NTP discipline.
+
 There are two flash workflows, both always run the coverage gate first:
 
 **First flash or after changing `partitions.csv`** — writes bootloader, partition table, and app:

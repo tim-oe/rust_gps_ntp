@@ -10,7 +10,7 @@ use embedded_svc::http::{Method, client::Client as HttpClient};
 #[cfg(target_os = "espidf")]
 use embedded_svc::utils::io;
 #[cfg(target_os = "espidf")]
-use esp_idf_svc::http::client::EspHttpConnection;
+use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
 
@@ -88,7 +88,7 @@ impl TimezoneStore {
 pub fn fetch_timezone_for_coords(lat: f32, lon: f32) -> anyhow::Result<Option<String>> {
     // Primary provider: Open-Meteo (no key required).
     let open_meteo_url = format!(
-        "http://api.open-meteo.com/v1/forecast?latitude={lat:.6}&longitude={lon:.6}&current=temperature_2m&timezone=auto"
+        "https://api.open-meteo.com/v1/forecast?latitude={lat:.6}&longitude={lon:.6}&current=temperature_2m&timezone=auto"
     );
     if let Some(tz) = fetch_timezone_from_url(&open_meteo_url)
         .context("timezone lookup request failed (open-meteo)")?
@@ -97,8 +97,9 @@ pub fn fetch_timezone_for_coords(lat: f32, lon: f32) -> anyhow::Result<Option<St
     }
 
     // Fallback provider: GeoNames demo account (best-effort only; can be rate-limited).
+    // Use secure.geonames.org — api.geonames.org presents a mismatched TLS cert.
     let geonames_url =
-        format!("http://api.geonames.org/timezoneJSON?lat={lat:.6}&lng={lon:.6}&username=demo");
+        format!("https://secure.geonames.org/timezoneJSON?lat={lat:.6}&lng={lon:.6}&username=demo");
     fetch_timezone_from_url(&geonames_url).context("timezone lookup request failed (geonames)")
 }
 
@@ -221,6 +222,17 @@ impl TimezoneWorker {
     }
 }
 
+#[cfg(target_os = "espidf")]
+fn timezone_http_client() -> anyhow::Result<HttpClient<EspHttpConnection>> {
+    let config = HttpConfiguration {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    };
+    Ok(HttpClient::wrap(EspHttpConnection::new(&config).context(
+        "failed to create HTTP connection for timezone lookup",
+    )?))
+}
+
 /// Perform one HTTP GET and extract a timezone field from the JSON body.
 ///
 /// # Parameters
@@ -232,10 +244,7 @@ impl TimezoneWorker {
 /// - `Err` on HTTP, read, or UTF-8 failures.
 #[cfg(target_os = "espidf")]
 fn fetch_timezone_from_url(url: &str) -> anyhow::Result<Option<String>> {
-    let mut client = HttpClient::wrap(
-        EspHttpConnection::new(&Default::default())
-            .context("failed to create HTTP connection for timezone lookup")?,
-    );
+    let mut client = timezone_http_client()?;
     let request = client
         .request(Method::Get, url, &[])
         .context("failed to create timezone lookup request")?;
