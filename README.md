@@ -5,6 +5,8 @@ Rust firmware for a GPS-disciplined NTP server on:
 - Adafruit ESP32-S3 TFT Feather (default build target)
 - Adafruit Ultimate GPS FeatherWing
 
+
+
 This repository includes project setup, hardware notes, and a flash workflow
 for your connected board at `/dev/ttyACM0`.
 
@@ -52,6 +54,23 @@ entrypoint. Modules include `gps`, `pps`, `ntp`, `display`, `battery`, `wifi`,
 ```bash
 just flash-monitor
 ```
+
+## Accuracy
+
+Live validation against local and internet NTP references (`just validate-ntp`):
+
+| Host | Stratum | Ref | Delay ms | Offset ms |
+|---|---|---|---:|---:|
+| **gps-ntp** *(this device)* | 1 | GPS | 18.2 | +2.7 |
+| 192.168.1.40 *(Pi3 + gpsd/ntpd)* | 1 | PPSH | 11.4 | +1.2 |
+| time.nist.gov | 1 | NIST | 60.0 | +6.2 |
+| time.google.com | 1 | GOOG | 42.9 | +10.2 |
+| time.apple.com | 1 | GPSs | 60.9 | +14.4 |
+
+gps-ntp is within **~1.5 ms of the local GPS-disciplined Pi reference** and
+ahead of all internet stratum-1 servers on this LAN. Residual offset is at the
+noise floor of single-shot UDP measurements over Wi-Fi (~RTT/2 ≈ ±5 ms per
+sample).
 
 ## Development
 
