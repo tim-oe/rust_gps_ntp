@@ -2,6 +2,34 @@
 //!
 //! The main loop handles GPS ingest, PPS discipline, NTP polling, and timezone
 //! coordination. Display, button, and battery sampling run on [`crate::ui_task`].
+//!
+//! # Performance architecture
+//!
+//! Several choices were made specifically to keep NTP response latency low:
+//!
+//! * **Wi-Fi power save disabled** (`WIFI_PS_NONE` in [`crate::wifi`]): the default
+//!   `WIFI_PS_MIN_MODEM` mode buffers incoming UDP packets at the AP for up to ~100 ms
+//!   (one DTIM interval), dominating NTP round-trip time.
+//!
+//! * **Non-blocking UART reads** (`timeout = 0` in [`poll_gps_uart`]): a blocking read
+//!   with even a 25-tick timeout stalls the loop for up to 250 ms, queueing NTP
+//!   packets and adding the same latency as power save.
+//!
+//! * **1 ms loop sleep** (`FreeRtos::delay_ms(1)`): reduces the worst-case time
+//!   between a UDP packet arriving and `poll()` processing it.  Combined with
+//!   `CONFIG_FREERTOS_HZ=1000` (1 kHz tick rate), this cuts the D/2 NTP
+//!   4-timestamp bias from ~5 ms to ~0.5 ms.
+//!
+//! * **ISR-captured PPS timestamp** (`edge_us` from [`crate::pps`]): the PPS edge
+//!   time is recorded in the GPIO ISR and passed directly to the clock anchor,
+//!   bypassing the ~10–100 ms task-scheduling delay that would accumulate if the
+//!   clock were read at the point `poll()` processes the event.
+//!
+//! * **Task priorities** (`CONFIG_ESP_MAIN_TASK_PRIO=10` in `sdkconfig.defaults`):
+//!   the ESP-IDF main task defaults to priority 1, below the default pthread
+//!   priority of 5 used by `std::thread`.  The UI task (priority 5) and timezone
+//!   worker (priority 2) are explicitly set below the NTP loop so display work
+//!   never preempts time-critical packet processing.
 
 use anyhow::Context;
 use display_interface_spi::SPIInterfaceNoCS;
@@ -281,18 +309,25 @@ pub fn run() -> anyhow::Result<()> {
 
         if let Some(event) = pps.poll(&mut pps_poll) {
             match event {
-                PpsEvent::First => {
+                PpsEvent::First { edge_us } => {
                     first_pps_logged = true;
                     log::info!(
                         "PPS: first pulse received (+{}s)",
                         (monotonic_us() - boot_us) / 1_000_000
                     );
-                    ntp_server.observe_pps_pulse(None);
+                    ntp_server.observe_pps_pulse(None, edge_us);
                 }
-                PpsEvent::Delta(delta) => {
-                    ui_feed.publish_pps_delta(delta);
-                    log::debug!("PPS: pulse #{} delta={}us", pps_poll.pulse_count(), delta);
-                    ntp_server.observe_pps_pulse(Some(delta));
+                PpsEvent::Delta {
+                    interval_us,
+                    edge_us,
+                } => {
+                    ui_feed.publish_pps_delta(interval_us);
+                    log::debug!(
+                        "PPS: pulse #{} delta={}us",
+                        pps_poll.pulse_count(),
+                        interval_us
+                    );
+                    ntp_server.observe_pps_pulse(Some(interval_us), edge_us);
                 }
             }
             // Publish fresh discipline metrics whenever PPS fires (every ~1 s when locked).
@@ -311,7 +346,11 @@ pub fn run() -> anyhow::Result<()> {
             last_ntp_publish_us = now_us;
         }
 
-        FreeRtos::delay_ms(10);
+        // 1 ms sleep keeps the loop at ~1 kHz: fast enough to respond to NTP
+        // requests within ~0.5 ms on average (D/2 bias in 4-timestamp offset),
+        // while still yielding to lower-priority tasks and keeping GPS UART
+        // drained (9600 baud delivers ~1 byte/ms so 1 ms reads are sufficient).
+        FreeRtos::delay_ms(1);
 
         // --- Boot self-checks: log key lifecycle milestones once, warn on stalls. ---
         let elapsed_s = (monotonic_us() - boot_us) / 1_000_000;
@@ -402,7 +441,11 @@ fn poll_gps_uart(
     tz_initialized: &mut bool,
     last_tz_lookup_us: &mut i64,
 ) {
-    let Ok(read) = gps_uart.read(rx_buf, 25) else {
+    // timeout=0: non-blocking read.  A blocking timeout (e.g. 25 ticks at
+    // 100 Hz = 250 ms) stalls the loop and queues NTP packets for the same
+    // duration, adding it directly to NTP round-trip time.  At 9600 baud GPS
+    // delivers ~1 byte/ms, so a 1 ms loop drains the UART buffer adequately.
+    let Ok(read) = gps_uart.read(rx_buf, 0) else {
         return;
     };
     if read == 0 {

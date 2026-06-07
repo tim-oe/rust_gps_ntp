@@ -124,6 +124,16 @@ impl TimezoneWorker {
     pub fn spawn() -> anyhow::Result<Self> {
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
+
+        // HTTP lookups are best-effort; run below both the main NTP loop (10)
+        // and the UI task (5) so blocking network calls never delay either.
+        esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+            priority: 2,
+            ..Default::default()
+        }
+        .set()
+        .context("failed to configure timezone worker priority")?;
+
         let handle = std::thread::Builder::new()
             .name("tz_lookup".into())
             .stack_size(12_000)
@@ -136,6 +146,10 @@ impl TimezoneWorker {
                 }
             })
             .context("failed to spawn timezone lookup worker")?;
+
+        esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration::default()
+            .set()
+            .context("failed to restore thread spawn configuration")?;
 
         Ok(Self {
             request_tx,

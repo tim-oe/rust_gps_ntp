@@ -24,9 +24,11 @@ pub struct PpsPollState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PpsEvent {
     /// First pulse since boot; no interval available yet.
-    First,
+    /// `edge_us` is the ISR-captured monotonic timestamp of the edge.
+    First { edge_us: i64 },
     /// Subsequent pulse with interval since previous edge (microseconds).
-    Delta(u32),
+    /// `edge_us` is the ISR-captured monotonic timestamp of this edge.
+    Delta { interval_us: u32, edge_us: i64 },
 }
 
 impl PpsPollState {
@@ -106,9 +108,14 @@ impl PpsMonitor {
     /// - `state`: Mutable poll cursor updated when a new pulse is observed.
     ///
     /// # Returns
-    /// - `Some(PpsEvent::First)` on the first observed pulse after boot.
-    /// - `Some(PpsEvent::Delta(us))` when a later pulse arrives.
+    /// - `Some(PpsEvent::First { edge_us })` on the first observed pulse after boot.
+    /// - `Some(PpsEvent::Delta { interval_us, edge_us })` when a later pulse arrives.
     /// - `None` when no new pulse has occurred since the last poll.
+    ///
+    /// `edge_us` is the ISR-captured monotonic timestamp of the rising edge.
+    /// Callers should use it as the authoritative edge time rather than reading
+    /// the clock again to avoid task-scheduling latency (~10–100 ms) inflating
+    /// the apparent offset.
     pub fn poll(&self, state: &mut PpsPollState) -> Option<PpsEvent> {
         let current_count = self.count.load(Ordering::Relaxed);
         if current_count <= state.last_count {
@@ -116,10 +123,14 @@ impl PpsMonitor {
         }
 
         let now_us = self.edge_us.load(Ordering::Relaxed);
+        let edge_us = now_us as i64;
         let event = if state.last_edge_us > 0 {
-            PpsEvent::Delta(pps_delta_us(now_us, state.last_edge_us))
+            PpsEvent::Delta {
+                interval_us: pps_delta_us(now_us, state.last_edge_us),
+                edge_us,
+            }
         } else {
-            PpsEvent::First
+            PpsEvent::First { edge_us }
         };
 
         state.last_count = current_count;
@@ -170,10 +181,19 @@ mod tests {
         let mut state = PpsPollState::default();
 
         PpsMonitor::record_edge(&edge, &count, 1_000_000);
-        assert_eq!(monitor.poll(&mut state), Some(PpsEvent::First));
+        assert_eq!(
+            monitor.poll(&mut state),
+            Some(PpsEvent::First { edge_us: 1_000_000 })
+        );
 
         PpsMonitor::record_edge(&edge, &count, 2_001_000);
-        assert_eq!(monitor.poll(&mut state), Some(PpsEvent::Delta(1_001_000)));
+        assert_eq!(
+            monitor.poll(&mut state),
+            Some(PpsEvent::Delta {
+                interval_us: 1_001_000,
+                edge_us: 2_001_000
+            })
+        );
         assert_eq!(state.pulse_count(), 2);
     }
 }

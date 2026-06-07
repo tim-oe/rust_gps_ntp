@@ -7,6 +7,20 @@
 # Prevent early reboot loops from main task stack overflow.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
+# Raise the main task above the default pthread priority (5) so the NTP/GPS
+# service loop preempts the UI and timezone-lookup background threads.
+# FreeRTOS default configMAX_PRIORITIES=25; 10 < 25 leaves headroom for any
+# higher-priority system tasks (e.g. Wi-Fi driver, Bluetooth).
+CONFIG_ESP_MAIN_TASK_PRIO=10
+
+# Increase the FreeRTOS tick rate from the default 100 Hz to 1000 Hz so that
+# FreeRtos::delay_ms(1) in the main service loop actually sleeps for 1 ms.
+# At 100 Hz one tick = 10 ms, meaning delay_ms(1) rounds up to 10 ms and the
+# loop delay D/2 bias in NTP 4-timestamp offset stays at ~5 ms regardless.
+# At 1000 Hz D/2 drops to ~0.5 ms.  The extra tick overhead on ESP32-S3 is
+# negligible; Wi-Fi and BT drivers are unaffected (they use their own timers).
+CONFIG_FREERTOS_HZ=1000
+
 # Keep production logs at info by default.
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
@@ -20,6 +34,12 @@ CONFIG_MDNS_MAX_SERVICES=4
 # Hostname used by the DHCP client (option 12) and as the mDNS base name.
 # Change this to rename the device on the network without recompiling Rust code.
 CONFIG_LWIP_LOCAL_HOSTNAME="gps-ntp"
+
+# Integer seconds to add to the NMEA UTC value when a PPS pulse fires.
+# Most GPS modules send the NMEA sentence describing second N *after* the PPS
+# edge for second N, so last_gps_utc_seconds = N-1 at PPS time → set to 1.
+# Set to 0 for modules that output NMEA *before* the PPS edge (uncommon).
+CONFIG_GPS_NTP_NMEA_PPS_FUDGE_S=1
 
 # module log levels
 # LOG_GPS_LEVEL=trace

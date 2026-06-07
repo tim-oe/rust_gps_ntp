@@ -147,6 +147,16 @@ impl UiTaskHandle {
             log::warn!("Display: failed to enable button pull-up: {}", err);
         }
 
+        // Run below the main NTP/GPS loop (priority 10) so display work never
+        // delays time-critical NTP packet processing.
+        #[cfg(target_os = "espidf")]
+        esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration {
+            priority: 5,
+            ..Default::default()
+        }
+        .set()
+        .context("failed to configure UI task priority")?;
+
         let thread = thread::Builder::new()
             .name("ui_task".into())
             .stack_size(UI_TASK_STACK_BYTES)
@@ -161,6 +171,13 @@ impl UiTaskHandle {
                 );
             })
             .context("failed to spawn UI task")?;
+
+        // Restore default spawn configuration so subsequent thread::spawn
+        // calls elsewhere are not inadvertently affected.
+        #[cfg(target_os = "espidf")]
+        esp_idf_svc::hal::task::thread::ThreadSpawnConfiguration::default()
+            .set()
+            .context("failed to restore thread spawn configuration")?;
 
         log::info!(
             "Display: UI task started (stack {} bytes)",

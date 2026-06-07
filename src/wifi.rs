@@ -90,6 +90,18 @@ pub fn connect_wifi_sta(
         .context("failed to set Wi-Fi STA configuration")?;
 
     wifi.start().context("failed to start Wi-Fi driver")?;
+
+    // Disable Wi-Fi modem sleep so the radio stays awake and can respond to
+    // incoming NTP UDP packets without waiting for the next DTIM beacon.
+    // The default (WIFI_PS_MIN_MODEM) buffers incoming packets at the AP for
+    // up to ~100 ms, which dominates NTP response latency.
+    // WIFI_PS_NONE = 0 per esp-idf wifi_ps_type_t enum.
+    #[cfg(target_os = "espidf")]
+    esp_idf_svc::sys::esp!(unsafe {
+        esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE)
+    })
+    .context("failed to disable Wi-Fi power save")?;
+
     wifi.connect().context("failed to connect Wi-Fi STA")?;
     wifi.wait_netif_up()
         .context("Wi-Fi netif did not come up")?;

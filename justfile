@@ -5,6 +5,7 @@ chip := "esp32s3"
 esp_export := "$HOME/export-esp.sh"
 partition_table := "partitions.csv"
 host_target := `rustc -vV | sed -n 's/^host: //p'`
+DEFAULT_DEVICE := "gps-ntp"
 
 # Host coverage minimums (project target: 90% on host-testable lib code).
 # `main.rs` is excluded (host stub); refresh baselines with `just coverage`.
@@ -77,3 +78,17 @@ ci: fmt-check lint coverage check
 
 # Host-only CI: fmt-check + lint + gated coverage. Works without ESP toolchain.
 ci-no-esp: fmt-check lint coverage
+
+# Query the live device and compare its time against well-known reference servers.
+# Checks: stratum=1, leap-indicator not unsync, offset within --tolerance ms (default 100).
+# Requires the device to be running on the network.
+# Note: takes ~60 s (3 samples × 2.5 s gap × 4 hosts) to respect the device rate-limiter.
+#
+#   just validate-ntp                                    # default device + 3 built-in refs
+#   just validate-ntp gps-ntp.localdomain                # explicit hostname
+#   just validate-ntp 192.168.1.48                       # by IP
+#   just validate-ntp gps-ntp -- --tolerance 10          # tighter 10ms check
+#   just validate-ntp gps-ntp -- --ref ntp.ubuntu.com    # add an extra reference server
+#   just validate-ntp gps-ntp -- --no-defaults --ref ntp.ubuntu.com  # replace all refs
+validate-ntp device=DEFAULT_DEVICE *flags="":
+    python3 scripts/validate_ntp.py {{device}} {{flags}}

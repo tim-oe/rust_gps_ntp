@@ -28,6 +28,17 @@ const MODE6_OPCODE_READSTAT: u8 = 1;
 const MODE6_OPCODE_READVAR: u8 = 2;
 const MODE6_ASSOC_ID: u16 = 1;
 
+/// Seconds added to the NMEA UTC value when anchoring to a PPS edge.
+///
+/// Most GPS modules output the NMEA sentence for second N *after* the PPS
+/// pulse for second N fires, so `last_gps_utc_seconds` lags by one second at
+/// PPS time.  Set `CONFIG_GPS_NTP_NMEA_PPS_FUDGE_S=0` in `sdkconfig.defaults`
+/// for modules that transmit NMEA *before* the PPS edge (uncommon).
+const NMEA_PPS_FUDGE_S: i64 = match env!("NMEA_PPS_FUDGE_S").as_bytes() {
+    [b'0'] => 0,
+    _ => 1,
+};
+
 // --- Discipline servo parameters ---
 /// Proportional gain: fraction of phase error applied to the anchor per pulse.
 const SERVO_KP: f64 = 0.1;
@@ -322,11 +333,14 @@ impl NtpServer {
     /// # Parameters
     /// - `pps_interval_us`: `None` for first pulse alignment, or the measured
     ///   interval in microseconds between the previous and current PPS edge.
+    /// - `edge_us`: ISR-captured monotonic timestamp of the rising edge.
+    ///   Using the ISR timestamp instead of reading the clock at call time
+    ///   eliminates task-scheduling latency (~10–100 ms) from the anchor.
     ///
     /// # Returns
     /// - No return value.
-    pub fn observe_pps_pulse(&mut self, pps_interval_us: Option<u32>) {
-        let now_us = monotonic_us_now();
+    pub fn observe_pps_pulse(&mut self, pps_interval_us: Option<u32>, edge_us: i64) {
+        let now_us = edge_us;
 
         match pps_interval_us {
             None => {
@@ -351,7 +365,12 @@ impl NtpServer {
 
                 if let Some(gps_utc) = self.last_gps_utc_seconds {
                     self.clock_anchor = Some(ClockAnchor {
-                        unix_seconds: gps_utc,
+                        // The GPS module sends NMEA ~100-200 ms AFTER the PPS
+                        // edge.  When PPS fires for second N, last_gps_utc_seconds
+                        // still holds N-1 (from the previous NMEA cycle).  Adding
+                        // NMEA_PPS_FUDGE_S (from sdkconfig.defaults) aligns the
+                        // anchor to the second the PPS pulse is actually marking.
+                        unix_seconds: gps_utc + NMEA_PPS_FUDGE_S,
                         monotonic_us: now_us,
                     });
                     self.pps_locked = true;
@@ -404,7 +423,7 @@ impl NtpServer {
                     anchor.monotonic_us = now_us.saturating_sub(phase_correction_us);
                 } else if let Some(gps_utc) = self.last_gps_utc_seconds {
                     self.clock_anchor = Some(ClockAnchor {
-                        unix_seconds: gps_utc,
+                        unix_seconds: gps_utc + NMEA_PPS_FUDGE_S,
                         monotonic_us: now_us,
                     });
                 }
@@ -1246,6 +1265,13 @@ mod tests {
                 last_gps_utc_update_us: None,
             })
         }
+
+        /// Test helper: call `observe_pps_pulse` using the current monotonic clock
+        /// as the edge timestamp.  Production code should always pass the ISR-captured
+        /// edge time; this wrapper exists only to keep test call sites concise.
+        fn pps_now(&mut self, pps_interval_us: Option<u32>) {
+            self.observe_pps_pulse(pps_interval_us, monotonic_us_now());
+        }
     }
 
     fn client_ntp_request() -> [u8; NTP_PACKET_LEN] {
@@ -1275,7 +1301,7 @@ mod tests {
     fn observe_pps_pulse_first_pulse_locks_to_gps() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         assert!(server.pps_locked);
         assert!(server.last_pps_monotonic_us.is_some());
     }
@@ -1284,9 +1310,9 @@ mod tests {
     fn observe_pps_pulse_valid_interval_advances_anchor() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         let before = server.clock_anchor.expect("anchor").unix_seconds;
-        server.observe_pps_pulse(Some(1_000_000));
+        server.pps_now(Some(1_000_000));
         assert_eq!(
             server.clock_anchor.expect("anchor").unix_seconds,
             before + 1
@@ -1298,7 +1324,7 @@ mod tests {
     fn observe_pps_pulse_ignores_invalid_interval() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(Some(2_000_000));
+        server.pps_now(Some(2_000_000));
         assert!(!server.pps_has_sample);
     }
 
@@ -1307,7 +1333,7 @@ mod tests {
         let mut server = NtpServer::new_for_test().expect("test socket");
         let addr = server.socket.local_addr().expect("local addr");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
 
         let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
         client
@@ -1362,7 +1388,7 @@ mod tests {
         let mut server = NtpServer::new_for_test().expect("test socket");
         let addr = server.socket.local_addr().expect("local addr");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
 
         let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
         for _ in 0..2 {
@@ -1381,9 +1407,9 @@ mod tests {
     fn observe_pps_pulse_smoothes_jitter_on_second_valid_interval() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
-        server.observe_pps_pulse(Some(1_000_250));
-        server.observe_pps_pulse(Some(1_000_500));
+        server.pps_now(None);
+        server.pps_now(Some(1_000_250));
+        server.pps_now(Some(1_000_500));
         assert!(server.pps_has_sample);
         assert_eq!(server.pps_offset_us, 500);
         assert!(server.pps_jitter_us > 0.0);
@@ -1409,9 +1435,9 @@ mod tests {
     fn servo_updates_freq_ppm_positive_for_fast_clock() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Interval longer than 1s: monotonic is fast relative to GPS.
-        server.observe_pps_pulse(Some(1_000_500));
+        server.pps_now(Some(1_000_500));
         assert!(
             server.freq_ppm > 0.0,
             "freq_ppm should be positive when interval > 1s (fast clock)"
@@ -1428,9 +1454,9 @@ mod tests {
     fn servo_updates_freq_ppm_negative_for_slow_clock() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Interval shorter than 1s: monotonic is slow relative to GPS.
-        server.observe_pps_pulse(Some(999_500));
+        server.pps_now(Some(999_500));
         assert!(
             server.freq_ppm < 0.0,
             "freq_ppm should be negative when interval < 1s (slow clock)"
@@ -1447,10 +1473,10 @@ mod tests {
     fn servo_accumulates_freq_over_multiple_pulses() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Apply ten identical intervals with +100 us error each.
         for _ in 0..10 {
-            server.observe_pps_pulse(Some(1_000_100));
+            server.pps_now(Some(1_000_100));
         }
         // Expected after 10 pulses: 10 * 100 * 0.01 = 10.0 ppm
         assert!(
@@ -1464,10 +1490,10 @@ mod tests {
     fn servo_clamps_freq_ppm_at_max() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Extreme interval: should saturate at SERVO_MAX_FREQ_PPM.
         for _ in 0..10_000 {
-            server.observe_pps_pulse(Some(1_200_000));
+            server.pps_now(Some(1_200_000));
         }
         assert_eq!(server.freq_ppm, SERVO_MAX_FREQ_PPM);
     }
@@ -1480,7 +1506,7 @@ mod tests {
         // 1 ms — and stratum must be 1.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         let dp = server.discipline_params(true);
         assert_eq!(dp.stratum, 1);
         assert_eq!(dp.leap, 0);
@@ -1499,7 +1525,7 @@ mod tests {
         // dispersion is still low.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         let dp = server.discipline_params(false);
         assert_eq!(
             dp.stratum, 1,
@@ -1511,7 +1537,7 @@ mod tests {
     fn discipline_params_stale_pps_and_no_gps_fix_gives_stratum_16() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Simulate deep holdover (PPS stale beyond unsync threshold).
         let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
         server.last_pps_monotonic_us = Some(past_us);
@@ -1531,7 +1557,7 @@ mod tests {
     fn holdover_dispersion_grows_after_pps_loss() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Simulate PPS that arrived 60 s into holdover (10s entry + 60s growth).
         let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 60 * MICROS_PER_SEC);
         server.last_pps_monotonic_us = Some(past_us);
@@ -1554,7 +1580,7 @@ mod tests {
     fn holdover_declares_stratum_16_when_dispersion_exceeds_1s() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Need dispersion >= HOLDOVER_UNSYNC_US (1_000_000 us):
         // BASE + secs * RATE >= 1_000_000  →  secs >= (1_000_000 - 1_000) / 500 = 1998 s
         let holdover_secs = 2_010_i64;
@@ -1572,13 +1598,13 @@ mod tests {
     fn holdover_stratum_1_restored_after_pps_returns() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Force into deep holdover.
         let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
         server.last_pps_monotonic_us = Some(past_us);
         assert_eq!(server.discipline_params(true).stratum, 16);
         // Simulate PPS returning.
-        server.observe_pps_pulse(Some(1_000_000));
+        server.pps_now(Some(1_000_000));
         let dp = server.discipline_params(true);
         assert_eq!(
             dp.stratum, 1,
@@ -1590,7 +1616,7 @@ mod tests {
     fn freq_correction_does_not_affect_zero_freq_ppm() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         assert_eq!(server.freq_ppm, 0.0);
         // current_ntp_timestamp should not panic or produce obviously wrong output.
         let ts = server.current_ntp_timestamp();
@@ -1604,7 +1630,7 @@ mod tests {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
         assert_eq!(server.last_sync_ntp_ts, 0);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         assert_ne!(
             server.last_sync_ntp_ts, 0,
             "ref ts should be set after first pulse"
@@ -1615,9 +1641,9 @@ mod tests {
     fn last_sync_ntp_ts_updated_on_subsequent_pulse() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         let first_ref = server.last_sync_ntp_ts;
-        server.observe_pps_pulse(Some(1_000_000));
+        server.pps_now(Some(1_000_000));
         // After the second pulse, ref_ts should advance by approximately 1 NTP second.
         let delta_secs = ((server.last_sync_ntp_ts >> 32) as i64) - ((first_ref >> 32) as i64);
         assert_eq!(delta_secs, 1, "ref_ts should advance by 1 s per PPS pulse");
@@ -1670,7 +1696,7 @@ mod tests {
     fn discipline_params_locked_dispersion_uses_phi_model() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Simulate jitter = 200 µs (above MIN_HW_ACCURACY_US = 100 µs).
         server.pps_jitter_us = 200.0;
         server.pps_has_sample = true;
@@ -1694,7 +1720,7 @@ mod tests {
         // With no PPS sample yet, dispersion should equal the hardware floor.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // pps_has_sample is still false after first pulse.
         server.pps_has_sample = false;
         let dp = server.discipline_params(true);
@@ -1874,7 +1900,7 @@ mod tests {
         // rapid succession. The second poll should receive a KoD RATE response.
         let mut server = NtpServer::new_for_test().expect("server");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client
@@ -1975,7 +2001,7 @@ mod tests {
     fn poll_kod_response_echoes_client_transmit_timestamp() {
         let mut server = NtpServer::new_for_test().expect("server");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client
@@ -2015,7 +2041,7 @@ mod tests {
     fn poll_rate_limited_counter_visible_in_snapshot() {
         let mut server = NtpServer::new_for_test().expect("server");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client
@@ -2056,7 +2082,7 @@ mod tests {
     fn poll_client_allowed_again_after_rate_limit_window() {
         let mut server = NtpServer::new_for_test().expect("server");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client
@@ -2136,7 +2162,7 @@ mod tests {
     fn discipline_params_uses_pending_leap_when_synced() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         server.set_leap_indicator(1);
         let dp = server.discipline_params(true);
         assert_eq!(
@@ -2160,7 +2186,7 @@ mod tests {
     fn ntp_snapshot_exposes_leap_indicator() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         server.set_leap_indicator(2);
         let snap = server.ntp_snapshot(true);
         assert_eq!(snap.leap_indicator, 2);
@@ -2172,13 +2198,13 @@ mod tests {
     fn pps_outlier_rejected_after_servo_converged() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Give the servo a good first sample to establish pps_has_sample=true.
-        server.observe_pps_pulse(Some(1_000_100)); // +100 µs error — OK
+        server.pps_now(Some(1_000_100)); // +100 µs error — OK
 
         let freq_before = server.freq_ppm;
         // Now send a huge phase error that exceeds PPS_OUTLIER_THRESHOLD_US (50 ms).
-        server.observe_pps_pulse(Some(1_100_000)); // +100_000 µs = 100 ms — outlier
+        server.pps_now(Some(1_100_000)); // +100_000 µs = 100 ms — outlier
         assert_eq!(
             server.pps_glitch_count, 1,
             "outlier should increment pps_glitch_count"
@@ -2195,10 +2221,10 @@ mod tests {
         // errors are allowed through so the servo can make an initial correction.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // pps_has_sample is still false; a large interval is still gated by the
         // ±20% interval filter (800k–1200k µs).  Use a mid-range value.
-        server.observe_pps_pulse(Some(1_049_999)); // 49_999 µs error — just under threshold
+        server.pps_now(Some(1_049_999)); // 49_999 µs error — just under threshold
         assert_eq!(
             server.pps_glitch_count, 0,
             "should not be counted as outlier"
@@ -2215,10 +2241,10 @@ mod tests {
         // the holdover timer would be reset by bad pulses.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
-        server.observe_pps_pulse(Some(1_000_100)); // good → sets last_pps_monotonic_us
+        server.pps_now(None);
+        server.pps_now(Some(1_000_100)); // good → sets last_pps_monotonic_us
         let last_good = server.last_pps_monotonic_us;
-        server.observe_pps_pulse(Some(1_100_000)); // outlier
+        server.pps_now(Some(1_100_000)); // outlier
         assert_eq!(
             server.last_pps_monotonic_us, last_good,
             "outlier must not update last_pps_monotonic_us"
@@ -2236,7 +2262,7 @@ mod tests {
         // normal path — instead manipulate internal state to make GPS appear stale.
         server.last_gps_utc_seconds = Some(1_700_000_000);
         server.last_gps_utc_update_us = Some(monotonic_us_now() - 2 * GPS_STALE_THRESHOLD_US);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         assert!(
             server.clock_anchor.is_none(),
             "stale GPS should prevent phase anchor on first PPS pulse"
@@ -2248,7 +2274,7 @@ mod tests {
         // With a recent GPS update the first PPS pulse should establish the anchor.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000); // fresh
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         assert!(
             server.clock_anchor.is_some(),
             "fresh GPS should allow phase anchor on first PPS pulse"
@@ -2259,9 +2285,9 @@ mod tests {
     fn glitch_count_exposed_in_ntp_snapshot() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
-        server.observe_pps_pulse(Some(1_000_100)); // good
-        server.observe_pps_pulse(Some(1_100_000)); // outlier
+        server.pps_now(None);
+        server.pps_now(Some(1_000_100)); // good
+        server.pps_now(Some(1_100_000)); // outlier
         let snap = server.ntp_snapshot(true);
         assert_eq!(snap.pps_glitch_count, 1);
     }
@@ -2376,7 +2402,7 @@ mod tests {
     fn ntp_snapshot_state_locked_with_gps_fix_and_fresh_pps() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         let snap = server.ntp_snapshot(true);
         assert_eq!(snap.state, DisciplineState::Locked);
         assert_eq!(snap.stratum, 1);
@@ -2387,7 +2413,7 @@ mod tests {
         // Anchor + fresh PPS, but gps_fix = false → Holdover (not fully_synced).
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         let snap = server.ntp_snapshot(false); // GPS fix gone
         assert_eq!(snap.state, DisciplineState::Holdover);
     }
@@ -2397,7 +2423,7 @@ mod tests {
         // Anchor valid but PPS older than HOLDOVER_ENTRY_US → Holdover.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         // Age the last PPS timestamp past the holdover threshold.
         let stale_offset = HOLDOVER_ENTRY_US + 1_000_000;
         if let Some(ref mut t) = server.last_pps_monotonic_us {
@@ -2425,7 +2451,7 @@ mod tests {
 
         // Establish GPS + PPS → Locked.
         server.update_gps_utc_seconds(1_700_000_000);
-        server.observe_pps_pulse(None);
+        server.pps_now(None);
         assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
 
         // GPS fix lost → Holdover (anchor still valid).
@@ -2442,7 +2468,7 @@ mod tests {
         assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Holdover);
 
         // PPS returns (new pulse) → Locked.
-        server.observe_pps_pulse(Some(1_000_000));
+        server.pps_now(Some(1_000_000));
         assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
     }
 

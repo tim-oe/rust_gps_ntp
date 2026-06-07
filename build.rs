@@ -17,6 +17,12 @@ fn main() {
     let hostname = read_sdkconfig_string("sdkconfig.defaults", "CONFIG_LWIP_LOCAL_HOSTNAME")
         .unwrap_or_else(|| "espressif".to_owned());
     println!("cargo::rustc-env=DEVICE_HOSTNAME={hostname}");
+
+    let nmea_pps_fudge =
+        read_sdkconfig_string("sdkconfig.defaults", "CONFIG_GPS_NTP_NMEA_PPS_FUDGE_S")
+            .and_then(|v| if v == "0" { Some(0i64) } else { None })
+            .unwrap_or(1i64);
+    println!("cargo::rustc-env=NMEA_PPS_FUDGE_S={nmea_pps_fudge}");
 }
 
 /// Parse a quoted string value from a Kconfig-style `sdkconfig.defaults` file.
