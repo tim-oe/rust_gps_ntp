@@ -69,7 +69,7 @@ Status legend: `[ ]` open · `[x]` resolved.
 ## P2 — Accuracy / correctness
 
 ### P2-1 · NTP receive timestamp (T2) captured too late
-- [ ] **File:** `src/ntp/mod.rs:668-673`
+- [x] **File:** `src/ntp/mod.rs:668-673`
 - **Symptom:** `poll()` drains all queued packets in a loop and samples the
   receive timestamp only after ACL + rate-limit + `discipline_params()` work.
   Under burst, later packets get a T2 inflated by earlier packets' processing,

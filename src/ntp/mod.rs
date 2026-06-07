@@ -613,6 +613,10 @@ impl NtpServer {
                         continue;
                     }
 
+                    // RFC 5905 receive timestamp (T2): sample before ACL, rate-limit,
+                    // or discipline work so burst traffic does not inflate T2.
+                    let receive_ntp_ts = self.current_ntp_timestamp();
+
                     // Extract IPv4 source address for ACL and rate limiting.
                     // IPv6 sources bypass both (pass through unconditionally).
                     let src_ip_v4: Option<u32> = match &peer {
@@ -685,8 +689,7 @@ impl NtpServer {
 
                             let dp = self.discipline_params(gps_fix);
                             let started_us = monotonic_us_now();
-                            let now_ntp = self.current_ntp_timestamp();
-                            let mut resp = build_response(&req48, &dp, now_ntp);
+                            let mut resp = build_response(&req48, &dp, receive_ntp_ts);
                             let transmit_ts = self.current_ntp_timestamp();
                             write_u64_be(&mut resp[40..48], transmit_ts);
 
@@ -1364,6 +1367,30 @@ mod tests {
         assert_eq!(len, NTP_PACKET_LEN);
         assert_eq!(resp[0] & 0x07, 4);
         assert_eq!(resp[1], 1);
+    }
+
+    #[test]
+    fn poll_response_receive_timestamp_precedes_transmit() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let addr = server.socket.local_addr().expect("local addr");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.pps_now(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
+        client
+            .send_to(&client_ntp_request(), addr)
+            .expect("send request");
+        server.poll(true).expect("poll");
+
+        let mut resp = [0_u8; NTP_PACKET_LEN];
+        client.recv_from(&mut resp).expect("response");
+        let receive_ts = u64::from_be_bytes(resp[32..40].try_into().unwrap());
+        let transmit_ts = u64::from_be_bytes(resp[40..48].try_into().unwrap());
+        assert_ne!(receive_ts, 0, "receive timestamp should be populated");
+        assert!(
+            receive_ts <= transmit_ts,
+            "T2 (receive) must not follow T3 (transmit)"
+        );
     }
 
     #[test]
