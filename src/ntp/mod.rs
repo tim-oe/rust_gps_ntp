@@ -302,10 +302,10 @@ impl NtpServer {
         self.pending_leap = li.min(2);
     }
 
-    /// Update absolute UTC seconds from a parsed GPS RMC sample.
+    /// Update absolute UTC seconds from GPS, RTC, or another cached time source.
     ///
     /// # Parameters
-    /// - `utc_unix_seconds`: UTC seconds since Unix epoch from GPS.
+    /// - `utc_unix_seconds`: UTC seconds since Unix epoch.
     ///
     /// # Returns
     /// - No return value.
@@ -562,6 +562,23 @@ impl NtpServer {
             current_ts: self.current_ntp_timestamp(),
             precision,
         }
+    }
+
+    /// Current disciplined UTC seconds when a clock anchor exists.
+    ///
+    /// Uses the same frequency-corrected elapsed time as [`Self::current_ntp_timestamp`].
+    pub fn current_utc_unix_seconds(&self) -> Option<i64> {
+        let anchor = self.clock_anchor?;
+        let now_us = monotonic_us_now();
+        let raw_elapsed_us = now_us.saturating_sub(anchor.monotonic_us);
+        let corrected_elapsed_us = if self.freq_ppm == 0.0 {
+            raw_elapsed_us
+        } else {
+            ((raw_elapsed_us as f64) * (1.0 - self.freq_ppm / 1_000_000.0)) as i64
+        }
+        .max(0);
+        let elapsed_seconds = corrected_elapsed_us.div_euclid(MICROS_PER_SEC);
+        Some(anchor.unix_seconds.saturating_add(elapsed_seconds))
     }
 
     /// Build a public discipline snapshot for the UI and display task.

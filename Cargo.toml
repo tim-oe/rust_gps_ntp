@@ -16,7 +16,7 @@ display-interface-spi = "0.4"
 embedded-graphics = "0.7"
 embedded-svc = "0.28"
 embedded-hal-02 = { package = "embedded-hal", version = "0.2" }
-esp-idf-svc = { version = "0.51", features = ["std", "binstart"] }
+esp-idf-svc = { version = "0.51", features = ["std", "binstart", "experimental"] }
 st7789 = "0.7"
 
 [build-dependencies]

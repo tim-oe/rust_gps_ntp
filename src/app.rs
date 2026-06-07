@@ -48,8 +48,10 @@ use crate::battery::{self, BatteryMonitor};
 use crate::display;
 use crate::gps::{self, GpsSnapshot};
 use crate::logging;
-use crate::ntp;
+use crate::ntp::{self, DisciplineState};
 use crate::pps::{PpsEvent, PpsMonitor, PpsPollState};
+use crate::rtc;
+use crate::storage::{self, StorageStatus};
 use crate::timezone::{TimezoneStore, TimezoneWorker};
 use crate::ui_task::{UiFeed, UiTaskHandle};
 use crate::wifi;
@@ -63,11 +65,18 @@ pub const GPS_UART_RX_PIN: i32 = 2;
 pub const PPS_GPIO_PIN: i32 = 12;
 /// Board I2C SDA pin for the battery fuel gauge.
 pub const BOARD_I2C_SDA_PIN: i32 = 42;
-/// Board I2C SCL pin for the battery fuel gauge.
+/// Board I2C SCL pin for fuel gauge and Adalogger RTC.
 pub const BOARD_I2C_SCL_PIN: i32 = 41;
+/// TFT chip-select on the shared Feather SPI bus.
+pub const TFT_CS_PIN: i32 = 7;
+/// PCF8523 RTC on the Adalogger FeatherWing (shared Feather I2C bus).
+pub const ADALOGGER_RTC_I2C_ADDR: u8 = rtc::PCF8523_ADDR;
 
 const TZ_LOOKUP_RETRY_US: i64 = 300_000_000;
 const TZ_LOOKUP_REFRESH_US: i64 = 21_600_000_000;
+const RTC_WRITEBACK_US: i64 = 60_000_000;
+const RTC_FALLBACK_INTERVAL_US: i64 = 1_000_000;
+const STORAGE_REFRESH_US: i64 = 60_000_000;
 
 /// Initialize peripherals, spawn the UI task, and run the main service loop.
 ///
@@ -146,9 +155,9 @@ pub fn run() -> anyhow::Result<()> {
 
     let i2c_cfg = i2c::config::Config::new().baudrate(100.kHz().into());
     let mut i2c_drv = i2c::I2cDriver::new(i2c0, pins.gpio42, pins.gpio41, &i2c_cfg)
-        .context("failed to initialize I2C for battery monitor")?;
+        .context("failed to initialize I2C for battery monitor and RTC")?;
     log::info!(
-        "Battery I2C bus initialized on SDA=GPIO{}, SCL=GPIO{}",
+        "I2C bus initialized on SDA=GPIO{}, SCL=GPIO{}",
         BOARD_I2C_SDA_PIN,
         BOARD_I2C_SCL_PIN
     );
@@ -167,33 +176,101 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    let spi_drv = spi::SpiDeviceDriver::new_single(
-        spi2,
-        pins.gpio36,
-        pins.gpio35,
-        None::<gpio::Gpio37>,
+    let rtc_present = rtc::detect(&mut i2c_drv);
+    let boot_rtc_unix = if rtc_present {
+        if let Err(err) = rtc::init(&mut i2c_drv) {
+            log::warn!("RTC: PCF8523 init failed: {err}");
+        }
+        match rtc::read_unix_seconds(&mut i2c_drv) {
+            Ok(secs) => {
+                log::info!(
+                    "RTC: PCF8523 @ 0x{:02X} reads UTC {secs}",
+                    ADALOGGER_RTC_I2C_ADDR
+                );
+                Some(secs)
+            }
+            Err(err) => {
+                log::warn!(
+                    "RTC: PCF8523 present @ 0x{:02X} but time unset/invalid ({err}); waiting for GPS",
+                    ADALOGGER_RTC_I2C_ADDR
+                );
+                None
+            }
+        }
+    } else {
+        log::warn!(
+            "RTC: no PCF8523 response @ 0x{:02X} — check Adalogger stack and CR1220",
+            ADALOGGER_RTC_I2C_ADDR
+        );
+        None
+    };
+
+    // Leak the SPI bus driver so TFT and SD borrows satisfy the UI task `'static` bound.
+    let spi_driver: &'static spi::SpiDriver<'static> = Box::leak(Box::new(
+        spi::SpiDriver::new(
+            spi2,
+            pins.gpio36,
+            pins.gpio35,
+            Some(pins.gpio37),
+            &storage::shared_spi_bus_config(),
+        )
+        .context("failed to initialize shared SPI bus for TFT and SD card")?,
+    ));
+
+    FreeRtos::delay_ms(50);
+
+    // Hold TFT deselected while the SD card owns the shared Feather SPI bus.
+    deselect_spi_cs(TFT_CS_PIN).context("failed to deselect TFT before SD init")?;
+
+    let (mut storage_status, mut storage_mount) =
+        storage::try_mount(spi_driver, pins.gpio10, storage::ADALOGGER_SD_CS_PIN);
+    if !storage_status.mounted {
+        log::info!(
+            "Storage: retrying on GPIO{} (alternate Adalogger CS)",
+            storage::ADALOGGER_SD_CS_ALT_PIN
+        );
+        (storage_status, storage_mount) =
+            storage::try_mount(spi_driver, pins.gpio33, storage::ADALOGGER_SD_CS_ALT_PIN);
+    }
+    if !storage_status.mounted {
+        log::warn!(
+            "Storage: microSD unavailable — insert a FAT32 card; tried CS GPIO{} and GPIO{}",
+            storage::ADALOGGER_SD_CS_PIN,
+            storage::ADALOGGER_SD_CS_ALT_PIN
+        );
+    }
+    let _storage_mount = storage_mount;
+
+    let tft_spi = spi::SpiDeviceDriver::new(
+        spi_driver,
         Some(pins.gpio7),
-        &spi::config::DriverConfig::new(),
         &spi::config::Config::new().baudrate(40.MHz().into()),
     )
-    .context("failed to initialize SPI for TFT")?;
+    .context("failed to initialize SPI device for TFT")?;
     let dc = PinDriver::output(pins.gpio39).context("failed to init TFT DC")?;
     let rst = PinDriver::output(pins.gpio40).context("failed to init TFT RST")?;
     let backlight = PinDriver::output(pins.gpio45).context("failed to init TFT backlight")?;
     let button = PinDriver::input(pins.gpio0).context("failed to init page button")?;
 
-    let di = SPIInterfaceNoCS::new(spi_drv, dc);
+    let di = SPIInterfaceNoCS::new(tft_spi, dc);
     let mut display = ST7789::new(di, Some(rst), Some(backlight), 240, 135);
     let mut ets = Ets;
     let backlight_on_state = display::init_display(&mut display, &mut ets)?;
 
-    let ui_feed = UiFeed::new();
+    let ui_feed = UiFeed::new(storage_status);
+    if rtc_present {
+        ui_feed.publish_rtc(rtc::RtcSnapshot {
+            detected: true,
+            utc_unix_seconds: boot_rtc_unix,
+        });
+    }
     let _ui_task = UiTaskHandle::spawn(
         Arc::clone(&ui_feed),
         display,
         button,
         i2c_drv,
         battery_monitor,
+        rtc_present,
         backlight_on_state,
     )?;
 
@@ -236,12 +313,21 @@ pub fn run() -> anyhow::Result<()> {
         log::info!("NTP: ACL restricted to {acl_cidr}");
     }
 
+    if let Some(secs) = boot_rtc_unix {
+        ntp_server.update_gps_utc_seconds(secs);
+        log::info!("RTC: seeded NTP anchor from cached time (UTC {secs})");
+    }
+
     let mut tz_store = TimezoneStore::new(default_nvs_tz).ok();
     let mut tz_worker = TimezoneWorker::spawn().ok();
     let mut tz_initialized = false;
     let mut current_tz_name: Option<String> = None;
     let mut last_tz_lookup_us = 0_i64;
     let mut last_ntp_publish_us = 0_i64;
+    let mut last_rtc_fallback_us = 0_i64;
+    let mut last_rtc_write_us = 0_i64;
+    let mut last_rtc_utc = boot_rtc_unix;
+    let mut last_storage_refresh_us = 0_i64;
 
     if let Some(store) = tz_store.as_ref() {
         match store.load_cached() {
@@ -279,6 +365,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut first_ntp_client_logged = false;
     let mut warn_no_nmea_done = false;
     let mut warn_no_pps_done = false;
+    let mut rtc_seeded_from_gps = boot_rtc_unix.is_some();
 
     loop {
         poll_gps_uart(
@@ -309,6 +396,34 @@ pub fn run() -> anyhow::Result<()> {
 
         if let Err(err) = ntp_server.poll(gps.fix) {
             log::warn!("NTP: poll failed: {}", err);
+        }
+
+        maybe_apply_rtc_fallback(
+            &ui_feed,
+            &mut ntp_server,
+            gps.fix,
+            &mut last_rtc_fallback_us,
+            &mut last_rtc_utc,
+        );
+
+        let mut now_us = monotonic_us();
+        maybe_writeback_rtc(
+            &ui_feed,
+            &ntp_server,
+            gps.fix,
+            now_us,
+            &mut last_rtc_write_us,
+        );
+
+        if storage_status.mounted
+            && (last_storage_refresh_us == 0
+                || (now_us - last_storage_refresh_us) >= STORAGE_REFRESH_US)
+        {
+            ui_feed.publish_storage(StorageStatus::refresh(
+                storage::MOUNT_POINT,
+                ui_feed.storage(),
+            ));
+            last_storage_refresh_us = now_us;
         }
 
         if bytes_seen > 0 && bytes_seen % 512 == 0 {
@@ -348,7 +463,7 @@ pub fn run() -> anyhow::Result<()> {
 
         // During holdover the dispersion grows with time; refresh the display
         // snapshot every second so the UI reflects current uncertainty.
-        let now_us = monotonic_us();
+        now_us = monotonic_us();
         if (now_us - last_ntp_publish_us) >= 1_000_000 {
             ui_feed.publish_ntp(ntp_server.ntp_snapshot(gps.fix));
             last_ntp_publish_us = now_us;
@@ -377,6 +492,13 @@ pub fn run() -> anyhow::Result<()> {
                 gps.lon,
                 elapsed_s
             );
+            if rtc_present && !rtc_seeded_from_gps {
+                if let Some(utc) = gps.utc_unix_seconds {
+                    ui_feed.request_rtc_write(utc);
+                    rtc_seeded_from_gps = true;
+                    log::info!("RTC: queued initial time set from GPS fix (UTC {utc})");
+                }
+            }
         }
 
         if !first_ntp_client_logged {
@@ -408,6 +530,80 @@ pub fn run() -> anyhow::Result<()> {
             );
         }
     }
+}
+
+/// Feed RTC-cached UTC into the NTP anchor when GPS fix is unavailable.
+fn maybe_apply_rtc_fallback(
+    ui_feed: &UiFeed,
+    ntp_server: &mut ntp::NtpServer,
+    gps_fix: bool,
+    last_rtc_fallback_us: &mut i64,
+    last_rtc_utc: &mut Option<i64>,
+) {
+    if gps_fix {
+        return;
+    }
+
+    let rtc = ui_feed.rtc();
+    if !rtc.detected {
+        return;
+    }
+    let Some(secs) = rtc.utc_unix_seconds else {
+        return;
+    };
+
+    let now_us = monotonic_us();
+    let due =
+        *last_rtc_fallback_us == 0 || (now_us - *last_rtc_fallback_us) >= RTC_FALLBACK_INTERVAL_US;
+    if !due {
+        return;
+    }
+    if last_rtc_utc != &Some(secs) {
+        log::debug!("RTC: feeding cached UTC {secs} (GPS fix lost)");
+    }
+    ntp_server.update_gps_utc_seconds(secs);
+    *last_rtc_utc = Some(secs);
+    *last_rtc_fallback_us = now_us;
+}
+
+/// Queue a PCF8523 write when GPS is locked and discipline has a valid anchor.
+fn maybe_writeback_rtc(
+    ui_feed: &UiFeed,
+    ntp_server: &ntp::NtpServer,
+    gps_fix: bool,
+    now_us: i64,
+    last_rtc_write_us: &mut i64,
+) {
+    if !gps_fix {
+        return;
+    }
+    if !matches!(
+        ntp_server.ntp_snapshot(gps_fix).state,
+        DisciplineState::Locked
+    ) {
+        return;
+    }
+    if *last_rtc_write_us != 0 && (now_us - *last_rtc_write_us) < RTC_WRITEBACK_US {
+        return;
+    }
+    if let Some(secs) = ntp_server.current_utc_unix_seconds() {
+        ui_feed.request_rtc_write(secs);
+        *last_rtc_write_us = now_us;
+    }
+}
+
+/// Drive a SPI chip-select GPIO high before another device uses the shared bus.
+fn deselect_spi_cs(pin: i32) -> anyhow::Result<()> {
+    use esp_idf_svc::sys::{
+        GPIO_MODE_DEF_OUTPUT, gpio_reset_pin, gpio_set_direction, gpio_set_level,
+    };
+
+    esp_idf_svc::sys::esp!(unsafe {
+        gpio_reset_pin(pin);
+        gpio_set_direction(pin, GPIO_MODE_DEF_OUTPUT);
+        gpio_set_level(pin, 1)
+    })
+    .context("failed to configure SPI CS GPIO")
 }
 
 /// Read monotonic time from the ESP high-resolution timer.

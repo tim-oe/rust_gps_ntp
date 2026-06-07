@@ -10,7 +10,7 @@ use anyhow::Context;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::gpio::{self, Input, PinDriver, Pull};
 use esp_idf_svc::hal::i2c;
-use portable_atomic::AtomicU32;
+use portable_atomic::{AtomicI64, AtomicU32};
 use st7789::{BacklightState, ST7789};
 use std::sync::atomic::Ordering;
 
@@ -18,18 +18,24 @@ use crate::battery::{self, BatteryMonitor, BatterySnapshot};
 use crate::display::{self, Page};
 use crate::gps::GpsSnapshot;
 use crate::ntp::NtpSnapshot;
+use crate::rtc::{self, RtcSnapshot};
+use crate::storage::StorageStatus;
 
 const UI_TASK_STACK_BYTES: usize = 16_384;
 const BATTERY_SAMPLE_US: i64 = 5_000_000;
+const RTC_SAMPLE_US: i64 = 1_000_000;
 const DRAW_INTERVAL_US: i64 = 5_000_000;
 const SCREEN_BLANK_US: i64 = 15_000_000;
 const UI_LOOP_DELAY_MS: u32 = 10;
 
-/// Shared GPS, PPS, and NTP discipline samples written by the main loop and read by the UI task.
+/// Shared GPS, PPS, NTP discipline, RTC, and storage samples written by tasks.
 pub struct UiFeed {
     gps: RwLock<GpsSnapshot>,
     pps_delta_us: AtomicU32,
     ntp: RwLock<NtpSnapshot>,
+    rtc: RwLock<RtcSnapshot>,
+    storage: RwLock<StorageStatus>,
+    rtc_write_pending: AtomicI64,
 }
 
 impl UiFeed {
@@ -40,11 +46,14 @@ impl UiFeed {
     ///
     /// # Returns
     /// - `Arc<UiFeed>` ready to share between the main loop and UI task.
-    pub fn new() -> Arc<Self> {
+    pub fn new(storage: StorageStatus) -> Arc<Self> {
         Arc::new(Self {
             gps: RwLock::new(GpsSnapshot::default()),
             pps_delta_us: AtomicU32::new(0),
             ntp: RwLock::new(NtpSnapshot::default()),
+            rtc: RwLock::new(RtcSnapshot::default()),
+            storage: RwLock::new(storage),
+            rtc_write_pending: AtomicI64::new(0),
         })
     }
 
@@ -85,14 +94,44 @@ impl UiFeed {
         }
     }
 
-    /// Read a consistent GPS snapshot, PPS delta, and NTP snapshot for one draw pass.
+    /// Publish the latest cached RTC sample (for example after a boot-time read).
+    pub fn publish_rtc(&self, snap: RtcSnapshot) {
+        if let Ok(mut guard) = self.rtc.write() {
+            *guard = snap;
+        }
+    }
+
+    /// Read the latest cached RTC sample for GPS-loss time fallback.
+    pub fn rtc(&self) -> RtcSnapshot {
+        self.rtc.read().map(|guard| *guard).unwrap_or_default()
+    }
+
+    /// Queue a disciplined UTC write to the PCF8523 (handled by the UI task).
+    pub fn request_rtc_write(&self, utc_unix_seconds: i64) {
+        self.rtc_write_pending
+            .store(utc_unix_seconds, Ordering::Relaxed);
+    }
+
+    /// Read cached microSD storage status for the Resources page.
+    pub fn storage(&self) -> StorageStatus {
+        self.storage.read().map(|guard| *guard).unwrap_or_default()
+    }
+
+    /// Update storage status after mount or periodic refresh.
+    pub fn publish_storage(&self, status: StorageStatus) {
+        if let Ok(mut guard) = self.storage.write() {
+            *guard = status;
+        }
+    }
+
+    /// Read a consistent GPS snapshot, PPS delta, NTP snapshot, and storage for one draw pass.
     ///
     /// # Parameters
     /// - `self`: Shared feed state.
     ///
     /// # Returns
     /// - Tuple of cloned GPS snapshot, PPS delta in microseconds, and NTP snapshot.
-    fn snapshot(&self) -> (GpsSnapshot, u32, NtpSnapshot) {
+    fn snapshot(&self) -> (GpsSnapshot, u32, NtpSnapshot, StorageStatus) {
         let gps = self
             .gps
             .read()
@@ -100,7 +139,8 @@ impl UiFeed {
             .unwrap_or_default();
         let pps_delta_us = self.pps_delta_us.load(Ordering::Relaxed);
         let ntp = self.ntp.read().map(|guard| *guard).unwrap_or_default();
-        (gps, pps_delta_us, ntp)
+        let storage = self.storage();
+        (gps, pps_delta_us, ntp, storage)
     }
 }
 
@@ -118,6 +158,7 @@ impl UiTaskHandle {
     /// - `button`: Page/wake button on `GPIO0` (moved into the UI task).
     /// - `i2c_drv`: I2C driver for battery monitor reads (moved into the UI task).
     /// - `battery_monitor`: Detected gauge type, if any, for periodic sampling.
+    /// - `rtc_present`: Whether a PCF8523 RTC was detected on the I2C bus.
     /// - `backlight_on_state`: Backlight level that represents the panel-on state.
     ///
     /// # Returns
@@ -130,6 +171,7 @@ impl UiTaskHandle {
         mut button: PinDriver<'static, gpio::Gpio0, Input>,
         mut i2c_drv: i2c::I2cDriver<'static>,
         battery_monitor: Option<BatteryMonitor>,
+        rtc_present: bool,
         backlight_on_state: BacklightState,
     ) -> anyhow::Result<Self>
     where
@@ -167,6 +209,7 @@ impl UiTaskHandle {
                     &mut button,
                     &mut i2c_drv,
                     battery_monitor,
+                    rtc_present,
                     backlight_on_state,
                 );
             })
@@ -205,6 +248,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
     button: &mut PinDriver<'static, gpio::Gpio0, Input>,
     i2c_drv: &mut i2c::I2cDriver<'static>,
     battery_monitor: Option<BatteryMonitor>,
+    rtc_present: bool,
     backlight_on_state: BacklightState,
 ) where
     DI: display_interface::WriteOnlyDataCommand,
@@ -219,6 +263,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
     let mut ets = Ets;
     let mut battery = BatterySnapshot::default();
     let mut last_battery_us = 0_i64;
+    let mut last_rtc_us = 0_i64;
     let mut last_draw_us = 0_i64;
     let mut last_button_pressed = false;
     let mut screen_on = true;
@@ -238,6 +283,36 @@ fn ui_task_main<DI, RST, BL, PinE>(
                 }
             }
             last_battery_us = now_us;
+        }
+
+        if rtc_present {
+            let pending_write = feed.rtc_write_pending.swap(0, Ordering::Relaxed);
+            if pending_write > 0 {
+                match rtc::write_unix_seconds(i2c_drv, pending_write) {
+                    Ok(()) => log::debug!("RTC: wrote UTC {pending_write} from discipline"),
+                    Err(err) => log::warn!("RTC: write failed: {err}"),
+                }
+            }
+
+            if last_rtc_us == 0 || (now_us - last_rtc_us) >= RTC_SAMPLE_US {
+                let snap = match rtc::read_unix_seconds(i2c_drv) {
+                    Ok(secs) => RtcSnapshot {
+                        detected: true,
+                        utc_unix_seconds: Some(secs),
+                    },
+                    Err(err) => {
+                        log::debug!("RTC: read failed: {err}");
+                        RtcSnapshot {
+                            detected: true,
+                            utc_unix_seconds: None,
+                        }
+                    }
+                };
+                if let Ok(mut guard) = feed.rtc.write() {
+                    *guard = snap;
+                }
+                last_rtc_us = now_us;
+            }
         }
 
         let button_pressed = !button.is_high();
@@ -266,9 +341,17 @@ fn ui_task_main<DI, RST, BL, PinE>(
         }
 
         if screen_on && (force_redraw || (now_us - last_draw_us) >= DRAW_INTERVAL_US) {
-            let (gps, pps_delta_us, ntp) = feed.snapshot();
+            let (gps, pps_delta_us, ntp, storage) = feed.snapshot();
             let mut panel = display::make_panel(display);
-            display::draw_page(&mut panel, current_page, &gps, &battery, pps_delta_us, &ntp);
+            display::draw_page(
+                &mut panel,
+                current_page,
+                &gps,
+                &battery,
+                pps_delta_us,
+                &ntp,
+                storage,
+            );
             if !rendered_once {
                 log::trace!("Display diag: first frame rendered");
                 rendered_once = true;

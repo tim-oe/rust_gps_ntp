@@ -19,6 +19,7 @@ use st7789::{BacklightState, Orientation, ST7789};
 use crate::battery::BatterySnapshot;
 use crate::gps::GpsSnapshot;
 use crate::ntp::{DisciplineState, NtpSnapshot};
+use crate::storage::StorageStatus;
 
 pub const DISPLAY_DEBUG_ALWAYS_ON: bool = false;
 pub const DISPLAY_BACKLIGHT_ACTIVE_LOW: bool = false;
@@ -407,6 +408,7 @@ fn format_unsigned_us(value_us: u32) -> String {
 /// - `battery`: Latest battery snapshot.
 /// - `pps_delta_us`: Last observed PPS interval delta in microseconds.
 /// - `ntp`: Latest NTP discipline snapshot.
+/// - `storage`: MicroSD mount status, when available.
 ///
 /// # Returns
 /// - No return value; draw errors are logged.
@@ -417,6 +419,7 @@ pub fn draw_page<D>(
     battery: &BatterySnapshot,
     pps_delta_us: u32,
     ntp: &NtpSnapshot,
+    storage: StorageStatus,
 ) where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
@@ -454,16 +457,27 @@ pub fn draw_page<D>(
         Page::Resources => {
             let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
             let min_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
-            // We don't have a filesystem yet, so show app partition size as storage capacity.
-            let storage_part_bytes = unsafe {
-                let p = esp_idf_svc::sys::esp_ota_get_running_partition();
-                if p.is_null() { 0_u64 } else { (*p).size as u64 }
-            };
             line("Page 3/5  RESOURCES".to_owned());
-            line(format!(
-                "Storage part: {}",
-                format_human_bytes(storage_part_bytes)
-            ));
+            if storage.mounted {
+                line(format!(
+                    "SD free: {}",
+                    format_human_bytes(storage.free_bytes)
+                ));
+                line(format!(
+                    "SD total: {}",
+                    format_human_bytes(storage.total_bytes)
+                ));
+            } else {
+                let storage_part_bytes = unsafe {
+                    let p = esp_idf_svc::sys::esp_ota_get_running_partition();
+                    if p.is_null() { 0_u64 } else { (*p).size as u64 }
+                };
+                line(format!("SD: not mounted",));
+                line(format!(
+                    "App part: {}",
+                    format_human_bytes(storage_part_bytes)
+                ));
+            }
             line(format!(
                 "Heap free: {}",
                 format_human_bytes(free_heap as u64)
