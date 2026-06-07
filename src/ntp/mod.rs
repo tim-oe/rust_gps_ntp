@@ -581,6 +581,20 @@ impl NtpServer {
         }
     }
 
+    /// Returns `true` when the source may proceed, `false` when rate-limited.
+    fn try_rate_limit(&mut self, src_ip_v4: Option<u32>) -> bool {
+        let Some(ip) = src_ip_v4 else {
+            return true;
+        };
+        let now_us = monotonic_us_now();
+        if self.rate_limiter.check(ip, now_us) {
+            true
+        } else {
+            self.rate_limited_total += 1;
+            false
+        }
+    }
+
     /// Poll and serve all immediately available NTP packets.
     ///
     /// # Parameters
@@ -627,6 +641,10 @@ impl NtpServer {
                                 );
                                 continue;
                             }
+                            if !self.try_rate_limit(src_ip_v4) {
+                                log::debug!("NTP: mode-6 rate limited from {}", peer);
+                                continue;
+                            }
                             let dp = self.discipline_params(gps_fix);
                             let resp = build_mode6_response(
                                 &req[..len],
@@ -651,21 +669,15 @@ impl NtpServer {
                                 continue;
                             }
 
-                            // Rate limit mode-3 (client) and mode-1 (symmetric) requests.
-                            // Mode-6 (ntpq) is exempt so admin queries are never throttled.
-                            if mode == 3
-                                && let Some(ip) = src_ip_v4
-                            {
-                                let now_us = monotonic_us_now();
-                                if !self.rate_limiter.check(ip, now_us) {
-                                    self.rate_limited_total += 1;
-                                    let mut req48 = [0_u8; NTP_PACKET_LEN];
-                                    req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
-                                    let resp = build_kod_response(&req48, version);
-                                    let _ = self.socket.send_to(&resp, peer);
-                                    log::debug!("NTP: KoD RATE sent to {} (rate limited)", peer);
-                                    continue;
-                                }
+                            // Rate limit mode-3 (client) requests; mode-6 uses the
+                            // same limiter but drops silently to avoid amplification.
+                            if mode == 3 && !self.try_rate_limit(src_ip_v4) {
+                                let mut req48 = [0_u8; NTP_PACKET_LEN];
+                                req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
+                                let resp = build_kod_response(&req48, version);
+                                let _ = self.socket.send_to(&resp, peer);
+                                log::debug!("NTP: KoD RATE sent to {} (rate limited)", peer);
+                                continue;
                             }
 
                             let mut req48 = [0_u8; NTP_PACKET_LEN];
@@ -1971,8 +1983,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_mode6_not_rate_limited() {
-        // ntpq (mode-6) queries should never be rate-limited even if sent rapidly.
+    fn poll_mode6_rate_limited_on_rapid_poll() {
         let mut server = NtpServer::new_for_test().expect("server");
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
         client
@@ -1980,24 +1991,63 @@ mod tests {
             .unwrap();
         let server_addr = server.socket.local_addr().unwrap();
 
-        // Mode-6 request.
         let mut req = [0_u8; NTP_CONTROL_HEADER_LEN];
         req[0] = (4 << 3) | 6; // VN=4, Mode=6
         req[1] = MODE6_OPCODE_READVAR;
 
         let mut buf = [0_u8; 256];
-        for _ in 0..3 {
-            client.send_to(&req, server_addr).unwrap();
-            server.poll(false).unwrap();
-            let (n, _) = client.recv_from(&mut buf).unwrap();
-            assert!(
-                n >= NTP_CONTROL_HEADER_LEN,
-                "mode-6 should always get a response"
-            );
-        }
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(false).unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert!(
+            n >= NTP_CONTROL_HEADER_LEN,
+            "first mode-6 request should get a response"
+        );
+
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(false).unwrap();
+        assert!(
+            client.recv_from(&mut buf).is_err(),
+            "rapid mode-6 poll should be silently dropped"
+        );
         assert_eq!(
-            server.rate_limited_total, 0,
-            "mode-6 should not be rate-limited"
+            server.rate_limited_total, 1,
+            "mode-6 should increment rate_limited counter"
+        );
+    }
+
+    #[test]
+    fn poll_mode6_allowed_again_after_rate_limit_window() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        let mut req = [0_u8; NTP_CONTROL_HEADER_LEN];
+        req[0] = (4 << 3) | 6;
+        req[1] = MODE6_OPCODE_READVAR;
+
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(false).unwrap();
+        let mut buf = [0_u8; 256];
+        let _ = client.recv_from(&mut buf).unwrap();
+
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(false).unwrap();
+        assert!(client.recv_from(&mut buf).is_err());
+
+        server
+            .rate_limiter
+            .subtract_time(protection::MIN_POLL_INTERVAL_US + 1);
+
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(false).unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert!(
+            n >= NTP_CONTROL_HEADER_LEN,
+            "mode-6 should be served again after rate-limit window"
         );
     }
 

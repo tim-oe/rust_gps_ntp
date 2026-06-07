@@ -40,7 +40,7 @@ Status legend: `[ ]` open · `[x]` resolved.
   reflect that allow-all is the shipped default.
 
 ### P1-2 · Mode-6 is an unauthenticated amplification/reflection vector
-- [ ] **File:** `src/ntp/mod.rs:648-663` (mode-6 exempt from rate limiting)
+- [x] **File:** `src/ntp/mod.rs:648-663` (mode-6 exempt from rate limiting)
 - **Symptom:** A 12-byte `READVAR` request yields a ~200+ byte response, with no
   rate limit and (by default) no ACL. With a spoofed source this is a classic
   NTP reflection/amplification primitive.

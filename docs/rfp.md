@@ -54,7 +54,7 @@ GPS NMEA + PPS.
 
 - [x] Per-client rate limiting (32-entry LRU table, 2 s min poll interval)
   with Kiss-o'-Death RATE responses for fast-polling clients (RFC 5905 §7.4);
-  mode-6 queries exempt
+  mode-6 queries share the limiter and are silently dropped when over limit
 - [x] IP ACL allowlist (`Acl::allow_all` / `deny_all` / `private_lan`);
   `private_lan` covers `127/8`, `10/8`, `172.16/12`, `192.168/16`
 - [x] Leap indicator API (`set_leap_indicator(0–2)`) with RFC 5905 §7.3

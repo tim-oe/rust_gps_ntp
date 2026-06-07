@@ -329,7 +329,9 @@ A fixed-size table of 32 `ClientRecord` entries tracks the last accepted monoton
 3. If found and interval is sufficient: update `last_us`, serve normally.
 4. If not found: add a new entry (evicting the oldest `last_us` when the table is full), serve normally.
 
-Mode-6 (ntpq) queries are never rate-limited so administrative monitoring is unaffected.
+Mode-6 (`ntpq`) queries share the same per-client limiter. When a mode-6
+request exceeds the interval the packet is silently dropped (no response) to
+avoid amplification; mode-3 over-limit clients receive a KoD RATE response instead.
 
 #### Kiss-o'-Death (KoD) Response
 
