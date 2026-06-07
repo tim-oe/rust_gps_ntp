@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_gga_rejects_short_sentence() {
+    fn parse_gga_rejects_malformed_satellite_field() {
         let mut gps = GpsSnapshot::default();
         let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08*7D";
         assert_eq!(parse_gga(gga, &mut gps), None);

@@ -1332,6 +1332,25 @@ mod tests {
         fn pps_now(&mut self, pps_interval_us: Option<u32>) {
             self.observe_pps_pulse(pps_interval_us, monotonic_us_now());
         }
+
+        /// Test helper: simulate a PPS edge at an explicit monotonic timestamp.
+        fn pps_at(&mut self, pps_interval_us: Option<u32>, edge_us: i64) {
+            self.observe_pps_pulse(pps_interval_us, edge_us);
+        }
+
+        /// Test helper: simulate a PPS edge that occurred `ago_us` before now.
+        fn pps_stale_ago(&mut self, pps_interval_us: Option<u32>, ago_us: i64) {
+            self.pps_at(pps_interval_us, monotonic_us_now().saturating_sub(ago_us));
+        }
+    }
+
+    /// Decode an NTP 64-bit timestamp to Unix epoch microseconds.
+    fn ntp_timestamp_to_unix_us(ts: u64) -> i64 {
+        let ntp_seconds = (ts >> 32) as i64;
+        let unix_seconds = ntp_seconds - NTP_UNIX_EPOCH_OFFSET_SECS as i64;
+        let fraction = ts & 0xFFFF_FFFF;
+        let micros = (fraction as i128 * 1_000_000 / (1i128 << 32)) as i64;
+        unix_seconds * MICROS_PER_SEC + micros
     }
 
     fn client_ntp_request() -> [u8; NTP_PACKET_LEN] {
@@ -1367,6 +1386,16 @@ mod tests {
     }
 
     #[test]
+    fn first_pps_pulse_applies_nmea_pps_fudge_to_anchor() {
+        let gps_utc = 1_700_000_000_i64;
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(gps_utc);
+        server.pps_now(None);
+        let anchor = server.clock_anchor.expect("anchor");
+        assert_eq!(anchor.unix_seconds, gps_utc + NMEA_PPS_FUDGE_S);
+    }
+
+    #[test]
     fn observe_pps_pulse_valid_interval_advances_anchor() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
@@ -1390,10 +1419,13 @@ mod tests {
 
     #[test]
     fn poll_serves_client_time_request() {
+        let gps_utc = 1_700_000_000_i64;
         let mut server = NtpServer::new_for_test().expect("test socket");
         let addr = server.socket.local_addr().expect("local addr");
-        server.update_gps_utc_seconds(1_700_000_000);
+        server.update_gps_utc_seconds(gps_utc);
         server.pps_now(None);
+
+        let expected_us = ntp_timestamp_to_unix_us(server.current_ntp_timestamp());
 
         let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
         client
@@ -1406,6 +1438,18 @@ mod tests {
         assert_eq!(len, NTP_PACKET_LEN);
         assert_eq!(resp[0] & 0x07, 4);
         assert_eq!(resp[1], 1);
+
+        let transmit_ts = u64::from_be_bytes(resp[40..48].try_into().unwrap());
+        let transmit_us = ntp_timestamp_to_unix_us(transmit_ts);
+        let anchor_unix = gps_utc + NMEA_PPS_FUDGE_S;
+        assert!(
+            (transmit_us - anchor_unix * MICROS_PER_SEC).abs() < 5_000_000,
+            "transmit time should track anchored GPS second {anchor_unix}"
+        );
+        assert!(
+            (transmit_us - expected_us).abs() < 5_000,
+            "transmit timestamp should be within 5 ms of server clock"
+        );
     }
 
     #[test]
@@ -1665,10 +1709,7 @@ mod tests {
     fn discipline_params_stale_pps_and_no_gps_fix_gives_stratum_16() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Simulate deep holdover (PPS stale beyond unsync threshold).
-        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
-        server.last_pps_monotonic_us = Some(past_us);
+        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
         let dp = server.discipline_params(false);
         assert_eq!(dp.stratum, 16);
         assert_eq!(dp.leap, 3);
@@ -1685,10 +1726,7 @@ mod tests {
     fn holdover_dispersion_grows_after_pps_loss() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Simulate PPS that arrived 60 s into holdover (10s entry + 60s growth).
-        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 60 * MICROS_PER_SEC);
-        server.last_pps_monotonic_us = Some(past_us);
+        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 60 * MICROS_PER_SEC);
         let dp = server.discipline_params(true);
         // Expected disp = BASE_DISP_US + 60 * RATE = 1000 + 30000 = 31000 us = 31 ms.
         assert!(
@@ -1708,12 +1746,8 @@ mod tests {
     fn holdover_declares_stratum_16_when_dispersion_exceeds_1s() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Need dispersion >= HOLDOVER_UNSYNC_US (1_000_000 us):
-        // BASE + secs * RATE >= 1_000_000  →  secs >= (1_000_000 - 1_000) / 500 = 1998 s
         let holdover_secs = 2_010_i64;
-        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + holdover_secs * MICROS_PER_SEC);
-        server.last_pps_monotonic_us = Some(past_us);
+        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + holdover_secs * MICROS_PER_SEC);
         let dp = server.discipline_params(true);
         assert_eq!(
             dp.stratum, 16,
@@ -1726,12 +1760,8 @@ mod tests {
     fn holdover_stratum_1_restored_after_pps_returns() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Force into deep holdover.
-        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
-        server.last_pps_monotonic_us = Some(past_us);
+        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
         assert_eq!(server.discipline_params(true).stratum, 16);
-        // Simulate PPS returning.
         server.pps_now(Some(1_000_000));
         let dp = server.discipline_params(true);
         assert_eq!(
@@ -2158,6 +2188,50 @@ mod tests {
             server.acl_blocked_total, 1,
             "acl_blocked counter should increment"
         );
+    }
+
+    #[test]
+    fn poll_allows_loopback_with_private_lan_acl() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        server.set_acl(Acl::private_lan());
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.pps_now(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        client.send_to(&client_ntp_request(), server_addr).unwrap();
+        server.poll(true).unwrap();
+
+        let mut buf = [0_u8; NTP_PACKET_LEN];
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_eq!(server.acl_blocked_total, 0);
+    }
+
+    #[test]
+    fn poll_blocks_loopback_outside_configured_cidr() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        server.set_acl(Acl::from_config("192.168.1.0/24"));
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        client.send_to(&client_ntp_request(), server_addr).unwrap();
+        server.poll(true).unwrap();
+
+        let mut buf = [0_u8; NTP_PACKET_LEN];
+        assert!(
+            client.recv_from(&mut buf).is_err(),
+            "127.0.0.1 should be blocked by 192.168.1.0/24 ACL"
+        );
+        assert_eq!(server.acl_blocked_total, 1);
     }
 
     #[test]
@@ -2655,15 +2729,9 @@ mod tests {
 
     #[test]
     fn ntp_snapshot_state_holdover_when_pps_becomes_stale() {
-        // Anchor valid but PPS older than HOLDOVER_ENTRY_US → Holdover.
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Age the last PPS timestamp past the holdover threshold.
-        let stale_offset = HOLDOVER_ENTRY_US + 1_000_000;
-        if let Some(ref mut t) = server.last_pps_monotonic_us {
-            *t -= stale_offset;
-        }
+        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 1_000_000);
         let snap = server.ntp_snapshot(true);
         assert_eq!(snap.state, DisciplineState::Holdover);
     }
@@ -2696,10 +2764,7 @@ mod tests {
         assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
 
         // PPS becomes stale → Holdover even with GPS fix.
-        let stale_offset = HOLDOVER_ENTRY_US + 1_000_000;
-        if let Some(ref mut t) = server.last_pps_monotonic_us {
-            *t -= stale_offset;
-        }
+        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 1_000_000);
         assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Holdover);
 
         // PPS returns (new pulse) → Locked.

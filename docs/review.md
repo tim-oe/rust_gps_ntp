@@ -107,22 +107,22 @@ Status legend: `[ ]` open · `[x]` resolved.
 The suite is strong (asserts concrete values and wire-format bytes, not just
 execution). Gaps where tests check structure but not correctness:
 
-- [ ] **P4-1 · No end-to-end "serves the right time" assertion.**
+- [x] **P4-1 · No end-to-end "serves the right time" assertion.**
   `src/ntp/mod.rs:1332` (`poll_serves_client_time_request`) checks only mode and
   stratum, never decodes `resp[40..48]` to confirm the transmit timestamp ≈
   anchored GPS time. Add: set a known anchor, `poll()`, decode transmit ts,
   assert within a few ms.
-- [ ] **P4-2 · PPS→second fudge untested.** No test asserts
+- [x] **P4-2 · PPS→second fudge untested.** No test asserts
   `clock_anchor.unix_seconds == gps_utc + NMEA_PPS_FUDGE_S`
   (`src/ntp/mod.rs:373,426`).
 - [x] **P4-3 · Mode-coverage of rate limiter untested.** No test sends a
   non-mode-3 client packet; this gap hid P1-3.
-- [ ] **P4-4 · ACL default/`private_lan` not integration-tested.** Only
+- [x] **P4-4 · ACL default/`private_lan` not integration-tested.** Only
   `deny_all()` is exercised through `poll()`.
-- [ ] **P4-5 · Mislabeled test.** `parse_gga_rejects_short_sentence`
+- [x] **P4-5 · Mislabeled test.** `parse_gga_rejects_short_sentence`
   (`src/gps.rs:350`) uses a sentence that is not short; it is rejected by
   checksum/field-parse. Rename to reflect intent.
-- [ ] **P4-6 · Holdover tests poke private fields.** Tests set
+- [x] **P4-6 · Holdover tests poke private fields.** Tests set
   `last_pps_monotonic_us` directly rather than driving the public pulse API with
   injected time; couples tests to internals.
 
