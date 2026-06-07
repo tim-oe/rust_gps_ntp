@@ -13,6 +13,14 @@ CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 # Allow per-module overrides to raise debug/trace at runtime.
 CONFIG_LOG_MAXIMUM_LEVEL_VERBOSE=y
 
+# Enable mDNS so the device is discoverable as gps-ntp.local on the LAN.
+CONFIG_MDNS_ENABLED=y
+CONFIG_MDNS_MAX_SERVICES=4
+
+# Hostname used by the DHCP client (option 12) and as the mDNS base name.
+# Change this to rename the device on the network without recompiling Rust code.
+CONFIG_LWIP_LOCAL_HOSTNAME="gps-ntp"
+
 # module log levels
 # LOG_GPS_LEVEL=trace
 # LOG_PPS_LEVEL=trace

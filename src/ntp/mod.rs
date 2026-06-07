@@ -1969,7 +1969,133 @@ mod tests {
         );
     }
 
-    // --- Item 5: leap-second and long-run edge case tests ---
+    /// KoD response must echo the client's transmit timestamp in the originate
+    /// field (bytes 24-31 = client bytes 40-47) per RFC 5905 §7.4.
+    #[test]
+    fn poll_kod_response_echoes_client_transmit_timestamp() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (4 << 3) | 3;
+        // Write a distinct transmit timestamp into the request.
+        let client_xmit: u64 = 0xDEAD_BEEF_CAFE_1234;
+        req[40..48].copy_from_slice(&client_xmit.to_be_bytes());
+        let mut buf = [0_u8; 64];
+
+        // First request — accepted normally (consume the slot so next is KoD).
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        client.recv_from(&mut buf).unwrap();
+
+        // Second immediate request — should receive KoD RATE.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_eq!(buf[1], 0, "KoD stratum must be 0");
+        assert_eq!(&buf[12..16], b"RATE", "KoD refid must be RATE");
+        let originate = u64::from_be_bytes(buf[24..32].try_into().unwrap());
+        assert_eq!(
+            originate, client_xmit,
+            "KoD originate must echo client transmit timestamp (RFC 5905 §7.4)"
+        );
+    }
+
+    /// After a client is rate-limited, the rate-limited counter must be visible
+    /// through `ntp_snapshot` so the UI and operator can observe it.
+    #[test]
+    fn poll_rate_limited_counter_visible_in_snapshot() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (4 << 3) | 3;
+        let mut buf = [0_u8; 64];
+
+        // First request — allowed.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        client.recv_from(&mut buf).unwrap();
+
+        // Second request immediately — triggers KoD + increments counter.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        client.recv_from(&mut buf).unwrap();
+
+        let snap = server.ntp_snapshot(true);
+        assert_eq!(
+            snap.rate_limited, 1,
+            "rate_limited must be 1 in NtpSnapshot"
+        );
+        // KoD responses do not increment served; only the first (allowed) request does.
+        assert_eq!(
+            snap.served, 1,
+            "served should count only the allowed response"
+        );
+    }
+
+    /// After a KoD is sent the rate limiter must NOT update `last_us`, so the
+    /// client is allowed again once `MIN_POLL_INTERVAL_US` has elapsed since the
+    /// original accepted request.
+    #[test]
+    fn poll_client_allowed_again_after_rate_limit_window() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (4 << 3) | 3;
+        let mut buf = [0_u8; 64];
+
+        // First request — allowed.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        client.recv_from(&mut buf).unwrap();
+
+        // Second request immediately — KoD.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        client.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[1], 0, "second response should be KoD");
+
+        // Advance the rate limiter's clock past the min poll interval by
+        // winding back every entry's last_us without real sleeps.
+        server
+            .rate_limiter
+            .subtract_time(protection::MIN_POLL_INTERVAL_US + 1);
+
+        // Third request after the window — should be served normally again.
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_ne!(buf[1], 0, "third response should be a normal NTP reply");
+        assert_eq!(
+            server.rate_limited_total, 1,
+            "only one KoD should have been sent"
+        );
+    }
 
     // -- Leap indicator tests --
 

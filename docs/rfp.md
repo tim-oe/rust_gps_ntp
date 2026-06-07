@@ -69,7 +69,7 @@ GPS NMEA + PPS.
 
 ### M6 — Testing and interoperability
 
-- [x] 118 host unit tests across all pure modules (`just test`)
+- [x] 121 host unit tests across all pure modules (`just test`)
   - Timestamp math: RFC 868 epoch offset, NTP fraction encoding, frequency
     correction
   - Sync state machine: Locked → Holdover → Unsync full-cycle transitions
@@ -77,10 +77,15 @@ GPS NMEA + PPS.
   - Mode-6 framing: 32-bit alignment, zero padding, response bit, originate
     echo (RFC 5905 §7.3), VN mirror
   - Service protection: ACL CIDR matching, rate-limiter LRU eviction, KoD
-    on rapid poll, poll-level integration
+    on rapid poll, KoD originate echo (RFC 5905 §7.4), rate-limited counter
+    snapshot, retry-after-backoff, poll-level integration
 - [x] Interop compatibility notes (`docs/interop.md`) for `ntpd`, `chronyd`,
   `systemd-timesyncd`, and `ntpsec` including iburst KoD interaction,
-  `maxdistance` holdover windows, and a 6-step on-device validation checklist
+  `maxdistance` holdover windows, and a 7-step on-device validation checklist
+- [x] mDNS registration (`gps-ntp.local`, `_ntp._udp` port 123) for zero-config
+  device discovery (`CONFIG_MDNS_ENABLED=y` in `sdkconfig.defaults`);
+  resolve with `ping gps-ntp.local`, `dns-sd -G v4 gps-ntp.local` (macOS),
+  or `resolvectl query gps-ntp.local` (Linux systemd)
 
 ---
 

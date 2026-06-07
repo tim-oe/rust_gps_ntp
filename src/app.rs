@@ -25,7 +25,8 @@ use crate::pps::{PpsEvent, PpsMonitor, PpsPollState};
 use crate::timezone::{TimezoneStore, TimezoneWorker};
 use crate::ui_task::{UiFeed, UiTaskHandle};
 use crate::wifi;
-
+#[cfg(esp_idf_comp_mdns_enabled)]
+use esp_idf_svc::mdns::EspMdns;
 /// GPS module UART TX pin used for NMEA output from the FeatherWing.
 pub const GPS_UART_TX_PIN: i32 = 1;
 /// GPS module UART RX pin used for NMEA input to the ESP32.
@@ -65,6 +66,37 @@ pub fn run() -> anyhow::Result<()> {
     let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()
         .context("failed to take system event loop")?;
     let _wifi = wifi::connect_wifi_sta(modem, sys_loop, default_nvs, &wifi_creds)?;
+
+    // Register the device on the LAN as <DEVICE_HOSTNAME>.local with an _ntp._udp
+    // service record so clients and scripts can find it without reading the serial log.
+    // The hostname is read from CONFIG_LWIP_LOCAL_HOSTNAME in sdkconfig.defaults at
+    // compile time via build.rs; change it there to rename the device.
+    // Requires CONFIG_MDNS_ENABLED=y in sdkconfig.defaults (see sdkconfig.defaults).
+    #[cfg(esp_idf_comp_mdns_enabled)]
+    let _mdns = match EspMdns::take() {
+        Ok(mut mdns) => {
+            let hostname_ok = mdns.set_hostname(env!("DEVICE_HOSTNAME")).is_ok();
+            let instance_ok = mdns.set_instance_name("GPS+PPS NTP Server").is_ok();
+            let service_ok = mdns
+                .add_service(None, "_ntp", "_udp", 123, &[("stratum", "1")])
+                .is_ok();
+            if hostname_ok && instance_ok && service_ok {
+                log::info!(
+                    "mDNS: registered as {}.local (_ntp._udp port 123)",
+                    env!("DEVICE_HOSTNAME")
+                );
+            } else {
+                log::warn!(
+                    "mDNS: partial registration failure (hostname={hostname_ok} instance={instance_ok} service={service_ok})"
+                );
+            }
+            Some(mdns)
+        }
+        Err(err) => {
+            log::warn!("mDNS: failed to acquire singleton: {}", err);
+            None
+        }
+    };
 
     let uart_cfg = uart::config::Config::default().baudrate(Hertz(9_600));
     let gps_uart = UartDriver::new(

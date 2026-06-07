@@ -126,19 +126,26 @@ server 192.168.1.100 prefer minpoll 6 maxpoll 10
 
 Before deploying in a production environment, validate the following:
 
-1. **`ntpq -pnu <ip>`** — verify the server appears in the peer list with `*`
-   (system peer selected) and stratum 1.
-2. **`ntpq -c "rv 0" <ip>`** — confirm `refid=GPS`, `stratum=1`, `leap=00`,
-   and that `reftime` and `clock` fields show recent hexadecimal NTP timestamps.
-3. **Hold the GPS antenna stationary** for at least 5 minutes and confirm that
+1. **Discover the device** — after boot the device registers itself as
+   `gps-ntp.local` via mDNS (`CONFIG_MDNS_ENABLED=y`).  Resolve it with:
+   - **Any OS**: `ping gps-ntp.local`
+   - **macOS**: `dns-sd -G v4 gps-ntp.local`
+   - **Linux (systemd)**: `resolvectl query gps-ntp.local`
+   - **Linux (avahi)**: `avahi-resolve -n gps-ntp.local`
+
+   The DHCP IP is also logged at boot: `Wi-Fi: connected; STA IP: x.x.x.x`.
+   NTP tools accept the hostname directly: `ntpq -pnu gps-ntp.local`.
+2. **`ntpq -pnu gps-ntp.local`** — verify the server appears in the peer list
+   with `*` (system peer selected) and stratum 1.
+3. **`ntpq -c "rv 0" gps-ntp.local`** — confirm `refid=GPS`, `stratum=1`,
+   `leap=00`, and that `reftime` and `clock` fields show recent NTP timestamps.
+4. **Hold the GPS antenna stationary** for at least 5 minutes and confirm that
    `offset` in `ntpq` output is less than 1 ms and `jitter` is below 500 µs.
-4. **Simulate holdover** by disconnecting the GPS fix input; verify that
+5. **Simulate holdover** by disconnecting the GPS fix input; verify that
    responding clients observe stratum rising toward 16 as dispersion grows, and
    that ntpd/chronyd drops the server from the selection set within the expected
    holdover window (~50–100 min depending on client `maxdistance`).
-5. **Rate-limit test** — `ntpdate -q <ip>` (which sends a quick single query)
-   should succeed; rapid repeated `ntpdate` calls within 2 s should receive KoD
-   `RATE` and back off without crashing the client.
-6. **Leap second test (optional)** — use `server.set_leap_indicator(1)` to
-   broadcast LI=1 and confirm that `ntpq` shows `leap=01` in the server's
-   `rv 0` output.
+6. **Rate-limit test** — `ntpdate -q gps-ntp.local` (single query) should
+   succeed; rapid repeated calls within 2 s should receive KoD `RATE`.
+7. **Leap second test (optional)** — use `server.set_leap_indicator(1)` to
+   broadcast LI=1 and confirm that `ntpq` shows `leap=01` in the `rv 0` output.

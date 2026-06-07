@@ -60,7 +60,6 @@ impl RateLimiter {
     /// Returns `true` if the request should be served, `false` if it should
     /// receive a KoD RATE response.
     pub(super) fn check(&mut self, addr: u32, now_us: i64) -> bool {
-        // Look for an existing entry for this client.
         for entry in self.table.iter_mut().flatten() {
             if entry.addr == addr {
                 let elapsed = now_us.saturating_sub(entry.last_us);
@@ -89,6 +88,15 @@ impl RateLimiter {
             last_us: now_us,
         });
         true
+    }
+
+    /// Subtract `by_us` from every entry's `last_us` timestamp.
+    /// Used in tests to simulate time passing without real sleeps.
+    #[cfg(test)]
+    pub(super) fn subtract_time(&mut self, by_us: i64) {
+        for slot in self.table.iter_mut().flatten() {
+            slot.last_us -= by_us;
+        }
     }
 }
 
