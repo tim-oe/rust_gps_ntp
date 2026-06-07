@@ -37,10 +37,10 @@ struct ClientRecord {
 
 /// Fixed-capacity per-client rate limiter.
 ///
-/// On each mode-3 request the caller checks the source IP. A request is
-/// accepted if the client has not been seen before, or if the time since
-/// its last accepted request exceeds `MIN_POLL_INTERVAL_US`. Otherwise the
-/// caller should send a KoD RATE response.
+/// On each incoming time or control request the caller checks the source IP.
+/// A request is accepted if the client has not been seen before, or if the time
+/// since its last accepted request exceeds `MIN_POLL_INTERVAL_US`. Otherwise
+/// the caller sends a KoD RATE (48-byte modes) or silently drops (mode-6).
 ///
 /// The table holds up to `RATE_TABLE_SIZE` entries. When full, the entry
 /// with the oldest `last_us` is evicted to make room for new clients.

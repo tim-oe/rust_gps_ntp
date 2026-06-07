@@ -48,7 +48,7 @@ Status legend: `[ ]` open · `[x]` resolved.
   than exempting it globally. At minimum, gate it behind the P1-1 ACL.
 
 ### P1-3 · Rate limiter only covers mode 3; comment/docs claim more
-- [ ] **File:** `src/ntp/mod.rs:650` (`if mode == 3`)
+- [x] **File:** `src/ntp/mod.rs:650` (`if mode == 3`)
 - **Symptom:** The `_ =>` arm serves a full 48-byte response for modes 0/1/2/4/5
   with **no** rate-limit check. An attacker can flood with mode-1 packets to
   bypass the limiter.
@@ -93,7 +93,7 @@ Status legend: `[ ]` open · `[x]` resolved.
   emphasized in `sdkconfig.defaults` and the `app.rs` header).
 - [ ] **P3-2 · Module path.** `docs/technical.md:63` lists `ntp.rs`; the module
   is `src/ntp/mod.rs` plus `src/ntp/protection.rs`.
-- [ ] **P3-3 · Mode-1 rate-limit claim.** `docs/technical.md:325` (see P1-3).
+- [x] **P3-3 · Mode-1 rate-limit claim.** `docs/technical.md:325` (see P1-3).
 - [ ] **P3-4 · Validation-checklist step count.** `docs/rfp.md:84` says
   "7-step", `docs/technical.md:548` says "6-step"; `docs/interop.md` has 7. Fix
   `technical.md`.
@@ -115,7 +115,7 @@ execution). Gaps where tests check structure but not correctness:
 - [ ] **P4-2 · PPS→second fudge untested.** No test asserts
   `clock_anchor.unix_seconds == gps_utc + NMEA_PPS_FUDGE_S`
   (`src/ntp/mod.rs:373,426`).
-- [ ] **P4-3 · Mode-coverage of rate limiter untested.** No test sends a
+- [x] **P4-3 · Mode-coverage of rate limiter untested.** No test sends a
   non-mode-3 client packet; this gap hid P1-3.
 - [ ] **P4-4 · ACL default/`private_lan` not integration-tested.** Only
   `deny_all()` is exercised through `poll()`.

@@ -322,16 +322,16 @@ Both `pps_jitter_us` and `proc_delay_us` are maintained as exponentially weighte
 
 #### Per-Client Rate Limiter
 
-A fixed-size table of 32 `ClientRecord` entries tracks the last accepted monotonic timestamp per IPv4 source address. On each mode-3 (client) or mode-1 (symmetric) request:
+A fixed-size table of 32 `ClientRecord` entries tracks the last accepted monotonic timestamp per IPv4 source address. On each incoming 48-byte time request (modes 0–5, 7) or mode-6 control query:
 
 1. Look up the source address in the table (O(32) linear scan).
-2. If found and `now − last_us < MIN_POLL_INTERVAL_US` (2 s): send a KoD RATE response, increment `rate_limited_total`, and skip normal processing.
+2. If found and `now − last_us < MIN_POLL_INTERVAL_US` (2 s): send a KoD RATE response for 48-byte modes, silently drop mode-6, increment `rate_limited_total`, and skip normal processing.
 3. If found and interval is sufficient: update `last_us`, serve normally.
 4. If not found: add a new entry (evicting the oldest `last_us` when the table is full), serve normally.
 
 Mode-6 (`ntpq`) queries share the same per-client limiter. When a mode-6
 request exceeds the interval the packet is silently dropped (no response) to
-avoid amplification; mode-3 over-limit clients receive a KoD RATE response instead.
+avoid amplification; over-limit 48-byte requests receive a KoD RATE response instead.
 
 #### Kiss-o'-Death (KoD) Response
 

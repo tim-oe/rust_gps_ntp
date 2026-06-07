@@ -189,7 +189,7 @@ pub struct NtpServer {
     /// NTP timestamp of the most recent PPS-based clock discipline event.
     /// Returned as the Reference Timestamp in NTP responses (RFC 5905 §7.3).
     last_sync_ntp_ts: u64,
-    /// Per-client rate limiter (mode-3 requests only).
+    /// Per-client rate limiter for incoming time and control requests.
     rate_limiter: RateLimiter,
     /// IP allowlist; checked for every incoming packet.
     acl: Acl,
@@ -669,9 +669,9 @@ impl NtpServer {
                                 continue;
                             }
 
-                            // Rate limit mode-3 (client) requests; mode-6 uses the
-                            // same limiter but drops silently to avoid amplification.
-                            if mode == 3 && !self.try_rate_limit(src_ip_v4) {
+                            // Rate limit all 48-byte time requests (modes 0–5, 7).
+                            // Mode-6 uses the same limiter but drops silently.
+                            if !self.try_rate_limit(src_ip_v4) {
                                 let mut req48 = [0_u8; NTP_PACKET_LEN];
                                 req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
                                 let resp = build_kod_response(&req48, version);
@@ -1949,6 +1949,67 @@ mod tests {
             server.rate_limited_total, 1,
             "rate_limited counter should increment"
         );
+    }
+
+    #[test]
+    fn poll_sends_kod_when_symmetric_active_polls_too_fast() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (4 << 3) | 1; // VN=4, Mode=1 (symmetric active)
+
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let mut buf = [0_u8; 64];
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_ne!(buf[1], 0, "first response should not be a kiss packet");
+
+        client.send_to(&req, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_eq!(buf[1], 0, "second response should be stratum-0 KoD");
+        assert_eq!(&buf[12..16], b"RATE", "KoD refid should be RATE");
+        assert_eq!(server.rate_limited_total, 1);
+    }
+
+    #[test]
+    fn poll_rate_limits_across_time_request_modes() {
+        let mut server = NtpServer::new_for_test().expect("server");
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
+        let server_addr = server.socket.local_addr().unwrap();
+
+        let mut mode3 = [0_u8; NTP_PACKET_LEN];
+        mode3[0] = (4 << 3) | 3;
+        let mut mode1 = [0_u8; NTP_PACKET_LEN];
+        mode1[0] = (4 << 3) | 1;
+
+        client.send_to(&mode3, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let mut buf = [0_u8; 64];
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_ne!(buf[1], 0);
+
+        client.send_to(&mode1, server_addr).unwrap();
+        server.poll(true).unwrap();
+        let (n, _) = client.recv_from(&mut buf).unwrap();
+        assert_eq!(n, NTP_PACKET_LEN);
+        assert_eq!(
+            buf[1], 0,
+            "mode-1 after mode-3 should share limiter and get KoD"
+        );
+        assert_eq!(&buf[12..16], b"RATE");
+        assert_eq!(server.rate_limited_total, 1);
     }
 
     #[test]
