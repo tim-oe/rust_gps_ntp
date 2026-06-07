@@ -37,7 +37,7 @@ Use this structure throughout firmware code:
   - I2C errors include context (register/chip)
 - `src/wifi.rs`
   - setup path uses `Result + ?` with contextual failures
-- `src/ntp.rs`
+- `src/ntp/mod.rs` and `src/ntp/protection.rs`
   - socket operations use `Result + ?`
   - caller boundary handles poll errors in `main`
 - `src/main.rs`

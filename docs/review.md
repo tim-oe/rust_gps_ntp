@@ -88,16 +88,16 @@ Status legend: `[ ]` open · `[x]` resolved.
 
 ## P3 — Documentation mismatches
 
-- [ ] **P3-1 · Main-loop period wrong.** `docs/technical.md:467,491,497` say the
+- [x] **P3-1 · Main-loop period wrong.** `docs/technical.md:467,491,497` say the
   loop is 10 ms / `delay_ms(10)`; actual is `delay_ms(1)` (`src/app.rs:353`,
   emphasized in `sdkconfig.defaults` and the `app.rs` header).
-- [ ] **P3-2 · Module path.** `docs/technical.md:63` lists `ntp.rs`; the module
+- [x] **P3-2 · Module path.** `docs/technical.md:63` lists `ntp.rs`; the module
   is `src/ntp/mod.rs` plus `src/ntp/protection.rs`.
 - [x] **P3-3 · Mode-1 rate-limit claim.** `docs/technical.md:325` (see P1-3).
-- [ ] **P3-4 · Validation-checklist step count.** `docs/rfp.md:84` says
+- [x] **P3-4 · Validation-checklist step count.** `docs/rfp.md:84` says
   "7-step", `docs/technical.md:548` says "6-step"; `docs/interop.md` has 7. Fix
   `technical.md`.
-- [ ] **P3-5 · README display pages.** `README.md:24-25` omits the 5th NTP page
+- [x] **P3-5 · README display pages.** `README.md:24-25` omits the 5th NTP page
   (`Page::Ntp` in `src/display.rs`).
 
 ---

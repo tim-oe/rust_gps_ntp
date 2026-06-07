@@ -22,7 +22,7 @@ for your connected board at `/dev/ttyACM0`.
 - Wi-Fi STA credentials load from build env (`WIFI_SSID`/`WIFI_PASS`)
 - Boot initializes STA and logs acquired DHCP IP
 - TFT display pages with button paging + 15s auto-blank
-- Display pages: time/local estimate, position/satellites/PPS, resources, battery
+- Display pages: time/local estimate, position/satellites/PPS, resources, battery, NTP discipline
 - PPS discipline on `GPIO12` (rising-edge interrupt)
 - NTP UDP/123 responder with GPS/PPS-backed timestamps and mode-6 diagnostics
 - IANA timezone lookup (background worker) with NVS cache

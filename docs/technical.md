@@ -60,7 +60,9 @@ src/
 ├── app.rs          # peripheral init, main service loop, task coordination
 ├── gps.rs          # NMEA sentence parsing, GpsSnapshot
 ├── pps.rs          # GPIO ISR capture, PPS interval tracking
-├── ntp.rs          # NTPv4 server, clock discipline, mode-6 diagnostics
+├── ntp/
+│   ├── mod.rs          # NTPv4 server, clock discipline, mode-6 diagnostics
+│   └── protection.rs   # per-client rate limiter and IP ACL
 ├── display.rs      # ST7789 TFT rendering, page layout
 ├── battery.rs      # MAX17048 / LC709203 I2C fuel gauge
 ├── timezone.rs     # IANA timezone resolution, NVS cache, HTTP worker
@@ -466,7 +468,7 @@ I2C bus on GPIO 42 (SDA) / GPIO 41 (SCL) at 100 kHz. Two gauge ICs are supported
 
 ### `timezone` – IANA Timezone Resolution
 
-On first GPS fix the device looks up the IANA timezone for the current coordinates. The lookup runs on a background FreeRTOS thread (`tz_lookup`, 12 KB stack) to avoid blocking the 10 ms main loop.
+On first GPS fix the device looks up the IANA timezone for the current coordinates. The lookup runs on a background FreeRTOS thread (`tz_lookup`, 12 KB stack) to avoid blocking the 1 ms main loop.
 
 **Providers (tried in order):**
 
@@ -490,13 +492,13 @@ The timezone string is persisted to the ESP-IDF NVS partition (namespace `rust_g
 7. Subscribe GPIO12 rising-edge ISR for PPS capture.
 8. Bind `NtpServer` on UDP/123.
 9. Load cached timezone from NVS.
-10. **Loop (10 ms delay per iteration):**
+10. **Loop (1 ms delay per iteration, requires `CONFIG_FREERTOS_HZ=1000`):**
     - `poll_gps_uart` – read UART bytes, accumulate lines, parse RMC/GGA.
     - Poll `TimezoneWorker` for completed HTTP result.
     - `NtpServer::poll` – serve pending UDP requests.
     - `PpsMonitor::poll` – forward new PPS events to `NtpServer` and `UiFeed`.
 
-The main loop iteration budget is 10 ms (`FreeRtos::delay_ms(10)`). GPS sentences arrive at approximately 1 Hz with minimal per-sentence processing time; NTP requests are served non-blocking from a pre-bound UDP socket.
+The main loop sleeps 1 ms per iteration (`FreeRtos::delay_ms(1)`). At the default 100 Hz FreeRTOS tick rate this would round up to 10 ms; `sdkconfig.defaults` sets `CONFIG_FREERTOS_HZ=1000` so the sleep is actually 1 ms. GPS sentences arrive at approximately 1 Hz with minimal per-sentence processing time; NTP requests are served non-blocking from a pre-bound UDP socket.
 
 ---
 
@@ -547,7 +549,7 @@ ESP-IDF target modules (`app`, `display`, `wifi`, `ui_task`, `logging`) are excl
 ## NTP Client Interoperability
 
 Client-specific compatibility notes — iburst KoD behaviour, `maxdistance`
-holdover windows, mode-6 diagnostics, and a 6-step on-device validation
+holdover windows, mode-6 diagnostics, and a 7-step on-device validation
 checklist — are documented in [`docs/interop.md`](interop.md).
 
 Clients tested and confirmed compatible: `ntpd` (ISC 4.2.x), `chronyd`
