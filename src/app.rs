@@ -324,6 +324,7 @@ pub fn run() -> anyhow::Result<()> {
     let mut current_tz_name: Option<String> = None;
     let mut last_tz_lookup_us = 0_i64;
     let mut last_ntp_publish_us = 0_i64;
+    let mut last_ntp_served = 0_u64;
     let mut last_rtc_fallback_us = 0_i64;
     let mut last_rtc_write_us = 0_i64;
     let mut last_rtc_utc = boot_rtc_unix;
@@ -396,6 +397,13 @@ pub fn run() -> anyhow::Result<()> {
 
         if let Err(err) = ntp_server.poll(gps.fix) {
             log::warn!("NTP: poll failed: {}", err);
+        } else {
+            let served = ntp_server.served();
+            if served > last_ntp_served {
+                ui_feed.publish_ntp(ntp_server.ntp_snapshot(gps.fix));
+                last_ntp_publish_us = monotonic_us();
+                last_ntp_served = served;
+            }
         }
 
         maybe_apply_rtc_fallback(

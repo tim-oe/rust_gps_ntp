@@ -133,6 +133,8 @@ pub struct NtpSnapshot {
     pub leap_indicator: u8,
     /// Smoothed per-packet NTP processing delay in microseconds (EWMA).
     pub proc_delay_us: f32,
+    /// True after at least one served request has been timed.
+    pub proc_delay_has_sample: bool,
 }
 
 impl Default for NtpSnapshot {
@@ -150,6 +152,7 @@ impl Default for NtpSnapshot {
             pps_glitch_count: 0,
             leap_indicator: 0,
             proc_delay_us: 0.0,
+            proc_delay_has_sample: false,
         }
     }
 }
@@ -624,6 +627,24 @@ impl NtpServer {
             } else {
                 0.0
             },
+            proc_delay_has_sample: self.proc_delay_has_sample,
+        }
+    }
+
+    /// Total NTP requests served since boot (time and mode-6).
+    pub fn served(&self) -> u64 {
+        self.served
+    }
+
+    /// Update the smoothed per-packet processing delay estimate.
+    fn record_proc_delay(&mut self, started_us: i64) {
+        let finished_us = monotonic_us_now();
+        let sample_us = (finished_us.saturating_sub(started_us)).max(1) as f32;
+        if self.proc_delay_has_sample {
+            self.proc_delay_us = self.proc_delay_us * 0.8 + sample_us * 0.2;
+        } else {
+            self.proc_delay_us = sample_us;
+            self.proc_delay_has_sample = true;
         }
     }
 
@@ -696,6 +717,7 @@ impl NtpServer {
                                 continue;
                             }
                             let dp = self.discipline_params(gps_fix);
+                            let started_us = monotonic_us_now();
                             let resp = build_mode6_response(
                                 &req[..len],
                                 version,
@@ -708,6 +730,7 @@ impl NtpServer {
                             self.socket.send_to(&resp, peer).with_context(|| {
                                 format!("failed to send mode-6 response to {}", peer)
                             })?;
+                            self.record_proc_delay(started_us);
                         }
                         _ => {
                             if len < NTP_PACKET_LEN {
@@ -742,14 +765,7 @@ impl NtpServer {
                             self.socket.send_to(&resp, peer).with_context(|| {
                                 format!("failed to send NTP response to {}", peer)
                             })?;
-                            let finished_us = monotonic_us_now();
-                            let sample_us = (finished_us.saturating_sub(started_us)).max(1) as f32;
-                            if self.proc_delay_has_sample {
-                                self.proc_delay_us = self.proc_delay_us * 0.8 + sample_us * 0.2;
-                            } else {
-                                self.proc_delay_us = sample_us;
-                                self.proc_delay_has_sample = true;
-                            }
+                            self.record_proc_delay(started_us);
                         }
                     }
 
@@ -1574,6 +1590,7 @@ mod tests {
         assert!(server.proc_delay_has_sample);
         assert!(server.proc_delay_us >= 1.0);
         let snap = server.ntp_snapshot(true);
+        assert!(snap.proc_delay_has_sample);
         assert!(snap.proc_delay_us >= 1.0);
     }
 

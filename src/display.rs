@@ -19,6 +19,7 @@ use st7789::{BacklightState, Orientation, ST7789};
 use crate::battery::BatterySnapshot;
 use crate::gps::GpsSnapshot;
 use crate::ntp::{DisciplineState, NtpSnapshot};
+use crate::rtc::RtcSnapshot;
 use crate::storage::StorageStatus;
 
 pub const DISPLAY_DEBUG_ALWAYS_ON: bool = false;
@@ -399,6 +400,50 @@ fn format_unsigned_us(value_us: u32) -> String {
     }
 }
 
+/// True when GPS time/location pages should show RTC fallback instead of live GPS.
+fn gps_use_rtc_fallback(gps: &GpsSnapshot) -> bool {
+    !gps.fix || gps.sats == 0
+}
+
+/// Resolve date/time strings for display, preferring RTC when GPS is unavailable.
+fn display_time_source(gps: &GpsSnapshot, rtc: RtcSnapshot) -> (String, String, bool) {
+    if gps_use_rtc_fallback(gps) {
+        if let Some(utc) = rtc.utc_unix_seconds {
+            if let Some((date, time)) =
+                crate::rtc::local_date_time_from_utc(utc, gps.tz_offset_hours)
+            {
+                return (time, date, true);
+            }
+        }
+        ("n/a".to_owned(), "n/a".to_owned(), true)
+    } else {
+        (gps.local_time.clone(), gps.local_date.clone(), false)
+    }
+}
+
+/// Format the last PPS interval as a signed offset from 1 s.
+fn pps_offset_label(pps_delta_us: u32) -> String {
+    if pps_delta_us == 0 {
+        "PPS: n/a".to_owned()
+    } else {
+        let offset_us = pps_delta_us as i64 - 1_000_000_i64;
+        format!("PPS: {}", format_signed_offset_us(offset_us))
+    }
+}
+
+/// Local RTC date/time strings for display, or `n/a` when absent or unset.
+fn rtc_local_strings(rtc: RtcSnapshot, tz_offset_hours: i8) -> (String, String) {
+    if !rtc.detected {
+        return ("n/a".to_owned(), "n/a".to_owned());
+    }
+    if let Some(utc) = rtc.utc_unix_seconds {
+        if let Some((date, time)) = crate::rtc::local_date_time_from_utc(utc, tz_offset_hours) {
+            return (time, date);
+        }
+    }
+    ("n/a".to_owned(), "n/a".to_owned())
+}
+
 /// Draw the selected UI page onto the display target.
 ///
 /// # Parameters
@@ -409,6 +454,7 @@ fn format_unsigned_us(value_us: u32) -> String {
 /// - `pps_delta_us`: Last observed PPS interval delta in microseconds.
 /// - `ntp`: Latest NTP discipline snapshot.
 /// - `storage`: MicroSD mount status, when available.
+/// - `rtc`: Latest RTC sample for GPS-loss fallback display.
 ///
 /// # Returns
 /// - No return value; draw errors are logged.
@@ -420,6 +466,7 @@ pub fn draw_page<D>(
     pps_delta_us: u32,
     ntp: &NtpSnapshot,
     storage: StorageStatus,
+    rtc: RtcSnapshot,
 ) where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
@@ -443,16 +490,32 @@ pub fn draw_page<D>(
 
     match page {
         Page::Time => {
+            let (time, date, rtc_fallback) = display_time_source(gps, rtc);
             line("Page 1/5  TIME".to_owned());
-            line(format!("Time:  {}", gps.local_time));
-            line(format!("Date:  {}", gps.local_date));
+            if rtc_fallback {
+                line("RTC fallback".to_owned());
+            }
+            line(format!("Time:  {}", time));
+            line(format!("Date:  {}", date));
             line(format!("TZ:    {:+}h", gps.tz_offset_hours));
+            line(pps_offset_label(pps_delta_us));
         }
         Page::Location => {
             line("Page 2/5  LOCATION".to_owned());
-            line(format!("Lat: {:.6}", gps.lat));
-            line(format!("Lon: {:.6}", gps.lon));
-            line(format!("Sats: {}", gps.sats));
+            if gps_use_rtc_fallback(gps) {
+                let (time, date, _) = display_time_source(gps, rtc);
+                line("RTC fallback".to_owned());
+                line(format!("Time:  {}", time));
+                line(format!("Date:  {}", date));
+            } else {
+                line(format!("Lat: {:.6}", gps.lat));
+                line(format!("Lon: {:.6}", gps.lon));
+                match gps.altitude_m {
+                    Some(alt) => line(format!("Alt: {:.1} m", alt)),
+                    None => line("Alt: n/a".to_owned()),
+                }
+                line(format!("Sats: {}", gps.sats));
+            }
         }
         Page::Resources => {
             let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
@@ -485,16 +548,12 @@ pub fn draw_page<D>(
             line(format!("Heap min: {}", format_human_bytes(min_heap as u64)));
         }
         Page::Battery => {
-            let pps_label = if pps_delta_us == 0 {
-                "PPS: n/a".to_owned()
-            } else {
-                let offset_us = pps_delta_us as i64 - 1_000_000_i64;
-                format!("PPS: {}", format_signed_offset_us(offset_us))
-            };
-            line("Page 4/5  BATTERY".to_owned());
+            let (rtc_time, rtc_date) = rtc_local_strings(rtc, gps.tz_offset_hours);
+            line("Page 4/5  BATT & RTC".to_owned());
             line(format!("Voltage: {:.3} V", battery.voltage_v));
             line(format!("Charge:  {:.1} %", battery.percent));
-            line(pps_label);
+            line(format!("Time:  {}", rtc_time));
+            line(format!("Date:  {}", rtc_date));
         }
         Page::Ntp => {
             let state_str = match ntp.state {
@@ -502,30 +561,17 @@ pub fn draw_page<D>(
                 DisciplineState::Holdover => "HOLDOVER",
                 DisciplineState::Unsync => "UNSYNC",
             };
-            let sign = if ntp.freq_ppm >= 0.0 { "+" } else { "" };
-            let offset_label =
-                if ntp.pps_offset_us == 0 && matches!(ntp.state, DisciplineState::Unsync) {
-                    "Offset: n/a".to_owned()
-                } else {
-                    format!(
-                        "Offset: {}",
-                        format_signed_offset_us(ntp.pps_offset_us as i64)
-                    )
-                };
             let jitter_us = ntp.pps_jitter_us.round() as u32;
             line("Page 5/5  NTP".to_owned());
-            line(format!(
-                "Str:{} {}  {}{:.3}ppm",
-                ntp.stratum, state_str, sign, ntp.freq_ppm
-            ));
-            line(offset_label);
+            line(format!("Str:{} {}", ntp.stratum, state_str));
+            line(format!("Freq:{:+.3} ppm", ntp.freq_ppm));
             line(format!(
                 "Jit:{}  disp:{:.1}ms",
                 format_unsigned_us(jitter_us),
                 ntp.root_disp_ms
             ));
-            let proc_label = if ntp.proc_delay_us > 0.0 {
-                format_unsigned_us(ntp.proc_delay_us.round() as u32)
+            let proc_label = if ntp.proc_delay_has_sample {
+                format_unsigned_us(ntp.proc_delay_us.round().max(1.0) as u32)
             } else {
                 "n/a".to_owned()
             };

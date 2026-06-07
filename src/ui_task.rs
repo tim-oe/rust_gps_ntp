@@ -130,8 +130,8 @@ impl UiFeed {
     /// - `self`: Shared feed state.
     ///
     /// # Returns
-    /// - Tuple of cloned GPS snapshot, PPS delta in microseconds, and NTP snapshot.
-    fn snapshot(&self) -> (GpsSnapshot, u32, NtpSnapshot, StorageStatus) {
+    /// - Tuple of cloned GPS snapshot, PPS delta in microseconds, NTP snapshot, storage, and RTC.
+    fn snapshot(&self) -> (GpsSnapshot, u32, NtpSnapshot, StorageStatus, RtcSnapshot) {
         let gps = self
             .gps
             .read()
@@ -140,7 +140,8 @@ impl UiFeed {
         let pps_delta_us = self.pps_delta_us.load(Ordering::Relaxed);
         let ntp = self.ntp.read().map(|guard| *guard).unwrap_or_default();
         let storage = self.storage();
-        (gps, pps_delta_us, ntp, storage)
+        let rtc = self.rtc();
+        (gps, pps_delta_us, ntp, storage, rtc)
     }
 }
 
@@ -341,7 +342,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
         }
 
         if screen_on && (force_redraw || (now_us - last_draw_us) >= DRAW_INTERVAL_US) {
-            let (gps, pps_delta_us, ntp, storage) = feed.snapshot();
+            let (gps, pps_delta_us, ntp, storage, rtc) = feed.snapshot();
             let mut panel = display::make_panel(display);
             display::draw_page(
                 &mut panel,
@@ -351,6 +352,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
                 pps_delta_us,
                 &ntp,
                 storage,
+                rtc,
             );
             if !rendered_once {
                 log::trace!("Display diag: first frame rendered");

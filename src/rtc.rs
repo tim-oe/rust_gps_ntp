@@ -3,7 +3,7 @@
 //! The RTC shares the Feather I2C bus with the battery fuel gauge and provides
 //! battery-backed time that survives reboots and brief GPS outages.
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::hal::i2c;
@@ -108,6 +108,29 @@ pub fn unix_seconds_to_datetime(unix_seconds: i64) -> Option<RtcDateTime> {
         minute: dt.minute(),
         second: dt.second(),
     })
+}
+
+/// Format UTC Unix seconds as local date and time using a fixed hour offset.
+pub fn local_date_time_from_utc(
+    utc_unix_seconds: i64,
+    tz_offset_hours: i8,
+) -> Option<(String, String)> {
+    let dt = Utc.timestamp_opt(utc_unix_seconds, 0).single()?;
+    let local = dt + Duration::hours(i64::from(tz_offset_hours));
+    Some((
+        format!(
+            "{:04}-{:02}-{:02}",
+            local.year(),
+            local.month(),
+            local.day()
+        ),
+        format!(
+            "{:02}:{:02}:{:02}",
+            local.hour(),
+            local.minute(),
+            local.second()
+        ),
+    ))
 }
 
 #[cfg(target_os = "espidf")]
@@ -261,5 +284,22 @@ mod tests {
         let unix = datetime_to_unix_seconds(dt).expect("valid datetime");
         let back = unix_seconds_to_datetime(unix).expect("valid unix");
         assert_eq!(back, dt);
+    }
+
+    #[test]
+    fn local_date_time_applies_tz_offset() {
+        // 2024-06-07 14:30:45 UTC -> 09:30:45 at UTC-5
+        let unix = datetime_to_unix_seconds(RtcDateTime {
+            year: 2024,
+            month: 6,
+            day: 7,
+            hour: 14,
+            minute: 30,
+            second: 45,
+        })
+        .expect("valid datetime");
+        let (date, time) = local_date_time_from_utc(unix, -5).expect("valid offset");
+        assert_eq!(date, "2024-06-07");
+        assert_eq!(time, "09:30:45");
     }
 }

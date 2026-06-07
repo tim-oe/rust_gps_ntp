@@ -29,6 +29,8 @@ pub struct GpsSnapshot {
     pub fix: bool,
     /// Satellite count from the latest GGA sentence.
     pub sats: u8,
+    /// Antenna altitude above mean sea level in meters (GGA field 9).
+    pub altitude_m: Option<f32>,
 }
 
 /// Validate the NMEA XOR checksum suffix (`*$HH`).
@@ -306,7 +308,10 @@ pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
         return None;
     }
     gps.sats = fields[7].parse::<u8>().ok()?;
-    log::trace!("GPS GGA parsed: sats={}", gps.sats);
+    if fields.len() >= 10 {
+        gps.altitude_m = fields[9].parse::<f32>().ok();
+    }
+    log::trace!("GPS GGA parsed: sats={} alt={:?}", gps.sats, gps.altitude_m);
     Some(())
 }
 
@@ -433,6 +438,7 @@ mod tests {
 
         assert_eq!(parse_gga(gga, &mut gps), Some(()));
         assert_eq!(gps.sats, 8);
+        assert_eq!(gps.altitude_m, Some(545.4));
     }
 
     #[test]
