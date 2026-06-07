@@ -112,18 +112,43 @@ Why: long-term correctness and resilience.
 
 ESP32 feasibility: **Mostly yes**; leap-quality depends on the upstream GPS data quality.
 
-## [ ] 6) Testing and interoperability
+## [x] 6) Testing and interoperability
 
-- Add unit tests for:
-  - timestamp math,
-  - sync state transitions,
-  - holdover behavior,
-  - mode-6 packet framing/padding.
-- Add interop validation notes for:
-  - `ntpd`,
-  - `chronyd`,
-  - `systemd-timesyncd`,
-  - `ntpsec` tools.
+- Unit tests added in `src/ntp.rs` (91 total):
+  - **Timestamp math**: `ntp_epoch_offset_matches_rfc868_definition` (verifies
+    `NTP_UNIX_EPOCH_OFFSET_SECS = 2_208_988_800`); `ntp_fraction_half_second_encodes_correctly`
+    and `ntp_fraction_quarter_second_encodes_correctly` (verify 500 000 µs →
+    0x8000_0000 and 250 000 µs → 0x4000_0000 NTP fraction);
+    `ntp_frequency_correction_compensates_fast_clock` (positive `freq_ppm`
+    shrinks perceived elapsed); `ntp_timestamp_seconds_field_reflects_anchor_unix_epoch`
+    (NTP seconds = unix_seconds + epoch offset for zero elapsed).
+  - **Sync state transitions**: `ntp_snapshot_state_locked_with_gps_fix_and_fresh_pps`,
+    `ntp_snapshot_state_holdover_when_gps_fix_lost`,
+    `ntp_snapshot_state_holdover_when_pps_becomes_stale`,
+    `ntp_snapshot_state_unsync_without_any_anchor`, and
+    `sync_state_full_cycle` (Unsync→Locked→Holdover→Locked→Holdover→Locked
+    complete state-machine walk-through).
+  - **Holdover behavior**: covered by prior `holdover_*` suite
+    (`holdover_declares_stratum_16_when_dispersion_exceeds_1s`,
+    `holdover_dispersion_grows_after_pps_loss`,
+    `holdover_stratum_1_restored_after_pps_returns`).
+  - **Mode-6 framing / padding**: `build_mode6_response_length_is_multiple_of_4`
+    (RFC 1305 §3 32-bit alignment); `build_mode6_padding_bytes_are_zero` (zero
+    fill after payload); `build_mode6_response_bit_set_in_byte_1` (response
+    bit); `build_mode6_unknown_assoc_id_returns_header_only` (empty payload for
+    unknown assoc); `build_response_originate_echoes_client_transmit` (RFC 5905
+    §7.3 originate echo); `build_response_version_mirrors_client_v3` (VN mirror
+    for NTPv3 compatibility).
+- Interop validation notes written in `docs/interop.md`:
+  - **`ntpd`**: iburst KoD note, `maxdistance` holdover window, mode-6
+    compatibility, recommended `ntp.conf` snippet.
+  - **`chronyd`**: iburst handling, reference timestamp advance check,
+    `maxdistance`, leap-second guidance, recommended `chrony.conf` snippet.
+  - **`systemd-timesyncd`**: no-burst, SNTP-only, fully compatible out of the
+    box.
+  - **`ntpsec`**: RFC 5905 strictness (originate echo verified), mode-6
+    compatibility, reference timestamp staleness policy.
+  - General interoperability checklist (6-step on-device validation procedure).
 
 Why: prevents regressions and validates behavior across clients.
 

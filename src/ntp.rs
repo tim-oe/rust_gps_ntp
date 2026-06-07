@@ -2444,4 +2444,308 @@ mod tests {
         let snap = server.ntp_snapshot(true);
         assert_eq!(snap.pps_glitch_count, 1);
     }
+
+    // --- Item 6: Timestamp math ---
+
+    /// The NTP–Unix epoch offset is exactly the number of seconds from
+    /// 1900-01-01T00:00:00Z to 1970-01-01T00:00:00Z as specified in RFC 868.
+    #[test]
+    fn ntp_epoch_offset_matches_rfc868_definition() {
+        // 70 years * 365.25 days/year * 86400 s/day = 2_208_988_800 s
+        assert_eq!(NTP_UNIX_EPOCH_OFFSET_SECS, 2_208_988_800_u64);
+    }
+
+    /// 500 000 µs of elapsed time must produce an NTP fraction near
+    /// 0x8000_0000 (half the 32-bit range = half a second).
+    /// Real elapsed when `current_ntp_timestamp` runs is ≥ 500 000 µs (time
+    /// only moves forward), so we accept the range [500 ms, 600 ms).
+    #[test]
+    fn ntp_fraction_half_second_encodes_correctly() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let now_us = monotonic_us_now();
+        server.clock_anchor = Some(ClockAnchor {
+            unix_seconds: 1_700_000_000,
+            monotonic_us: now_us - 500_000,
+        });
+        server.freq_ppm = 0.0;
+        let ts = server.current_ntp_timestamp();
+        // Convert the sub-second NTP fraction back to microseconds.
+        let frac_us = (ts & 0xFFFF_FFFF) * 1_000_000 / (1u64 << 32);
+        assert!(
+            (500_000..600_000).contains(&frac_us),
+            "expected sub-second in 500–600 ms range, got {frac_us} µs"
+        );
+    }
+
+    /// 250 000 µs of elapsed time must produce an NTP fraction near
+    /// 0x4000_0000 (one quarter of the 32-bit range).
+    /// Same timing argument as above: accept [250 ms, 350 ms).
+    #[test]
+    fn ntp_fraction_quarter_second_encodes_correctly() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let now_us = monotonic_us_now();
+        server.clock_anchor = Some(ClockAnchor {
+            unix_seconds: 1_700_000_000,
+            monotonic_us: now_us - 250_000,
+        });
+        server.freq_ppm = 0.0;
+        let ts = server.current_ntp_timestamp();
+        let frac_us = (ts & 0xFFFF_FFFF) * 1_000_000 / (1u64 << 32);
+        assert!(
+            (250_000..350_000).contains(&frac_us),
+            "expected sub-second in 250–350 ms range, got {frac_us} µs"
+        );
+    }
+
+    /// With a positive `freq_ppm` the disciplined clock should report a
+    /// smaller elapsed interval than the raw monotonic elapsed.  A large
+    /// correction (50 000 ppm = 5%) creates a 25 ms difference over 500 ms,
+    /// which dwarfs any test-executor scheduling overhead.
+    #[test]
+    fn ntp_frequency_correction_compensates_fast_clock() {
+        let elapsed_us: i64 = 500_000;
+        let now_us = monotonic_us_now();
+        let anchor = ClockAnchor {
+            unix_seconds: 1_700_000_000,
+            monotonic_us: now_us - elapsed_us,
+        };
+
+        let mut server_uncorrected = NtpServer::new_for_test().expect("test socket");
+        server_uncorrected.clock_anchor = Some(anchor);
+        server_uncorrected.freq_ppm = 0.0;
+        let ts_uncorrected = server_uncorrected.current_ntp_timestamp();
+
+        // Use a large correction so the effect (25 ms) overwhelms any jitter.
+        let mut server_fast = NtpServer::new_for_test().expect("test socket");
+        server_fast.clock_anchor = Some(anchor);
+        server_fast.freq_ppm = 50_000.0; // 5% fast: corrected elapsed ≈ 475 ms
+        let ts_fast = server_fast.current_ntp_timestamp();
+
+        assert!(
+            ts_fast < ts_uncorrected,
+            "positive freq_ppm should reduce elapsed: ts_fast=0x{ts_fast:016X} ts_uncorrected=0x{ts_uncorrected:016X}"
+        );
+    }
+
+    /// The NTP seconds field extracted from a disciplined timestamp must match
+    /// the anchor's Unix epoch plus the NTP–Unix offset for zero elapsed time.
+    #[test]
+    fn ntp_timestamp_seconds_field_reflects_anchor_unix_epoch() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        let unix_sec: i64 = 1_700_000_100;
+        let now_us = monotonic_us_now();
+        // Set anchor to exactly now so elapsed ≈ 0.
+        server.clock_anchor = Some(ClockAnchor {
+            unix_seconds: unix_sec,
+            monotonic_us: now_us,
+        });
+        server.freq_ppm = 0.0;
+        let ts = server.current_ntp_timestamp();
+        let ntp_sec = ts >> 32;
+        let expected = unix_sec as u64 + NTP_UNIX_EPOCH_OFFSET_SECS;
+        assert_eq!(
+            ntp_sec, expected,
+            "NTP seconds should be unix_seconds + epoch offset"
+        );
+    }
+
+    // --- Item 6: Sync state transitions ---
+
+    #[test]
+    fn ntp_snapshot_state_locked_with_gps_fix_and_fresh_pps() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        let snap = server.ntp_snapshot(true);
+        assert_eq!(snap.state, DisciplineState::Locked);
+        assert_eq!(snap.stratum, 1);
+    }
+
+    #[test]
+    fn ntp_snapshot_state_holdover_when_gps_fix_lost() {
+        // Anchor + fresh PPS, but gps_fix = false → Holdover (not fully_synced).
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        let snap = server.ntp_snapshot(false); // GPS fix gone
+        assert_eq!(snap.state, DisciplineState::Holdover);
+    }
+
+    #[test]
+    fn ntp_snapshot_state_holdover_when_pps_becomes_stale() {
+        // Anchor valid but PPS older than HOLDOVER_ENTRY_US → Holdover.
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Age the last PPS timestamp past the holdover threshold.
+        let stale_offset = HOLDOVER_ENTRY_US + 1_000_000;
+        if let Some(ref mut t) = server.last_pps_monotonic_us {
+            *t -= stale_offset;
+        }
+        let snap = server.ntp_snapshot(true);
+        assert_eq!(snap.state, DisciplineState::Holdover);
+    }
+
+    #[test]
+    fn ntp_snapshot_state_unsync_without_any_anchor() {
+        let server = NtpServer::new_for_test().expect("test socket");
+        let snap = server.ntp_snapshot(false);
+        assert_eq!(snap.state, DisciplineState::Unsync);
+    }
+
+    /// Full state-machine cycle: Unsync → Locked → Holdover (GPS lost) →
+    /// Holdover (PPS stale) → Locked again (PPS + GPS return).
+    #[test]
+    fn sync_state_full_cycle() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+
+        // Initially unsync.
+        assert_eq!(server.ntp_snapshot(false).state, DisciplineState::Unsync);
+
+        // Establish GPS + PPS → Locked.
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
+
+        // GPS fix lost → Holdover (anchor still valid).
+        assert_eq!(server.ntp_snapshot(false).state, DisciplineState::Holdover);
+
+        // GPS fix returns; still has anchor → Locked again.
+        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
+
+        // PPS becomes stale → Holdover even with GPS fix.
+        let stale_offset = HOLDOVER_ENTRY_US + 1_000_000;
+        if let Some(ref mut t) = server.last_pps_monotonic_us {
+            *t -= stale_offset;
+        }
+        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Holdover);
+
+        // PPS returns (new pulse) → Locked.
+        server.observe_pps_pulse(Some(1_000_000));
+        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
+    }
+
+    // --- Item 6: Mode-6 framing and padding ---
+
+    fn make_mode6_req(opcode: u8, assoc: u16) -> Vec<u8> {
+        let mut req = vec![0_u8; NTP_CONTROL_HEADER_LEN];
+        req[0] = (4 << 3) | 6; // VN=4, mode=6
+        req[1] = opcode;
+        req[6..8].copy_from_slice(&assoc.to_be_bytes());
+        req
+    }
+
+    fn synced_dp() -> DisciplineParams {
+        DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 14,
+            root_disp_ms: 0.1,
+            ref_ts: 0,
+            current_ts: 0,
+        }
+    }
+
+    /// All mode-6 responses must be padded to a multiple of 4 bytes.
+    #[test]
+    fn build_mode6_response_length_is_multiple_of_4() {
+        let req = make_mode6_req(MODE6_OPCODE_READVAR, 0);
+        let dp = synced_dp();
+        let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
+        assert_eq!(
+            resp.len() % 4,
+            0,
+            "mode-6 response length {} is not 32-bit aligned",
+            resp.len()
+        );
+    }
+
+    /// Padding bytes appended for 32-bit alignment must all be zero.
+    #[test]
+    fn build_mode6_padding_bytes_are_zero() {
+        let req = make_mode6_req(MODE6_OPCODE_READVAR, 0);
+        let dp = synced_dp();
+        let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
+        // The count field (bytes 10-11) tells us how many payload bytes precede padding.
+        let count = u16::from_be_bytes([resp[10], resp[11]]) as usize;
+        let payload_end = NTP_CONTROL_HEADER_LEN + count;
+        for (i, &b) in resp[payload_end..].iter().enumerate() {
+            assert_eq!(b, 0, "padding byte at index {i} should be zero");
+        }
+    }
+
+    /// Byte 1 of every mode-6 response must have the response bit (0x80) set.
+    #[test]
+    fn build_mode6_response_bit_set_in_byte_1() {
+        for opcode in [MODE6_OPCODE_READSTAT, MODE6_OPCODE_READVAR] {
+            let req = make_mode6_req(opcode, 0);
+            let dp = synced_dp();
+            let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
+            assert_ne!(
+                resp[1] & 0x80,
+                0,
+                "response bit not set for opcode {opcode}"
+            );
+        }
+    }
+
+    /// An unknown association ID must produce a 12-byte header-only response
+    /// (no payload, no padding).
+    #[test]
+    fn build_mode6_unknown_assoc_id_returns_header_only() {
+        let req = make_mode6_req(MODE6_OPCODE_READVAR, 99); // assoc 99 not registered
+        let dp = synced_dp();
+        let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
+        // count field must be zero (bytes 10-11)
+        let count = u16::from_be_bytes([resp[10], resp[11]]);
+        assert_eq!(count, 0, "unknown assoc should return zero count");
+        assert_eq!(
+            resp.len(),
+            NTP_CONTROL_HEADER_LEN,
+            "unknown assoc should return header-only response"
+        );
+    }
+
+    /// The Originate Timestamp field (bytes 24-31) of a mode-3/4 response must
+    /// be a verbatim copy of the Transmit Timestamp field (bytes 40-47) from
+    /// the client request, as required by RFC 5905 §7.3.
+    #[test]
+    fn build_response_originate_echoes_client_transmit() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 0,
+            root_disp_ms: 0.0,
+            ref_ts: 0,
+            current_ts: 0,
+        };
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        // Write a known transmit timestamp into bytes 40-47 of the request.
+        let client_xmit: u64 = 0xDEAD_BEEF_1234_5678;
+        req[40..48].copy_from_slice(&client_xmit.to_be_bytes());
+        let resp = build_response(&req, &dp, 0);
+        let originate = u64::from_be_bytes(resp[24..32].try_into().unwrap());
+        assert_eq!(
+            originate, client_xmit,
+            "originate timestamp must echo client transmit timestamp"
+        );
+    }
+
+    /// When a client uses NTPv3 the server must mirror VN=3 in the response.
+    #[test]
+    fn build_response_version_mirrors_client_v3() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 0,
+            root_disp_ms: 0.0,
+            ref_ts: 0,
+            current_ts: 0,
+        };
+        let mut req = [0_u8; NTP_PACKET_LEN];
+        req[0] = (3 << 3) | 3; // VN=3, mode=3 (client)
+        let resp = build_response(&req, &dp, 0);
+        let vn = (resp[0] >> 3) & 0x07;
+        assert_eq!(vn, 3, "server should mirror client VN=3");
+    }
 }

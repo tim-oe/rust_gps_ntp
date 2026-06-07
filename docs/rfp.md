@@ -54,7 +54,14 @@ using GPS NMEA + PPS.
 - [ ] Basic metrics (fix age, PPS age, clients served)
 - [ ] Boot-time self-check logs for UART/PPS/network state
 
-## Data model
+### M6 - testing and interoperability
+
+- [x] Timestamp math tests (RFC 868 epoch offset, NTP fraction encoding, frequency correction)
+- [x] Sync state transition tests (Locked/Holdover/Unsync full-cycle state machine)
+- [x] Mode-6 framing tests (32-bit alignment, padding zeros, response bit, originate echo, VN mirror)
+- [x] Interop compatibility notes for `ntpd`, `chronyd`, `systemd-timesyncd`, `ntpsec` (`docs/interop.md`)
+
+
 
 - `GpsSnapshot`: fix status, satellites, local time estimate, UTC epoch
 - `PpsMonitor`: last edge instant (`u64` monotonic us) and pulse count

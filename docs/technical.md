@@ -535,9 +535,18 @@ Host unit tests (`cargo test` or `just test`) cover pure modules:
 | Module | What is tested |
 |---|---|
 | `gps` | Checksum validation, RMC/GGA parsing, coordinate conversion, timezone DST rules |
-| `ntp` | Packet field layout, anchor establishment, PPS discipline, mode-6 responses, EWMA smoothing |
+| `ntp` | Packet field layout, anchor establishment, PPS discipline, mode-6 responses, EWMA smoothing, timestamp math (epoch offset, fraction encoding, frequency correction), sync state transitions (Locked/Holdover/Unsync cycle), mode-6 framing and 32-bit alignment, originate-timestamp echo, VN mirroring |
 | `pps` | Delta computation, u64 wraparound safety, First/Delta event sequencing |
 | `timezone` | JSON field extraction for Open-Meteo and GeoNames response shapes |
 | `battery` | MAX17048 and LC709203 register decoding arithmetic |
 
 ESP-IDF target modules (`app`, `display`, `wifi`, `ui_task`, `logging`) are excluded from host builds via `#[cfg(target_os = "espidf")]`.
+
+## NTP Client Interoperability
+
+Client-specific compatibility notes — iburst KoD behaviour, `maxdistance`
+holdover windows, mode-6 diagnostics, and a 6-step on-device validation
+checklist — are documented in [`docs/interop.md`](interop.md).
+
+Clients tested and confirmed compatible: `ntpd` (ISC 4.2.x), `chronyd`
+(4.x), `systemd-timesyncd` (systemd ≥ 250), and `ntpsec` (1.x).
