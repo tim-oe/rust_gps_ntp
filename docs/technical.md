@@ -253,7 +253,7 @@ Standard mode-3 client → mode-4 server exchange per [RFC 5905 §7.3](https://w
 | 0 | LI/VN/Mode | LI=0, VN mirrored from client, Mode=4 |
 | 1 | Stratum | 1 (GPS primary reference) or 16 (unsync) |
 | 2 | Poll | mirrored from client |
-| 3 | Precision | −20 (≈1 µs) |
+| 3 | Precision | log2(seconds) from `max(jitter, 100 µs, loop floor, proc delay)` (typically −11…−13 when synced) |
 | 4–7 | Root Delay | 0 (hardware reference, per RFC 5905 §6) |
 | 8–11 | Root Dispersion | model-driven: `max(jitter, 100 µs) + PHI × age` |
 | 12–15 | Reference ID | `GPS\0` (stratum 1) or `INIT` (stratum 16) |

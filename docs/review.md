@@ -78,7 +78,7 @@ Status legend: `[ ]` open · `[x]` resolved.
 - **Fix:** Capture T2 immediately after `recv_from`, before any per-packet work.
 
 ### P2-2 · Advertised precision is optimistic
-- [ ] **File:** `src/ntp/mod.rs:936` (precision hard-coded `-20` ≈ 0.95 µs)
+- [x] **File:** `src/ntp/mod.rs:936` (precision hard-coded `-20` ≈ 0.95 µs)
 - **Symptom:** Real precision is bounded by the 1 kHz loop and PPS jitter
   (hundreds of µs); `-20` overstates the clock to clients.
 - **Fix:** Advertise a precision derived from measured jitter, or a more honest

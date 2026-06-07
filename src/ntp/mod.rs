@@ -66,7 +66,8 @@ const PHI_US_PER_S: i64 = 15;
 /// Hardware accuracy floor for GPS + PPS: MTK3339 PPS accuracy is ±10 ns, but
 /// ISR capture latency and ESP32 timer jitter make 100 µs a conservative floor.
 const MIN_HW_ACCURACY_US: i64 = 100;
-/// Root delay for a GPS + PPS primary reference (RFC 5905 §6).
+/// Worst-case uncertainty from the 1 kHz main-loop poll interval (NTP D/2).
+const LOOP_POLL_UNCERTAINTY_US: i64 = 500;
 /// The round-trip delay to a hardware reference clock wired directly to a GPIO
 /// pin is modelled as zero; any GPS propagation delay is absorbed into precision.
 const ROOT_DELAY_MS: f64 = 0.0;
@@ -167,6 +168,8 @@ struct DisciplineParams {
     /// Current NTP timestamp, captured when DisciplineParams was computed.
     /// Used as the system clock value in mode-6 READVAR responses.
     current_ts: u64,
+    /// RFC 5905 precision field: log2(seconds) of estimated worst-case error.
+    precision: i8,
 }
 
 /// Stateful NTP server engine and discipline metrics.
@@ -530,6 +533,23 @@ impl NtpServer {
         let root_disp_short = ((disp_us as u64 * (1u64 << 16)) / 1_000_000) as u32;
         let root_disp_ms = disp_us as f64 / 1_000.0;
 
+        let precision = if fully_synced {
+            let mut uncertainty_us = if self.pps_has_sample {
+                self.pps_jitter_us.max(MIN_HW_ACCURACY_US as f32)
+            } else {
+                MIN_HW_ACCURACY_US as f32
+            };
+            uncertainty_us = uncertainty_us.max(LOOP_POLL_UNCERTAINTY_US as f32);
+            if self.proc_delay_has_sample {
+                uncertainty_us = uncertainty_us.max(self.proc_delay_us);
+            }
+            ntp_precision_from_uncertainty_us(uncertainty_us as f64)
+        } else if has_anchor {
+            ntp_precision_from_uncertainty_us(disp_us as f64)
+        } else {
+            ntp_precision_from_uncertainty_us(MAX_DISP_US as f64)
+        };
+
         DisciplineParams {
             stratum,
             leap,
@@ -537,6 +557,7 @@ impl NtpServer {
             root_disp_ms,
             ref_ts: self.last_sync_ntp_ts,
             current_ts: self.current_ntp_timestamp(),
+            precision,
         }
     }
 
@@ -797,7 +818,7 @@ fn build_mode6_response(
                     let jitter_ms = (pps_jitter_us.max(1.0)) as f64 / 1_000.0;
                     let freq_sign = if freq_ppm >= 0.0 { "+" } else { "" };
                     format!(
-                        "stratum={},leap={},precision=-20,\
+                        "stratum={},leap={},precision={},\
                          rootdelay={:.3},rootdisp={:.3},refid=GPS,\
                          reftime={},clock={},\
                          offset={:.3},frequency={}{:.3},\
@@ -805,6 +826,7 @@ fn build_mode6_response(
                          tc=7,mintc=3,peer=1,system=\"rust_gps_ntp\"",
                         dp.stratum,
                         leap_str,
+                        dp.precision,
                         ROOT_DELAY_MS,
                         dp.root_disp_ms,
                         ntp_ts_to_mode6(dp.ref_ts),
@@ -818,12 +840,13 @@ fn build_mode6_response(
                     )
                 } else {
                     format!(
-                        "stratum=16,leap=11,precision=-20,\
+                        "stratum=16,leap=11,precision={},\
                          rootdelay={:.3},rootdisp={:.3},refid=INIT,\
                          reftime={},clock={},\
                          offset=0.000,frequency=+0.000,\
                          sys_jitter=0.000,clk_jitter=0.000,clk_wander=0.000,\
                          tc=7,mintc=3,peer=0,system=\"rust_gps_ntp\"",
+                        dp.precision,
                         ROOT_DELAY_MS,
                         dp.root_disp_ms,
                         ntp_ts_to_mode6(dp.ref_ts),
@@ -897,6 +920,14 @@ fn build_mode6_response(
     resp
 }
 
+/// RFC 5905 precision exponent from worst-case error in microseconds.
+///
+/// Returns log2(seconds), clamped to [-20, -4] (−20 ≈ 0.95 µs, −4 ≈ 62 ms).
+fn ntp_precision_from_uncertainty_us(uncertainty_us: f64) -> i8 {
+    let secs = uncertainty_us.max(1.0) / 1_000_000.0;
+    secs.log2().floor().clamp(-20.0, -4.0) as i8
+}
+
 /// Build a Kiss-o'-Death (KoD) RATE response for a client that is polling
 /// too frequently.
 ///
@@ -954,7 +985,7 @@ fn build_response(
     resp[0] = (dp.leap << 6) | (version << 3) | 4; // server mode
     resp[1] = dp.stratum;
     resp[2] = req[2]; // copy poll interval from client
-    resp[3] = (-20_i8) as u8; // precision ~1us
+    resp[3] = dp.precision as u8;
 
     // Root delay / root dispersion in NTP short format (16.16).
     write_u32_be(&mut resp[4..8], 0);
@@ -1095,6 +1126,7 @@ mod tests {
             root_disp_ms: 1.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0_u8; NTP_PACKET_LEN];
         let resp = build_response(&req, &dp, 0x0123_0000_0000_0000);
@@ -1112,6 +1144,7 @@ mod tests {
             root_disp_ms: 5000.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0_u8; NTP_PACKET_LEN];
         let resp = build_response(&req, &dp, 0);
@@ -1128,6 +1161,7 @@ mod tests {
             root_disp_ms: 1.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [
             0,
@@ -1177,6 +1211,7 @@ mod tests {
             root_disp_ms: 1.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
@@ -1192,6 +1227,7 @@ mod tests {
             root_disp_ms: 5000.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
@@ -1209,6 +1245,7 @@ mod tests {
             root_disp_ms: 5000.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [
             0,
@@ -1238,6 +1275,7 @@ mod tests {
             root_disp_ms: 1.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
@@ -1253,6 +1291,7 @@ mod tests {
             root_disp_ms: 5000.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 0, &dp, 0, 0.0, 0.0, 0.0);
@@ -1544,6 +1583,50 @@ mod tests {
     }
 
     #[test]
+    fn ntp_precision_exponent_scales_with_uncertainty() {
+        assert_eq!(super::ntp_precision_from_uncertainty_us(1.0), -20);
+        assert_eq!(super::ntp_precision_from_uncertainty_us(100.0), -14);
+        assert_eq!(super::ntp_precision_from_uncertainty_us(500.0), -11);
+        assert_eq!(super::ntp_precision_from_uncertainty_us(2_000_000.0), -4);
+    }
+
+    #[test]
+    fn discipline_params_precision_reflects_jitter_and_loop_floor() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.pps_now(None);
+        server.pps_jitter_us = 200.0;
+        server.pps_has_sample = true;
+        let dp = server.discipline_params(true);
+        assert_eq!(
+            dp.precision, -11,
+            "500 µs loop floor dominates 200 µs jitter → 2^-11 s"
+        );
+    }
+
+    #[test]
+    fn discipline_params_precision_poor_when_unsynced() {
+        let server = NtpServer::new_for_test().expect("test socket");
+        let dp = server.discipline_params(false);
+        assert_eq!(dp.precision, -4);
+    }
+
+    #[test]
+    fn build_response_precision_matches_discipline_params() {
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 0,
+            root_disp_short: 1 << 16,
+            root_disp_ms: 1.0,
+            ref_ts: 0,
+            current_ts: 0,
+            precision: -11,
+        };
+        let resp = build_response(&[0_u8; NTP_PACKET_LEN], &dp, 0);
+        assert_eq!(resp[3], (-11_i8) as u8);
+    }
+
+    #[test]
     fn discipline_params_fully_synced_gives_stratum_1_and_base_dispersion() {
         // With the PHI model, locked dispersion is max(jitter, MIN_HW_ACCURACY_US) +
         // PHI × age_since_last_pulse. After the first pulse with no jitter sample
@@ -1706,6 +1789,7 @@ mod tests {
             root_disp_ms: 0.1,
             ref_ts: fixed_ref_ts,
             current_ts: fixed_ref_ts + 0x1_0000_0000,
+            precision: -10,
         };
         let req = [0_u8; NTP_PACKET_LEN];
         // Pass a different receive_ts so we can distinguish ref_ts from it.
@@ -1727,6 +1811,7 @@ mod tests {
             root_disp_ms: 5000.0,
             ref_ts: 0xDEAD_BEEF_0000_0000,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0_u8; NTP_PACKET_LEN];
         let resp = build_response(&req, &dp, 0x1234);
@@ -1787,6 +1872,7 @@ mod tests {
             root_disp_ms: 0.1,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
@@ -1809,6 +1895,7 @@ mod tests {
             root_disp_ms: 5000.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
@@ -1827,6 +1914,7 @@ mod tests {
             root_disp_ms: 0.1,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
@@ -1848,6 +1936,7 @@ mod tests {
             root_disp_ms: 0.1,
             ref_ts: 0xE9D1_E7B4_8A3D_71A0,
             current_ts: 0xE9D1_E7B5_0000_0000,
+            precision: -10,
         };
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 500, 200.0, 1000.0, 5.321);
@@ -1874,6 +1963,7 @@ mod tests {
             root_disp_ms: 0.5,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [
             0,
@@ -2279,6 +2369,7 @@ mod tests {
             root_disp_ms: 0.1,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let req = [0_u8; NTP_PACKET_LEN];
         let resp = build_response(&req, &dp, 0);
@@ -2634,6 +2725,7 @@ mod tests {
             root_disp_ms: 0.1,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         }
     }
 
@@ -2709,6 +2801,7 @@ mod tests {
             root_disp_ms: 0.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let mut req = [0_u8; NTP_PACKET_LEN];
         // Write a known transmit timestamp into bytes 40-47 of the request.
@@ -2732,6 +2825,7 @@ mod tests {
             root_disp_ms: 0.0,
             ref_ts: 0,
             current_ts: 0,
+            precision: -10,
         };
         let mut req = [0_u8; NTP_PACKET_LEN];
         req[0] = (3 << 3) | 3; // VN=3, mode=3 (client)
