@@ -77,13 +77,36 @@ Why: protects limited CPU/network resources on embedded hardware.
 
 ESP32 feasibility: **Yes**.
 
-## [ ] 5) Leap-second and long-run edge cases
+## [x] 5) Leap-second and long-run edge cases
 
-- Explicit leap indicator handling from GPS data path.
-- Robust behavior across:
-  - GPS outage,
-  - PPS glitches,
-  - long uptime and monotonic counter edge conditions.
+- **Explicit leap indicator infrastructure** (`set_leap_indicator(li: u8)`):
+  - Values 0–2 per RFC 5905 §7.3 (0=normal, 1=+1s at end of day, 2=−1s).
+  - Emitted in every NTP response when the server is synced (stratum 1).
+  - Automatically forced to LI=3 (alarm) when unsynced regardless of setting.
+  - Clamped to 2; caller must clear with `set_leap_indicator(0)` after the event.
+  - GPS receivers (MTK3339) apply the GPS-UTC offset internally; standard NMEA
+    sentences carry no explicit leap-warning field.  The API exists for
+    integration with out-of-band sources (almanac, IERS bulletin, etc.).
+
+- **Robust behavior improvements**:
+  - **PPS phase-outlier filter**: after the servo converges (`pps_has_sample=true`),
+    any PPS interval whose phase error exceeds `PPS_OUTLIER_THRESHOLD_US = 50 ms`
+    is rejected.  `pps_glitch_count` is incremented and `freq_ppm` is not updated,
+    preventing a single errant PPS edge from corrupting the frequency estimate.
+    `last_pps_monotonic_us` is also not advanced, so the holdover timer is not reset
+    by bad pulses.
+  - **Stale GPS anchor guard**: the first PPS pulse only establishes the clock
+    anchor if `update_gps_utc_seconds()` was called within `GPS_STALE_THRESHOLD_US
+    = 2 s`.  Prevents anchoring to GPS data cached before a module reset or
+    cold-start.  This is a no-op in normal operation where GPS RMC sentences
+    arrive at ~1 Hz just before each PPS edge.
+  - **Monotonic counter safety**: all elapsed-time arithmetic uses `saturating_sub`
+    (wrapping subtraction on the `i64` timer would need 292,000 years to fire).
+    The 64-bit `esp_timer_get_time()` returns `int64_t` and poses no overflow risk
+    for any realistic deployment lifetime.
+
+- `pps_glitch_count` and `leap_indicator` are exposed via `NtpSnapshot` for
+  display and diagnostics.
 
 Why: long-term correctness and resilience.
 

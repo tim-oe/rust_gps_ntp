@@ -22,6 +22,8 @@ GPS-disciplined Stratum-1 NTP server firmware written in Rust for the ESP32-S3 p
 | Clock source codes (ClkSrc field) | [RFC 1305 Table F-2 – Clock Source Codes (4 = UHF/GPS)](https://www.rfc-editor.org/rfc/rfc1305#appendix-F) |
 | Kiss-o'-Death (KoD) responses | [RFC 5905 §7.4 – Kiss-o'-Death (KoD) Packet](https://www.rfc-editor.org/rfc/rfc5905#section-7.4) |
 | RFC 1918 private address ranges | [RFC 1918 – Address Allocation for Private Internets](https://www.rfc-editor.org/rfc/rfc1918) |
+| Leap indicator semantics | [RFC 5905 §7.3 – Packet Header Variables (LI field)](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
+| GPS-UTC leap second offset | [IERS Earth Orientation Centre – Bulletin C (leap second announcements)](https://www.iers.org/IERS/EN/Publications/Bulletins/bulletins.html) |
 | PLL/FLL clock servo theory | [D. L. Mills, "Internet Time Synchronization: the Network Time Protocol", IEEE Trans. Comm. 1991](https://www.eecis.udel.edu/~mills/database/papers/trans.pdf) |
 | NTP clock filter and combine algorithms | [D. L. Mills, "Improved Algorithms for Synchronizing Computer Network Clocks", IEEE/ACM Trans. Netw. 1995](https://www.eecis.udel.edu/~mills/database/papers/tune2.pdf) |
 | NTP project clock discipline notes | [NTP 4.2.8 Clock Discipline](https://www.ntp.org/documentation/4.2.8-series/discipline/) |
@@ -364,6 +366,59 @@ IPv6 sources always bypass the ACL (pass through unconditionally).
 #### Diagnostics Counters
 
 All three counters (`served`, `rate_limited`, `acl_blocked`) are exposed in `NtpSnapshot` and published to the UI task each second.
+
+---
+
+### `ntp` – Leap Second and Long-Run Robustness
+
+**Relevant specs:**
+- [RFC 5905 §7.3 – Leap Indicator](https://www.rfc-editor.org/rfc/rfc5905#section-7.3)
+- [IERS Bulletin C – Leap Second Announcements](https://www.iers.org/IERS/EN/Publications/Bulletins/bulletins.html)
+
+#### Leap Indicator
+
+Per [RFC 5905 §7.3](https://www.rfc-editor.org/rfc/rfc5905#section-7.3), the two LI bits in every NTP response indicate an imminent leap second:
+
+| Value | Meaning |
+|---|---|
+| `0` | No warning (normal) |
+| `1` | Last minute of the current UTC day has 61 seconds (+1 leap) |
+| `2` | Last minute of the current UTC day has 59 seconds (−1 leap) |
+| `3` | Alarm — clock is unsynchronised |
+
+**GPS leap handling**: The MTK3339 GPS receiver applies the GPS-UTC offset (taken from the navigation message subframe 4 page 18) internally before outputting NMEA UTC time. Standard NMEA sentences (`$GPRMC`, `$GPGGA`) carry no explicit leap-second warning field. `LI = 0` when synced is therefore correct: the time output is already leap-corrected.
+
+**`set_leap_indicator(li: u8)` API**: Allows the application to set `LI = 1` or `LI = 2` from an external source (IERS Bulletin C, almanac data, or proprietary GPS sentences):
+- Clamped to 0–2; values > 2 are clamped to 2.
+- When stratum = 16 (unsync), LI is always forced to 3 regardless of this setting.
+- The application must call `set_leap_indicator(0)` after the event (e.g., at 00:00:00 UTC).
+
+#### PPS Phase-Outlier Filter
+
+After the servo has produced at least one jitter sample (`pps_has_sample = true`), any PPS pulse whose phase error exceeds `PPS_OUTLIER_THRESHOLD_US = 50 ms` is rejected:
+
+- `freq_ppm` is not updated (servo integrity preserved).
+- `last_pps_monotonic_us` is not advanced (holdover timer is not reset by bad pulses).
+- `pps_glitch_count` is incremented and included in `NtpSnapshot`.
+
+The outlier guard is inactive on the first disciplined pulse, because the servo may legitimately need a large initial correction. The ±20% interval filter remains active for all pulses regardless.
+
+**Rationale**: A single errant PPS edge caused by cable transients, GPS time-of-week rollover, or satellite-constellation changes should not corrupt the frequency estimate learned over many good pulses.
+
+#### Stale GPS Anchor Guard
+
+The first PPS pulse (`observe_pps_pulse(None)`) only establishes the clock anchor if `update_gps_utc_seconds()` was called within `GPS_STALE_THRESHOLD_US = 2 s`. This prevents anchoring to GPS data that was cached before a GPS module reset, cold-start, or initial fix acquisition:
+
+```
+gps_fresh = (now_us − last_gps_utc_update_us) < GPS_STALE_THRESHOLD_US
+If !gps_fresh → log warning, skip anchor, return.
+```
+
+In normal operation (GPS outputs RMC at ~1 Hz, PPS fires ~1 s later) the guard is transparent.
+
+#### Monotonic Counter Safety
+
+`esp_timer_get_time()` returns a signed 64-bit microsecond counter starting at 0 on boot. Overflow would require ~292,000 years of continuous operation — not a practical risk. All elapsed-time computations use `saturating_sub` to remain well-defined even if the system clock is manipulated in tests.
 
 ---
 

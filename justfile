@@ -48,26 +48,24 @@ coverage:
 check:
     source {{esp_export}} && cargo +esp check
 
-# Deploy app partition only — runs coverage gate then flashes app; use after first full flash.
+# Deploy app partition only — runs full CI gate then flashes app; use after first full flash.
 flash-app:
-    just coverage
+    just ci
     source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}}
 
 # Deploy app partition only and attach serial monitor.
 flash-app-monitor:
-    just coverage
+    just ci
     source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}} --monitor
 
 # Full flash (bootloader + partition table + app); run after partitions.csv changes or first flash.
 flash:
-    just coverage
-    just check
+    just ci
     source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}}
 
 # Full flash and attach serial monitor.
 flash-monitor:
-    just coverage
-    just check
+    just ci
     source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}} --monitor
 
 # Attach serial monitor to the connected board without flashing.

@@ -489,16 +489,27 @@ pub fn draw_page<D>(
                 DisciplineState::Unsync => "UNSYNC",
             };
             let sign = if ntp.freq_ppm >= 0.0 { "+" } else { "" };
-            let offset_label = if ntp.pps_offset_us == 0 && matches!(ntp.state, DisciplineState::Unsync) {
-                "Offset: n/a".to_owned()
-            } else {
-                format!("Offset: {}", format_signed_offset_us(ntp.pps_offset_us as i64))
-            };
+            let offset_label =
+                if ntp.pps_offset_us == 0 && matches!(ntp.state, DisciplineState::Unsync) {
+                    "Offset: n/a".to_owned()
+                } else {
+                    format!(
+                        "Offset: {}",
+                        format_signed_offset_us(ntp.pps_offset_us as i64)
+                    )
+                };
             let jitter_us = ntp.pps_jitter_us.round() as u32;
             line("Page 5/5  NTP".to_owned());
-            line(format!("Str:{} {}  {}{:.3}ppm", ntp.stratum, state_str, sign, ntp.freq_ppm));
+            line(format!(
+                "Str:{} {}  {}{:.3}ppm",
+                ntp.stratum, state_str, sign, ntp.freq_ppm
+            ));
             line(offset_label);
-            line(format!("Jit:{}  disp:{:.1}ms", format_unsigned_us(jitter_us), ntp.root_disp_ms));
+            line(format!(
+                "Jit:{}  disp:{:.1}ms",
+                format_unsigned_us(jitter_us),
+                ntp.root_disp_ms
+            ));
         }
     }
 }

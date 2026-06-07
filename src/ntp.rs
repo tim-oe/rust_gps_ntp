@@ -53,6 +53,18 @@ const MIN_HW_ACCURACY_US: i64 = 100;
 /// pin is modelled as zero; any GPS propagation delay is absorbed into precision.
 const ROOT_DELAY_MS: f64 = 0.0;
 
+// --- Long-run robustness and leap-second constants ---
+/// Phase error magnitude above which a PPS interval is treated as an outlier
+/// and rejected without feeding the servo.  Applied only after the servo has
+/// converged (i.e. `pps_has_sample = true`).  Protects `freq_ppm` from being
+/// corrupted by a single errant PPS edge while still allowing the normal ±20%
+/// interval filter to catch gross glitches.
+const PPS_OUTLIER_THRESHOLD_US: i64 = 50_000; // 50 ms
+/// Maximum age of the last GPS UTC update before the first PPS pulse is
+/// considered "stale GPS" and the phase anchor is not set.  Prevents anchoring
+/// to GPS data that was cached before a GPS module reset or cold-start.
+const GPS_STALE_THRESHOLD_US: i64 = 2_000_000; // 2 s
+
 // --- Service protection constants ---
 /// Kiss-o'-Death kiss code for rate limiting (RFC 5905 §7.4).
 const KOD_KISS_RATE: &[u8; 4] = b"RATE";
@@ -126,7 +138,10 @@ impl RateLimiter {
                     .map(|(i, _)| i)
                     .unwrap_or(0)
             });
-        self.table[slot] = Some(ClientRecord { addr, last_us: now_us });
+        self.table[slot] = Some(ClientRecord {
+            addr,
+            last_us: now_us,
+        });
         true
     }
 }
@@ -221,11 +236,7 @@ impl Acl {
         } else {
             !((1u32 << (32 - prefix_bits as u32)) - 1)
         };
-        let slot = self
-            .entries
-            .iter()
-            .position(|e| e.is_none())
-            .unwrap_or(0);
+        let slot = self.entries.iter().position(|e| e.is_none()).unwrap_or(0);
         self.entries[slot] = Some(AclEntry { network, mask });
         self.len += 1;
         true
@@ -281,6 +292,11 @@ pub struct NtpSnapshot {
     pub rate_limited: u64,
     /// Total packets silently dropped by the ACL.
     pub acl_blocked: u64,
+    /// Total PPS phase outliers rejected since boot (large single-pulse errors).
+    pub pps_glitch_count: u32,
+    /// Current leap indicator value being broadcast in NTP responses.
+    /// 0 = no warning, 1 = +1 s at end of day, 2 = −1 s at end of day.
+    pub leap_indicator: u8,
 }
 
 impl Default for NtpSnapshot {
@@ -295,6 +311,8 @@ impl Default for NtpSnapshot {
             served: 0,
             rate_limited: 0,
             acl_blocked: 0,
+            pps_glitch_count: 0,
+            leap_indicator: 0,
         }
     }
 }
@@ -346,6 +364,16 @@ pub struct NtpServer {
     rate_limited_total: u64,
     /// Total packets dropped by the ACL.
     acl_blocked_total: u64,
+    /// Leap indicator to broadcast in NTP responses when synced (RFC 5905 §7.3).
+    /// 0 = no warning, 1 = last minute has 61 s, 2 = last minute has 59 s.
+    /// Set via `set_leap_indicator()`; must be cleared manually after the event.
+    pending_leap: u8,
+    /// Count of PPS intervals rejected as phase outliers since boot.
+    pps_glitch_count: u32,
+    /// Monotonic timestamp of the most recent `update_gps_utc_seconds` call.
+    /// Used to guard against anchoring the phase to stale GPS data on the first
+    /// PPS pulse after a device restart or GPS module reset.
+    last_gps_utc_update_us: Option<i64>,
 }
 
 impl NtpServer {
@@ -382,6 +410,9 @@ impl NtpServer {
             acl: Acl::allow_all(),
             rate_limited_total: 0,
             acl_blocked_total: 0,
+            pending_leap: 0,
+            pps_glitch_count: 0,
+            last_gps_utc_update_us: None,
         })
     }
 
@@ -397,6 +428,35 @@ impl NtpServer {
         self.acl = acl;
     }
 
+    /// Set the leap second indicator broadcast in NTP responses (RFC 5905 §7.3).
+    ///
+    /// | `li` | Meaning |
+    /// |---|---|
+    /// | 0 | No warning (normal operation) |
+    /// | 1 | Last minute of the current UTC day has 61 seconds (+1 leap) |
+    /// | 2 | Last minute of the current UTC day has 59 seconds (−1 leap) |
+    ///
+    /// The indicator is only emitted when the server is synced (stratum 1).
+    /// Values greater than 2 are clamped to 2; to clear the warning call
+    /// `set_leap_indicator(0)`.
+    ///
+    /// **The caller is responsible for clearing the indicator after the leap
+    /// event has passed** (typically at 00:00:00 UTC on the day after the
+    /// event). GPS receivers apply the current UTC offset internally, so the
+    /// time output is always correct; the warning exists only so NTP clients
+    /// can prepare their own clocks.
+    ///
+    /// # Example
+    /// ```rust,no_run
+    /// // Announce a positive leap second at end of the current UTC day.
+    /// server.set_leap_indicator(1);
+    /// // … after midnight UTC …
+    /// server.set_leap_indicator(0);
+    /// ```
+    pub fn set_leap_indicator(&mut self, li: u8) {
+        self.pending_leap = li.min(2);
+    }
+
     /// Update absolute UTC seconds from a parsed GPS RMC sample.
     ///
     /// # Parameters
@@ -407,6 +467,7 @@ impl NtpServer {
     pub fn update_gps_utc_seconds(&mut self, utc_unix_seconds: i64) {
         self.last_gps_utc_seconds = Some(utc_unix_seconds);
         let now_us = monotonic_us_now();
+        self.last_gps_utc_update_us = Some(now_us);
         match self.clock_anchor {
             Some(anchor) => {
                 let elapsed_sec = now_us
@@ -449,6 +510,23 @@ impl NtpServer {
             None => {
                 // First pulse: align anchor to GPS UTC; no servo update yet since
                 // there is no interval measurement to derive frequency error from.
+                // Guard: only anchor if GPS time is fresh, i.e. the NMEA parser
+                // fed us a UTC value recently.  Stale GPS data (from before a
+                // module reset or cold-start) must not be used to initialise the
+                // clock anchor.
+                let gps_fresh = self
+                    .last_gps_utc_update_us
+                    .map(|t| now_us.saturating_sub(t) < GPS_STALE_THRESHOLD_US)
+                    .unwrap_or(false);
+
+                if !gps_fresh {
+                    log::debug!(
+                        "NTP: PPS first pulse skipped — GPS time not fresh (age > {}s)",
+                        GPS_STALE_THRESHOLD_US / MICROS_PER_SEC
+                    );
+                    return;
+                }
+
                 if let Some(gps_utc) = self.last_gps_utc_seconds {
                     self.clock_anchor = Some(ClockAnchor {
                         unix_seconds: gps_utc,
@@ -470,6 +548,24 @@ impl NtpServer {
                 // Phase error in microseconds: positive means our clock runs fast
                 // (the measured interval exceeded the ideal 1 000 000 us).
                 let phase_error_us = interval as i64 - 1_000_000;
+
+                // Outlier guard: after the servo has had at least one sample to
+                // establish a jitter baseline, reject any pulse whose phase error
+                // exceeds PPS_OUTLIER_THRESHOLD_US (50 ms).  Such errors are far
+                // larger than normal oscillator drift and indicate a bad PPS edge,
+                // GPS time jump, or transient interference.  Rejecting here keeps
+                // freq_ppm and the anchor free of single-sample corruption.
+                if self.pps_has_sample
+                    && phase_error_us.unsigned_abs() > PPS_OUTLIER_THRESHOLD_US as u64
+                {
+                    self.pps_glitch_count = self.pps_glitch_count.saturating_add(1);
+                    log::warn!(
+                        "NTP: PPS outlier rejected phase_err={}us (glitch #{})",
+                        phase_error_us,
+                        self.pps_glitch_count
+                    );
+                    return;
+                }
 
                 // Integral path: accumulate frequency estimate.
                 // A phase error of +1 us/s equals +1 ppm.
@@ -575,7 +671,13 @@ impl NtpServer {
         } else {
             16_u8
         };
-        let leap = if stratum == 1 { 0_u8 } else { 3_u8 };
+        // Use the application-supplied leap indicator when synced.
+        // When unsynced (stratum 16) always force LI=3 (alarm) per RFC 5905 §7.3.
+        let leap = if stratum == 1 {
+            self.pending_leap
+        } else {
+            3_u8
+        };
 
         // NTP short format: 16.16 fixed-point seconds.
         let root_disp_short = ((disp_us as u64 * (1u64 << 16)) / 1_000_000) as u32;
@@ -627,6 +729,8 @@ impl NtpServer {
             served: self.served,
             rate_limited: self.rate_limited_total,
             acl_blocked: self.acl_blocked_total,
+            pps_glitch_count: self.pps_glitch_count,
+            leap_indicator: dp.leap,
         }
     }
 
@@ -656,12 +760,12 @@ impl NtpServer {
                     };
 
                     // ACL check: silently drop packets from disallowed sources.
-                    if let Some(ip) = src_ip_v4 {
-                        if !self.acl.allows(ip) {
-                            self.acl_blocked_total += 1;
-                            log::debug!("NTP: ACL blocked packet from {}", peer);
-                            continue;
-                        }
+                    if let Some(ip) = src_ip_v4
+                        && !self.acl.allows(ip)
+                    {
+                        self.acl_blocked_total += 1;
+                        log::debug!("NTP: ACL blocked packet from {}", peer);
+                        continue;
                     }
 
                     let mode = req[0] & 0x07;
@@ -702,21 +806,18 @@ impl NtpServer {
 
                             // Rate limit mode-3 (client) and mode-1 (symmetric) requests.
                             // Mode-6 (ntpq) is exempt so admin queries are never throttled.
-                            if mode == 3 {
-                                if let Some(ip) = src_ip_v4 {
-                                    let now_us = monotonic_us_now();
-                                    if !self.rate_limiter.check(ip, now_us) {
-                                        self.rate_limited_total += 1;
-                                        let mut req48 = [0_u8; NTP_PACKET_LEN];
-                                        req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
-                                        let resp = build_kod_response(&req48, version);
-                                        let _ = self.socket.send_to(&resp, peer);
-                                        log::debug!(
-                                            "NTP: KoD RATE sent to {} (rate limited)",
-                                            peer
-                                        );
-                                        continue;
-                                    }
+                            if mode == 3
+                                && let Some(ip) = src_ip_v4
+                            {
+                                let now_us = monotonic_us_now();
+                                if !self.rate_limiter.check(ip, now_us) {
+                                    self.rate_limited_total += 1;
+                                    let mut req48 = [0_u8; NTP_PACKET_LEN];
+                                    req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
+                                    let resp = build_kod_response(&req48, version);
+                                    let _ = self.socket.send_to(&resp, peer);
+                                    log::debug!("NTP: KoD RATE sent to {} (rate limited)", peer);
+                                    continue;
                                 }
                             }
 
@@ -882,10 +983,7 @@ fn build_mode6_response(
                          delay={delay_ms:.3},offset={offset_ms:.3},jitter={jitter_ms:.3},\
                          dispersion={:.3},xleave=0.000,\
                          filtdelay={delay_ms:.3},filtoffset={offset_ms:.3},filtdisp={:.3}",
-                        dp.stratum,
-                        leap_str,
-                        dp.root_disp_ms,
-                        jitter_ms,
+                        dp.stratum, leap_str, dp.root_disp_ms, jitter_ms,
                     )
                 } else {
                     String::from(
@@ -1321,6 +1419,9 @@ mod tests {
                 acl: Acl::allow_all(),
                 rate_limited_total: 0,
                 acl_blocked_total: 0,
+                pending_leap: 0,
+                pps_glitch_count: 0,
+                last_gps_utc_update_us: None,
             })
         }
     }
@@ -1578,7 +1679,10 @@ mod tests {
         server.update_gps_utc_seconds(1_700_000_000);
         server.observe_pps_pulse(None);
         let dp = server.discipline_params(false);
-        assert_eq!(dp.stratum, 1, "should hold stratum 1 with fresh PPS in holdover");
+        assert_eq!(
+            dp.stratum, 1,
+            "should hold stratum 1 with fresh PPS in holdover"
+        );
     }
 
     #[test]
@@ -1607,8 +1711,7 @@ mod tests {
         server.update_gps_utc_seconds(1_700_000_000);
         server.observe_pps_pulse(None);
         // Simulate PPS that arrived 60 s into holdover (10s entry + 60s growth).
-        let past_us =
-            monotonic_us_now() - (HOLDOVER_ENTRY_US + 60 * MICROS_PER_SEC);
+        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 60 * MICROS_PER_SEC);
         server.last_pps_monotonic_us = Some(past_us);
         let dp = server.discipline_params(true);
         // Expected disp = BASE_DISP_US + 60 * RATE = 1000 + 30000 = 31000 us = 31 ms.
@@ -1633,11 +1736,13 @@ mod tests {
         // Need dispersion >= HOLDOVER_UNSYNC_US (1_000_000 us):
         // BASE + secs * RATE >= 1_000_000  →  secs >= (1_000_000 - 1_000) / 500 = 1998 s
         let holdover_secs = 2_010_i64;
-        let past_us = monotonic_us_now()
-            - (HOLDOVER_ENTRY_US + holdover_secs * MICROS_PER_SEC);
+        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + holdover_secs * MICROS_PER_SEC);
         server.last_pps_monotonic_us = Some(past_us);
         let dp = server.discipline_params(true);
-        assert_eq!(dp.stratum, 16, "should be stratum 16 when dispersion >= 1 s");
+        assert_eq!(
+            dp.stratum, 16,
+            "should be stratum 16 when dispersion >= 1 s"
+        );
         assert_eq!(dp.leap, 3);
     }
 
@@ -1647,14 +1752,16 @@ mod tests {
         server.update_gps_utc_seconds(1_700_000_000);
         server.observe_pps_pulse(None);
         // Force into deep holdover.
-        let past_us = monotonic_us_now()
-            - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
+        let past_us = monotonic_us_now() - (HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
         server.last_pps_monotonic_us = Some(past_us);
         assert_eq!(server.discipline_params(true).stratum, 16);
         // Simulate PPS returning.
         server.observe_pps_pulse(Some(1_000_000));
         let dp = server.discipline_params(true);
-        assert_eq!(dp.stratum, 1, "stratum should recover to 1 after PPS returns");
+        assert_eq!(
+            dp.stratum, 1,
+            "stratum should recover to 1 after PPS returns"
+        );
     }
 
     #[test]
@@ -1676,7 +1783,10 @@ mod tests {
         server.update_gps_utc_seconds(1_700_000_000);
         assert_eq!(server.last_sync_ntp_ts, 0);
         server.observe_pps_pulse(None);
-        assert_ne!(server.last_sync_ntp_ts, 0, "ref ts should be set after first pulse");
+        assert_ne!(
+            server.last_sync_ntp_ts, 0,
+            "ref ts should be set after first pulse"
+        );
     }
 
     #[test]
@@ -1687,8 +1797,7 @@ mod tests {
         let first_ref = server.last_sync_ntp_ts;
         server.observe_pps_pulse(Some(1_000_000));
         // After the second pulse, ref_ts should advance by approximately 1 NTP second.
-        let delta_secs = ((server.last_sync_ntp_ts >> 32) as i64)
-            - ((first_ref >> 32) as i64);
+        let delta_secs = ((server.last_sync_ntp_ts >> 32) as i64) - ((first_ref >> 32) as i64);
         assert_eq!(delta_secs, 1, "ref_ts should advance by 1 s per PPS pulse");
     }
 
@@ -1729,7 +1838,10 @@ mod tests {
         let req = [0_u8; NTP_PACKET_LEN];
         let resp = build_response(&req, &dp, 0x1234);
         let ref_ts_in_resp = u64::from_be_bytes(resp[16..24].try_into().unwrap());
-        assert_eq!(ref_ts_in_resp, 0, "reference timestamp must be 0 when stratum=16");
+        assert_eq!(
+            ref_ts_in_resp, 0,
+            "reference timestamp must be 0 when stratum=16"
+        );
     }
 
     #[test]
@@ -1787,7 +1899,10 @@ mod tests {
         let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
         let sys_status = u16::from_be_bytes([resp[4], resp[5]]);
         let clksrc = (sys_status >> 8) & 0x3f;
-        assert_eq!(clksrc, 4, "ClkSrc should be 4 (UHF/GPS) per RFC 1305 Table F-2");
+        assert_eq!(
+            clksrc, 4,
+            "ClkSrc should be 4 (UHF/GPS) per RFC 1305 Table F-2"
+        );
         let li = sys_status >> 14;
         assert_eq!(li, 0, "LI should be 0 (no warning) when synced");
     }
@@ -1844,11 +1959,17 @@ mod tests {
         let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let resp = build_mode6_response(&req, 4, &dp, 500, 200.0, 1000.0, 5.321);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
-        assert!(payload.contains("reftime=0x"), "should include reftime in hex");
+        assert!(
+            payload.contains("reftime=0x"),
+            "should include reftime in hex"
+        );
         assert!(payload.contains("clock=0x"), "should include clock in hex");
         assert!(payload.contains("frequency="), "should include frequency");
         assert!(payload.contains("sys_jitter="), "should include sys_jitter");
-        assert!(payload.contains("rootdelay=0.000"), "root delay should be 0");
+        assert!(
+            payload.contains("rootdelay=0.000"),
+            "root delay should be 0"
+        );
     }
 
     #[test]
@@ -1862,9 +1983,18 @@ mod tests {
             current_ts: 0,
         };
         let req = [
-            0, MODE6_OPCODE_READVAR,
-            0, 0, 0, 0, 0, MODE6_ASSOC_ID as u8,
-            0, 0, 0, 0,
+            0,
+            MODE6_OPCODE_READVAR,
+            0,
+            0,
+            0,
+            0,
+            0,
+            MODE6_ASSOC_ID as u8,
+            0,
+            0,
+            0,
+            0,
         ];
         let resp = build_mode6_response(&req, 4, &dp, 250, 100.0, 800.0, 3.0);
         let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
@@ -1913,11 +2043,20 @@ mod tests {
         let acl = Acl::private_lan();
         assert!(acl.allows(0x7F_00_00_01), "127.0.0.1 (loopback)");
         assert!(acl.allows(0x0A_00_00_01), "10.0.0.1 (RFC 1918 /8)");
-        assert!(acl.allows(0x0A_FF_FF_FF), "10.255.255.255 (RFC 1918 /8 edge)");
+        assert!(
+            acl.allows(0x0A_FF_FF_FF),
+            "10.255.255.255 (RFC 1918 /8 edge)"
+        );
         assert!(acl.allows(0xAC_10_00_01), "172.16.0.1 (RFC 1918 /12)");
-        assert!(acl.allows(0xAC_1F_FF_FF), "172.31.255.255 (RFC 1918 /12 edge)");
+        assert!(
+            acl.allows(0xAC_1F_FF_FF),
+            "172.31.255.255 (RFC 1918 /12 edge)"
+        );
         assert!(acl.allows(0xC0_A8_00_01), "192.168.0.1 (RFC 1918 /16)");
-        assert!(acl.allows(0xC0_A8_FF_FF), "192.168.255.255 (RFC 1918 /16 edge)");
+        assert!(
+            acl.allows(0xC0_A8_FF_FF),
+            "192.168.255.255 (RFC 1918 /16 edge)"
+        );
     }
 
     #[test]
@@ -1925,16 +2064,22 @@ mod tests {
         let acl = Acl::private_lan();
         assert!(!acl.allows(0x08_08_08_08), "8.8.8.8 (Google DNS)");
         assert!(!acl.allows(0x01_01_01_01), "1.1.1.1 (Cloudflare)");
-        assert!(!acl.allows(0xAC_0F_FF_FF), "172.15.255.255 (just below RFC 1918 /12)");
-        assert!(!acl.allows(0xAC_20_00_00), "172.32.0.0 (just above RFC 1918 /12)");
+        assert!(
+            !acl.allows(0xAC_0F_FF_FF),
+            "172.15.255.255 (just below RFC 1918 /12)"
+        );
+        assert!(
+            !acl.allows(0xAC_20_00_00),
+            "172.32.0.0 (just above RFC 1918 /12)"
+        );
     }
 
     #[test]
     fn acl_add_ipv4_cidr_single_host() {
         let mut acl = Acl::deny_all();
         acl.add_ipv4_cidr(192, 168, 1, 100, 32);
-        assert!(acl.allows(0xC0_A8_01_64)); // 192.168.1.100
-        assert!(!acl.allows(0xC0_A8_01_65)); // 192.168.1.101
+        assert!(acl.allows(0xC0A8_0164_u32)); // 192.168.1.100
+        assert!(!acl.allows(0xC0A8_0165_u32)); // 192.168.1.101
     }
 
     #[test]
@@ -1986,8 +2131,8 @@ mod tests {
     fn rate_limiter_allows_after_previous_deny() {
         let mut rl = RateLimiter::new();
         let addr = 0xC0_A8_01_03_u32;
-        rl.check(addr, 0);                        // allow (first)
-        rl.check(addr, 500_000);                  // deny  (too fast, but last_us not updated)
+        rl.check(addr, 0); // allow (first)
+        rl.check(addr, 500_000); // deny  (too fast, but last_us not updated)
         assert!(rl.check(addr, 3 * MICROS_PER_SEC)); // allow (enough time since first)
     }
 
@@ -2019,7 +2164,11 @@ mod tests {
         // Mode = 4 (server).
         assert_eq!(resp[0] & 0x07, 4, "mode should be 4");
         // Originate = client's transmit timestamp.
-        assert_eq!(&resp[24..32], &req[40..48], "originate should echo client transmit ts");
+        assert_eq!(
+            &resp[24..32],
+            &req[40..48],
+            "originate should echo client transmit ts"
+        );
     }
 
     // -- poll() integration tests for service protections --
@@ -2033,7 +2182,9 @@ mod tests {
         server.observe_pps_pulse(None);
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
         let server_addr = server.socket.local_addr().unwrap();
 
         // Build a minimal mode-3 NTP request packet.
@@ -2055,7 +2206,10 @@ mod tests {
         assert_eq!(n, NTP_PACKET_LEN);
         assert_eq!(buf[1], 0, "second response should be stratum-0 KoD");
         assert_eq!(&buf[12..16], b"RATE", "KoD refid should be RATE");
-        assert_eq!(server.rate_limited_total, 1, "rate_limited counter should increment");
+        assert_eq!(
+            server.rate_limited_total, 1,
+            "rate_limited counter should increment"
+        );
     }
 
     #[test]
@@ -2065,7 +2219,9 @@ mod tests {
         server.set_acl(Acl::deny_all());
 
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_millis(100))).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
         let server_addr = server.socket.local_addr().unwrap();
 
         let mut req = [0_u8; NTP_PACKET_LEN];
@@ -2077,8 +2233,14 @@ mod tests {
         // The packet should be silently dropped — no response.
         let mut buf = [0_u8; 64];
         let result = client.recv_from(&mut buf);
-        assert!(result.is_err(), "ACL-blocked packet should not receive a response");
-        assert_eq!(server.acl_blocked_total, 1, "acl_blocked counter should increment");
+        assert!(
+            result.is_err(),
+            "ACL-blocked packet should not receive a response"
+        );
+        assert_eq!(
+            server.acl_blocked_total, 1,
+            "acl_blocked counter should increment"
+        );
     }
 
     #[test]
@@ -2086,7 +2248,9 @@ mod tests {
         // ntpq (mode-6) queries should never be rate-limited even if sent rapidly.
         let mut server = NtpServer::new_for_test().expect("server");
         let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client.set_read_timeout(Some(std::time::Duration::from_millis(200))).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .unwrap();
         let server_addr = server.socket.local_addr().unwrap();
 
         // Mode-6 request.
@@ -2099,8 +2263,185 @@ mod tests {
             client.send_to(&req, server_addr).unwrap();
             server.poll(false).unwrap();
             let (n, _) = client.recv_from(&mut buf).unwrap();
-            assert!(n >= NTP_CONTROL_HEADER_LEN, "mode-6 should always get a response");
+            assert!(
+                n >= NTP_CONTROL_HEADER_LEN,
+                "mode-6 should always get a response"
+            );
         }
-        assert_eq!(server.rate_limited_total, 0, "mode-6 should not be rate-limited");
+        assert_eq!(
+            server.rate_limited_total, 0,
+            "mode-6 should not be rate-limited"
+        );
+    }
+
+    // --- Item 5: leap-second and long-run edge case tests ---
+
+    // -- Leap indicator tests --
+
+    #[test]
+    fn set_leap_indicator_propagates_to_ntp_response() {
+        // LI=1 set by the application must appear in NTP response byte 0 bits 7-6.
+        let dp = DisciplineParams {
+            stratum: 1,
+            leap: 1, // simulating pending_leap=1 flowing through discipline_params
+            root_disp_short: 1 << 16,
+            root_disp_ms: 0.1,
+            ref_ts: 0,
+            current_ts: 0,
+        };
+        let req = [0_u8; NTP_PACKET_LEN];
+        let resp = build_response(&req, &dp, 0);
+        let li = (resp[0] >> 6) & 0x03;
+        assert_eq!(li, 1, "LI=1 should propagate to response byte 0 bits 7-6");
+    }
+
+    #[test]
+    fn set_leap_indicator_clamped_to_2() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.set_leap_indicator(5);
+        assert_eq!(server.pending_leap, 2, "values > 2 should be clamped to 2");
+    }
+
+    #[test]
+    fn set_leap_indicator_0_clears_warning() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.set_leap_indicator(1);
+        assert_eq!(server.pending_leap, 1);
+        server.set_leap_indicator(0);
+        assert_eq!(server.pending_leap, 0);
+    }
+
+    #[test]
+    fn discipline_params_uses_pending_leap_when_synced() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        server.set_leap_indicator(1);
+        let dp = server.discipline_params(true);
+        assert_eq!(
+            dp.leap, 1,
+            "pending_leap should flow into DisciplineParams.leap"
+        );
+    }
+
+    #[test]
+    fn discipline_params_overrides_pending_leap_with_alarm_when_unsynced() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.set_leap_indicator(1); // would be active if synced
+        let dp = server.discipline_params(false); // no anchor → stratum 16
+        assert_eq!(
+            dp.leap, 3,
+            "unsynced server must emit LI=3 regardless of pending_leap"
+        );
+    }
+
+    #[test]
+    fn ntp_snapshot_exposes_leap_indicator() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        server.set_leap_indicator(2);
+        let snap = server.ntp_snapshot(true);
+        assert_eq!(snap.leap_indicator, 2);
+    }
+
+    // -- PPS outlier filter tests --
+
+    #[test]
+    fn pps_outlier_rejected_after_servo_converged() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // Give the servo a good first sample to establish pps_has_sample=true.
+        server.observe_pps_pulse(Some(1_000_100)); // +100 µs error — OK
+
+        let freq_before = server.freq_ppm;
+        // Now send a huge phase error that exceeds PPS_OUTLIER_THRESHOLD_US (50 ms).
+        server.observe_pps_pulse(Some(1_100_000)); // +100_000 µs = 100 ms — outlier
+        assert_eq!(
+            server.pps_glitch_count, 1,
+            "outlier should increment pps_glitch_count"
+        );
+        assert!(
+            (server.freq_ppm - freq_before).abs() < 0.001,
+            "freq_ppm should not change on outlier rejection"
+        );
+    }
+
+    #[test]
+    fn pps_outlier_not_applied_before_first_sample() {
+        // Before pps_has_sample is true (first disciplined pulse), large phase
+        // errors are allowed through so the servo can make an initial correction.
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        // pps_has_sample is still false; a large interval is still gated by the
+        // ±20% interval filter (800k–1200k µs).  Use a mid-range value.
+        server.observe_pps_pulse(Some(1_049_999)); // 49_999 µs error — just under threshold
+        assert_eq!(
+            server.pps_glitch_count, 0,
+            "should not be counted as outlier"
+        );
+        assert!(
+            server.pps_has_sample,
+            "servo should accept the first large-ish error"
+        );
+    }
+
+    #[test]
+    fn pps_outlier_does_not_update_last_pps_monotonic() {
+        // A rejected outlier must not advance last_pps_monotonic_us; otherwise
+        // the holdover timer would be reset by bad pulses.
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        server.observe_pps_pulse(Some(1_000_100)); // good → sets last_pps_monotonic_us
+        let last_good = server.last_pps_monotonic_us;
+        server.observe_pps_pulse(Some(1_100_000)); // outlier
+        assert_eq!(
+            server.last_pps_monotonic_us, last_good,
+            "outlier must not update last_pps_monotonic_us"
+        );
+    }
+
+    // -- Stale GPS anchor guard tests --
+
+    #[test]
+    fn first_pps_pulse_skipped_when_gps_time_is_stale() {
+        // If update_gps_utc_seconds was not called recently, the first PPS pulse
+        // must not anchor the clock to old GPS data.
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        // Set GPS UTC seconds but do NOT call update_gps_utc_seconds via the
+        // normal path — instead manipulate internal state to make GPS appear stale.
+        server.last_gps_utc_seconds = Some(1_700_000_000);
+        server.last_gps_utc_update_us = Some(monotonic_us_now() - 2 * GPS_STALE_THRESHOLD_US);
+        server.observe_pps_pulse(None);
+        assert!(
+            server.clock_anchor.is_none(),
+            "stale GPS should prevent phase anchor on first PPS pulse"
+        );
+    }
+
+    #[test]
+    fn first_pps_pulse_anchors_with_fresh_gps() {
+        // With a recent GPS update the first PPS pulse should establish the anchor.
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000); // fresh
+        server.observe_pps_pulse(None);
+        assert!(
+            server.clock_anchor.is_some(),
+            "fresh GPS should allow phase anchor on first PPS pulse"
+        );
+    }
+
+    #[test]
+    fn glitch_count_exposed_in_ntp_snapshot() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.observe_pps_pulse(None);
+        server.observe_pps_pulse(Some(1_000_100)); // good
+        server.observe_pps_pulse(Some(1_100_000)); // outlier
+        let snap = server.ntp_snapshot(true);
+        assert_eq!(snap.pps_glitch_count, 1);
     }
 }

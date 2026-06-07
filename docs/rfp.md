@@ -48,6 +48,9 @@ using GPS NMEA + PPS.
 - [x] Holdover behavior when GPS fix is lost (PLL/FLL servo + growing root dispersion, stratum demotion at 1 s)
 - [x] Per-client rate limiting with Kiss-o'-Death RATE responses (RFC 5905 §7.4)
 - [x] IP ACL allowlist (`Acl::allow_all` / `deny_all` / `private_lan`)
+- [x] Leap indicator API (`set_leap_indicator`) with RFC 5905 §7.3 semantics
+- [x] PPS phase-outlier filter (reject phase errors > 50 ms after servo convergence)
+- [x] Stale GPS anchor guard (prevent anchoring to GPS data > 2 s old)
 - [ ] Basic metrics (fix age, PPS age, clients served)
 - [ ] Boot-time self-check logs for UART/PPS/network state
 
