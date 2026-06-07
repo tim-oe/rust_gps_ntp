@@ -92,3 +92,24 @@ ci-no-esp: fmt-check lint coverage
 #   just validate-ntp gps-ntp -- --no-defaults --ref ntp.ubuntu.com  # replace all refs
 validate-ntp device=DEFAULT_DEVICE *flags="":
     python3 scripts/validate_ntp.py {{device}} {{flags}}
+
+# Sustained NTP load from this host (single or multi-worker with --bind-ip).
+# Respects the device's 2 s per-client rate limiter (default 2.5 s interval).
+#
+#   just load-test                                    # 5 min @ gps-ntp
+#   just load-test 192.168.1.48 -- --duration 60
+#   just load-test gps-ntp -- --workers 4 --bind-ip 192.168.1.201 --bind-ip 192.168.1.202
+load-test device=DEFAULT_DEVICE *flags="":
+    python3 scripts/load_ntp.py {{device}} {{flags}}
+
+# Multi-client load via Docker macvlan (distinct 192.168.1.x per container).
+# Requires MACVLAN_PARENT set to your wired LAN interface.
+#
+#   just load-test-docker CLIENTS=8 DURATION=300 MACVLAN_PARENT=eth0
+load-test-docker device=DEFAULT_DEVICE clients="4" duration="300" interval="2.5" macvlan_parent="eth0":
+    DEVICE={{device}} DURATION={{duration}} INTERVAL={{interval}} MACVLAN_PARENT={{macvlan_parent}} \
+      docker compose -f docker/load/docker-compose.yml --profile macvlan up --scale ntp-client={{clients}}
+
+# Host micro-benchmarks for GPS parse and NTP serve hot paths (Criterion HTML report).
+bench:
+    cargo bench --target {{host_target}} --features bench

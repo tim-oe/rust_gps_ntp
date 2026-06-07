@@ -55,9 +55,49 @@ entrypoint. Modules include `gps`, `pps`, `ntp`, `display`, `battery`, `wifi`,
 just flash-monitor
 ```
 
+## Validation testing
+
+After the device is on the network with GPS/PPS lock, validate NTP accuracy from
+another host on the LAN. Full usage, exit codes, and examples are documented in
+the module docstring of [`scripts/validate_ntp.py`](scripts/validate_ntp.py).
+
+Quick run (default device `gps-ntp`, three samples per host, ~60 s total to
+respect the device's 2 s per-client rate limiter):
+
+```bash
+just validate-ntp
+```
+
+The script checks:
+
+- device reachability and stratum 1
+- leap indicator not unsynchronised (LI ≠ 3)
+- offset divergence vs a median of reference servers (default tolerance 100 ms)
+
+Exit codes (see script docstring for detail):
+
+| Code | Meaning |
+|---:|---|
+| 0 | all checks passed |
+| 1 | device offset exceeds `--tolerance` |
+| 2 | device unreachable or invalid stratum |
+
+Examples (also in [`scripts/validate_ntp.py`](scripts/validate_ntp.py)):
+
+```bash
+just validate-ntp gps-ntp.local
+just validate-ntp 192.168.1.48 -- --tolerance 10
+just validate-ntp gps-ntp -- --ref ntp.ubuntu.com
+just validate-ntp gps-ntp -- --no-defaults --ref ntp.ubuntu.com --tolerance 50
+```
+
+For on-device integration checks (`ntpq`, holdover, rate limiting), see
+[`docs/interop.md`](docs/interop.md). For sustained load testing after
+validation, see [`docker/load/README.md`](docker/load/README.md).
+
 ## Accuracy
 
-Live validation against local and internet NTP references (`just validate-ntp`):
+Example output from `just validate-ntp` against local and internet references:
 
 | Host | Stratum | Ref | Delay ms | Offset ms |
 |---|---|---|---:|---:|
@@ -78,4 +118,7 @@ see just recipes for details
 
 ```bash
 just --list
+just bench          # host Criterion benchmarks (GPS parse, NTP poll)
+just load-test      # sustained on-device NTP load (see docker/load/ for multi-client)
+just validate-ntp   # on-device accuracy validation (see Validation testing above)
 ```

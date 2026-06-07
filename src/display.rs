@@ -510,6 +510,15 @@ pub fn draw_page<D>(
                 format_unsigned_us(jitter_us),
                 ntp.root_disp_ms
             ));
+            let proc_label = if ntp.proc_delay_us > 0.0 {
+                format_unsigned_us(ntp.proc_delay_us.round() as u32)
+            } else {
+                "n/a".to_owned()
+            };
+            line(format!(
+                "Proc:{}  srv:{} ko:{}",
+                proc_label, ntp.served, ntp.rate_limited
+            ));
         }
     }
 }

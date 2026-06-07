@@ -131,6 +131,8 @@ pub struct NtpSnapshot {
     /// Current leap indicator value being broadcast in NTP responses.
     /// 0 = no warning, 1 = +1 s at end of day, 2 = −1 s at end of day.
     pub leap_indicator: u8,
+    /// Smoothed per-packet NTP processing delay in microseconds (EWMA).
+    pub proc_delay_us: f32,
 }
 
 impl Default for NtpSnapshot {
@@ -147,6 +149,7 @@ impl Default for NtpSnapshot {
             acl_blocked: 0,
             pps_glitch_count: 0,
             leap_indicator: 0,
+            proc_delay_us: 0.0,
         }
     }
 }
@@ -599,6 +602,11 @@ impl NtpServer {
             acl_blocked: self.acl_blocked_total,
             pps_glitch_count: self.pps_glitch_count,
             leap_indicator: dp.leap,
+            proc_delay_us: if self.proc_delay_has_sample {
+                self.proc_delay_us
+            } else {
+                0.0
+            },
         }
     }
 
@@ -1113,6 +1121,48 @@ fn write_u64_be(dst: &mut [u8], value: u64) {
     dst.copy_from_slice(&value.to_be_bytes());
 }
 
+/// Ephemeral localhost UDP socket for host tests and Criterion benchmarks.
+#[cfg(any(test, feature = "bench"))]
+impl NtpServer {
+    pub fn new_loopback() -> anyhow::Result<Self> {
+        let socket = UdpSocket::bind("127.0.0.1:0")?;
+        socket.set_nonblocking(true)?;
+        Ok(Self::from_socket(socket))
+    }
+
+    /// Return the bound address of the loopback test/bench socket.
+    pub fn loopback_addr(&self) -> std::net::SocketAddr {
+        self.socket
+            .local_addr()
+            .expect("loopback NTP socket address")
+    }
+
+    fn from_socket(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            served: 0,
+            clock_anchor: None,
+            last_gps_utc_seconds: None,
+            pps_locked: false,
+            pps_offset_us: 0,
+            pps_jitter_us: 0.0,
+            pps_has_sample: false,
+            proc_delay_us: 0.0,
+            proc_delay_has_sample: false,
+            freq_ppm: 0.0,
+            last_pps_monotonic_us: None,
+            last_sync_ntp_ts: 0,
+            rate_limiter: RateLimiter::new(),
+            acl: Acl::allow_all(),
+            rate_limited_total: 0,
+            acl_blocked_total: 0,
+            pending_leap: 0,
+            pps_glitch_count: 0,
+            last_gps_utc_update_us: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1300,30 +1350,7 @@ mod tests {
 
     impl NtpServer {
         fn new_for_test() -> anyhow::Result<Self> {
-            let socket = UdpSocket::bind("127.0.0.1:0")?;
-            socket.set_nonblocking(true)?;
-            Ok(Self {
-                socket,
-                served: 0,
-                clock_anchor: None,
-                last_gps_utc_seconds: None,
-                pps_locked: false,
-                pps_offset_us: 0,
-                pps_jitter_us: 0.0,
-                pps_has_sample: false,
-                proc_delay_us: 0.0,
-                proc_delay_has_sample: false,
-                freq_ppm: 0.0,
-                last_pps_monotonic_us: None,
-                last_sync_ntp_ts: 0,
-                rate_limiter: RateLimiter::new(),
-                acl: Acl::allow_all(),
-                rate_limited_total: 0,
-                acl_blocked_total: 0,
-                pending_leap: 0,
-                pps_glitch_count: 0,
-                last_gps_utc_update_us: None,
-            })
+            Self::new_loopback()
         }
 
         /// Test helper: call `observe_pps_pulse` using the current monotonic clock
@@ -1529,6 +1556,8 @@ mod tests {
         }
         assert!(server.proc_delay_has_sample);
         assert!(server.proc_delay_us >= 1.0);
+        let snap = server.ntp_snapshot(true);
+        assert!(snap.proc_delay_us >= 1.0);
     }
 
     #[test]

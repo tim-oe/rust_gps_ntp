@@ -1,0 +1,66 @@
+# Multi-client NTP load against a LAN GPS-NTP device.
+#
+# Profiles:
+#   host     — single source IP (host network); good for sustained single-client load
+#   macvlan  — each container gets a distinct 192.168.1.x IP (true multi-client)
+#
+# Examples:
+#   # 8 containers, distinct LAN IPs (requires macvlan parent on your LAN)
+#   DEVICE=gps-ntp CLIENTS=8 DURATION=300 MACVLAN_PARENT=eth0 \
+#     docker compose -f docker/load/docker-compose.yml --profile macvlan up --scale ntp-client=8
+#
+#   # Single-client load from the Docker host's IP
+#   DEVICE=gps-ntp DURATION=120 \
+#     docker compose -f docker/load/docker-compose.yml --profile host up
+
+services:
+  ntp-client:
+    build:
+      context: ../..
+      dockerfile: docker/load/Dockerfile
+    profiles: [macvlan]
+    environment:
+      NTP_TARGET: ${DEVICE:-gps-ntp}
+      POLL_INTERVAL: ${INTERVAL:-2.5}
+      DURATION: ${DURATION:-300}
+    command:
+      - ${DEVICE:-gps-ntp}
+      - --duration
+      - ${DURATION:-300}
+      - --interval
+      - ${INTERVAL:-2.5}
+      - --workers
+      - "1"
+    networks:
+      ntp_load: {}
+
+  ntp-client-host:
+    build:
+      context: ../..
+      dockerfile: docker/load/Dockerfile
+    profiles: [host]
+    network_mode: host
+    environment:
+      NTP_TARGET: ${DEVICE:-gps-ntp}
+      POLL_INTERVAL: ${INTERVAL:-2.5}
+      DURATION: ${DURATION:-300}
+    command:
+      - ${DEVICE:-gps-ntp}
+      - --duration
+      - ${DURATION:-300}
+      - --interval
+      - ${INTERVAL:-2.5}
+      - --workers
+      - "1"
+
+networks:
+  ntp_load:
+    driver: macvlan
+    driver_opts:
+      parent: ${MACVLAN_PARENT:-eth0}
+    ipam:
+      config:
+        - subnet: 192.168.1.0/24
+          gateway: 192.168.1.1
+          # Pool for scaled containers; must fall inside CONFIG_GPS_NTP_ACL_CIDR.
+          ip_range: 192.168.1.210/28
