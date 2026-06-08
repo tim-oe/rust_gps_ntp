@@ -14,11 +14,15 @@ pub mod timezone;
 #[cfg(target_os = "espidf")]
 pub mod app;
 #[cfg(target_os = "espidf")]
+pub mod board;
+#[cfg(target_os = "espidf")]
 pub mod display;
 #[cfg(target_os = "espidf")]
 pub mod i2c_bus;
 #[cfg(target_os = "espidf")]
 pub mod logging;
+#[cfg(target_os = "espidf")]
+pub mod pins;
 #[cfg(target_os = "espidf")]
 pub mod storage;
 #[cfg(target_os = "espidf")]

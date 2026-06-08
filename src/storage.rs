@@ -13,6 +13,8 @@ use esp_idf_svc::hal::sd::{SdCardDriver, config::Configuration, spi::SdSpiHostDr
 use esp_idf_svc::hal::spi::{Dma, SpiDriver, config::DriverConfig};
 use esp_idf_svc::io::vfs::MountedFatfs;
 
+use crate::pins::PinPool;
+
 /// VFS mount point for the Adalogger microSD card.
 pub const MOUNT_POINT: &str = "/sdcard";
 
@@ -100,11 +102,74 @@ fn card_capacity_bytes(card: &esp_idf_svc::sys::sdmmc_card_t) -> u64 {
     (card.csd.capacity as u64).saturating_mul(card.csd.sector_size as u64)
 }
 
+/// Mounted microSD card (or unmounted probe result) with CS GPIO tracking.
+pub struct StorageDevice<'d> {
+    _mount: Option<StorageMount<'d>>,
+    pub status: StorageStatus,
+    cs_pin: Option<i32>,
+}
+
+impl<'d> StorageDevice<'d> {
+    const MODULE: &'static str = "storage";
+
+    /// Probe and mount the Adalogger microSD card on the shared SPI bus.
+    ///
+    /// TFT CS must already be deselected on the shared bus. Tries the primary
+    /// CS pin first, then the alternate wing wiring.
+    pub fn init(pool: &mut PinPool, spi: &'d SpiDriver<'d>) -> Self {
+        if let Ok(cs) = pool.take_gpio10(Self::MODULE) {
+            let (status, mount) = try_mount(spi, cs, ADALOGGER_SD_CS_PIN);
+            if status.mounted {
+                return Self {
+                    _mount: mount,
+                    status,
+                    cs_pin: Some(ADALOGGER_SD_CS_PIN),
+                };
+            }
+            pool.release(ADALOGGER_SD_CS_PIN);
+        }
+
+        log::info!(
+            "Storage: retrying on GPIO{} (alternate Adalogger CS)",
+            ADALOGGER_SD_CS_ALT_PIN
+        );
+        if let Ok(cs) = pool.take_gpio33(Self::MODULE) {
+            let (status, mount) = try_mount(spi, cs, ADALOGGER_SD_CS_ALT_PIN);
+            if status.mounted {
+                return Self {
+                    _mount: mount,
+                    status,
+                    cs_pin: Some(ADALOGGER_SD_CS_ALT_PIN),
+                };
+            }
+            pool.release(ADALOGGER_SD_CS_ALT_PIN);
+        }
+
+        log::warn!(
+            "Storage: microSD unavailable — insert a FAT32 card; tried CS GPIO{} and GPIO{}",
+            ADALOGGER_SD_CS_PIN,
+            ADALOGGER_SD_CS_ALT_PIN
+        );
+        Self {
+            _mount: None,
+            status: StorageStatus::default(),
+            cs_pin: None,
+        }
+    }
+
+    /// Release the SD chip-select GPIO claim when a card was mounted.
+    pub fn close(self, pool: &mut PinPool) {
+        if let Some(pin) = self.cs_pin {
+            pool.release(pin);
+        }
+    }
+}
+
 /// Attempt to mount the Adalogger microSD card on the shared SPI bus.
 ///
 /// Call with TFT CS (`GPIO7`) already driven high so the display does not
 /// respond to SD bus traffic. Returns `(status, mount_handle)`.
-pub fn try_mount<'d, CS>(
+fn try_mount<'d, CS>(
     spi: &'d SpiDriver<'d>,
     cs: CS,
     cs_pin: i32,

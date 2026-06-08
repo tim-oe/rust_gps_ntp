@@ -3,10 +3,11 @@
 //! Device modules implement [`I2cDevice`] and receive a [`FeatherI2cBus`] at init.
 
 use anyhow::Context;
-use esp_idf_svc::hal::gpio;
 use esp_idf_svc::hal::i2c::{self, I2c, I2cDriver};
 use esp_idf_svc::hal::peripheral::Peripheral;
 use esp_idf_svc::hal::prelude::*;
+
+use crate::pins::PinPool;
 
 /// Feather I2C data line (battery gauge + PCF8523 RTC on Adalogger wing).
 pub const SDA_PIN: i32 = 42;
@@ -27,12 +28,19 @@ pub struct FeatherI2cBus {
 }
 
 impl FeatherI2cBus {
+    const MODULE: &'static str = "i2c";
+
     /// Bring up the shared Feather I2C bus at 100 kHz.
     pub fn init<I2C: I2c>(
+        pool: &mut PinPool,
         i2c_peripheral: impl Peripheral<P = I2C> + 'static,
-        sda: impl gpio::InputPin + gpio::OutputPin + 'static,
-        scl: impl gpio::InputPin + gpio::OutputPin + 'static,
     ) -> anyhow::Result<Self> {
+        let sda = pool
+            .take_gpio42(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let scl = pool
+            .take_gpio41(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
         let cfg = i2c::config::Config::new().baudrate(100.kHz().into());
         let driver = I2cDriver::new(i2c_peripheral, sda, scl, &cfg)
             .context("failed to initialize Feather I2C bus")?;
@@ -42,6 +50,12 @@ impl FeatherI2cBus {
             SCL_PIN
         );
         Ok(Self { driver })
+    }
+
+    /// Release SDA/SCL GPIO claims.
+    pub fn close(self, pool: &mut PinPool) {
+        pool.release(SDA_PIN);
+        pool.release(SCL_PIN);
     }
 
     /// Write a register payload to a typed I2C device.

@@ -7,6 +7,7 @@ use anyhow::{Context, anyhow};
 use core::sync::atomic::{AtomicBool, Ordering};
 // Official font docs (embedded-graphics mono/ascii):
 // https://docs.rs/embedded-graphics/latest/embedded_graphics/mono_font/ascii/index.html
+use display_interface_spi::SPIInterfaceNoCS;
 use embedded_graphics::mono_font::MonoTextStyleBuilder;
 use embedded_graphics::mono_font::ascii::FONT_10X20;
 use embedded_graphics::pixelcolor::Rgb565;
@@ -14,13 +15,21 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
+use esp_idf_svc::hal::gpio::{self, Input, Output, PinDriver};
+use esp_idf_svc::hal::peripheral::Peripheral;
+use esp_idf_svc::hal::prelude::*;
+use esp_idf_svc::hal::spi::{self, SpiDriver};
 use st7789::{BacklightState, Orientation, ST7789};
 
 use crate::battery::BatterySnapshot;
 use crate::gps::GpsSnapshot;
 use crate::ntp::{DisciplineState, NtpSnapshot};
+use crate::pins::PinPool;
 use crate::rtc::RtcSnapshot;
-use crate::storage::StorageStatus;
+use crate::storage::{self, StorageStatus};
+
+/// Feather SPI clock line shared by TFT and microSD (re-exported from [`storage`]).
+pub use storage::{FEATHER_SPI_MISO_PIN, FEATHER_SPI_MOSI_PIN, FEATHER_SPI_SCK_PIN};
 
 /// TFT chip-select on the shared Feather SPI bus.
 pub const CS_PIN: i32 = 7;
@@ -50,8 +59,145 @@ pub const PANEL_WIDTH: u16 = DISPLAY_WIDTH;
 /// Logical panel height passed to ST7789 construction.
 pub const PANEL_HEIGHT: u16 = DISPLAY_HEIGHT;
 
+/// TFT stack: shared SPI bus, panel driver, and page button.
+pub struct DisplayDevice {
+    driver: &'static SpiDriver<'static>,
+    _power: PinDriver<'static, gpio::Gpio21, Output>,
+    panel_claimed: bool,
+}
+
+impl DisplayDevice {
+    const MODULE: &'static str = "display";
+
+    /// Enable TFT power, bring up the shared SPI bus, and deselect TFT CS for SD probing.
+    pub fn init<SPI: spi::Spi + spi::SpiAnyPins>(
+        pool: &mut PinPool,
+        spi_peripheral: impl Peripheral<P = SPI> + 'static,
+    ) -> anyhow::Result<Self> {
+        let power_gpio = pool
+            .take_gpio21(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let sck = pool
+            .take_gpio36(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let mosi = pool
+            .take_gpio35(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let miso = pool
+            .take_gpio37(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+
+        let _power = enable_power(power_gpio)?;
+        let driver: &'static SpiDriver<'static> = Box::leak(Box::new(
+            SpiDriver::new(
+                spi_peripheral,
+                sck,
+                mosi,
+                Some(miso),
+                &storage::shared_spi_bus_config(),
+            )
+            .context("failed to initialize shared SPI bus for TFT and SD card")?,
+        ));
+        log::info!(
+            "Display: shared SPI bus on SCK=GPIO{}, MOSI=GPIO{}, MISO=GPIO{}",
+            FEATHER_SPI_SCK_PIN,
+            FEATHER_SPI_MOSI_PIN,
+            FEATHER_SPI_MISO_PIN
+        );
+        FreeRtos::delay_ms(50);
+        deselect_spi_cs().context("failed to deselect TFT before SD init")?;
+        Ok(Self {
+            driver,
+            _power,
+            panel_claimed: false,
+        })
+    }
+
+    /// Borrow the shared SPI bus for the microSD socket or TFT device driver.
+    pub fn spi_driver(&self) -> &'static SpiDriver<'static> {
+        self.driver
+    }
+
+    /// Wire TFT control pins, construct the ST7789 driver, and run panel init.
+    pub fn init_panel(
+        &mut self,
+        pool: &mut PinPool,
+    ) -> anyhow::Result<
+        InitializedPanel<
+            SPIInterfaceNoCS<
+                spi::SpiDeviceDriver<'static, &'static SpiDriver<'static>>,
+                PinDriver<'static, gpio::Gpio39, Output>,
+            >,
+            PinDriver<'static, gpio::Gpio40, Output>,
+            PinDriver<'static, gpio::Gpio45, Output>,
+        >,
+    > {
+        let cs = pool.take_gpio7(Self::MODULE).map_err(anyhow::Error::from)?;
+        let dc = pool
+            .take_gpio39(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let rst = pool
+            .take_gpio40(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let bl = pool
+            .take_gpio45(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let button_pin = pool.take_gpio0(Self::MODULE).map_err(anyhow::Error::from)?;
+
+        let tft_spi = spi::SpiDeviceDriver::new(
+            self.driver,
+            Some(cs),
+            &spi::config::Config::new().baudrate(SPI_BAUD_MHZ.MHz().into()),
+        )
+        .context("failed to initialize SPI device for TFT")?;
+        let dc = PinDriver::output(dc).context("failed to init TFT DC")?;
+        let rst = PinDriver::output(rst).context("failed to init TFT RST")?;
+        let backlight = PinDriver::output(bl).context("failed to init TFT backlight")?;
+        let button = PinDriver::input(button_pin).context("failed to init page button")?;
+
+        let di = SPIInterfaceNoCS::new(tft_spi, dc);
+        let mut display = ST7789::new(di, Some(rst), Some(backlight), PANEL_WIDTH, PANEL_HEIGHT);
+        let mut ets = Ets;
+        let backlight_on_state = init_display(&mut display, &mut ets)?;
+        self.panel_claimed = true;
+
+        Ok(InitializedPanel {
+            display,
+            button,
+            backlight_on_state,
+        })
+    }
+
+    /// Release all display GPIO claims (SPI bus lines and panel pins when initialized).
+    pub fn close(self, pool: &mut PinPool) {
+        if self.panel_claimed {
+            pool.release(BUTTON_PIN);
+            pool.release(CS_PIN);
+            pool.release(DC_PIN);
+            pool.release(RST_PIN);
+            pool.release(BL_PIN);
+        }
+        pool.release(POWER_PIN);
+        pool.release(FEATHER_SPI_SCK_PIN);
+        pool.release(FEATHER_SPI_MOSI_PIN);
+        pool.release(FEATHER_SPI_MISO_PIN);
+    }
+}
+
+/// Initialized ST7789 panel, page button, and backlight state for the UI task.
+pub struct InitializedPanel<DI, RST, BL>
+where
+    DI: display_interface::WriteOnlyDataCommand,
+    RST: embedded_hal_02::digital::v2::OutputPin,
+    BL: embedded_hal_02::digital::v2::OutputPin,
+{
+    pub display: ST7789<DI, RST, BL>,
+    pub button: PinDriver<'static, gpio::Gpio0, Input>,
+    pub backlight_on_state: BacklightState,
+}
+
 /// Enable the TFT power rail and wait for the panel to stabilize.
-pub fn enable_power(
+fn enable_power(
     pin: esp_idf_svc::hal::gpio::Gpio21,
 ) -> anyhow::Result<
     esp_idf_svc::hal::gpio::PinDriver<
@@ -72,7 +218,7 @@ pub fn enable_power(
 }
 
 /// Drive the TFT chip-select high before another SPI device uses the shared bus.
-pub fn deselect_spi_cs() -> anyhow::Result<()> {
+fn deselect_spi_cs() -> anyhow::Result<()> {
     use esp_idf_svc::sys::{
         GPIO_MODE_DEF_OUTPUT, gpio_reset_pin, gpio_set_direction, gpio_set_level,
     };

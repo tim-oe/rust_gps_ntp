@@ -2,6 +2,7 @@
 //!
 //! The main loop handles GPS ingest, PPS discipline, NTP polling, and timezone
 //! coordination. Display, button, and battery sampling run on [`crate::ui_task`].
+//! Hardware bring-up is handled by [`crate::board::BoardBoot`].
 //!
 //! # Performance architecture
 //!
@@ -31,32 +32,18 @@
 //!   worker (priority 2) are explicitly set below the NTP loop so display work
 //!   never preempts time-critical packet processing.
 
-use anyhow::Context;
-use display_interface_spi::SPIInterfaceNoCS;
-use esp_idf_svc::hal::delay::{Ets, FreeRtos};
-use esp_idf_svc::hal::gpio::PinDriver;
-use esp_idf_svc::hal::peripherals::Peripherals;
-use esp_idf_svc::hal::prelude::*;
-use esp_idf_svc::hal::spi;
-use esp_idf_svc::hal::uart::UartDriver;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use st7789::ST7789;
-use std::sync::Arc;
+use esp_idf_svc::hal::delay::FreeRtos;
 
-use crate::battery::BatteryDevice;
-use crate::display;
-use crate::gps::{self, GpsSnapshot};
-use crate::i2c_bus::FeatherI2cBus;
+use crate::board::BoardBoot;
+use crate::gps::{self, GpsSnapshot, GpsUart};
 use crate::logging;
 use crate::ntp::{self, DisciplineState};
-use crate::pps::{self, PpsEvent, PpsMonitor, PpsPollState};
-use crate::rtc::{self, RtcDevice};
+use crate::pps::{self, PpsEvent};
+use crate::rtc;
 use crate::storage::{self, StorageStatus};
 use crate::timezone::{self, TimezoneStore, TimezoneWorker};
-use crate::ui_task::{UiFeed, UiTaskHandle};
+use crate::ui_task::UiFeed;
 use crate::wifi;
-#[cfg(esp_idf_comp_mdns_enabled)]
-use esp_idf_svc::mdns::EspMdns;
 
 /// Initialize peripherals, spawn the UI task, and run the main service loop.
 ///
@@ -69,201 +56,23 @@ use esp_idf_svc::mdns::EspMdns;
 pub fn run() -> anyhow::Result<()> {
     logging::init();
     let wifi_creds = wifi::load_wifi_credentials_from_env()?;
+    let board = BoardBoot::boot(&wifi_creds)?;
+    let mut ntp_server = board.init_ntp_server()?;
+    let (runtime, _keepalive) = board.into_runtime();
 
-    let peripherals = Peripherals::take().context("failed to take ESP32 peripherals")?;
-    let modem = peripherals.modem;
-    let uart1 = peripherals.uart1;
-    let i2c0 = peripherals.i2c0;
-    let spi2 = peripherals.spi2;
-    let pins = peripherals.pins;
-
-    let default_nvs =
-        EspDefaultNvsPartition::take().context("failed to take default NVS partition for Wi-Fi")?;
-    let default_nvs_tz = default_nvs.clone();
-    let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()
-        .context("failed to take system event loop")?;
-    let _wifi = wifi::connect_wifi_sta(modem, sys_loop, default_nvs, &wifi_creds)?;
-
-    // Register the device on the LAN as <DEVICE_HOSTNAME>.local with an _ntp._udp
-    // service record so clients and scripts can find it without reading the serial log.
-    // The hostname is read from CONFIG_LWIP_LOCAL_HOSTNAME in sdkconfig.defaults at
-    // compile time via build.rs; change it there to rename the device.
-    // Requires CONFIG_MDNS_ENABLED=y in sdkconfig.defaults (see sdkconfig.defaults).
-    #[cfg(esp_idf_comp_mdns_enabled)]
-    let _mdns = match EspMdns::take() {
-        Ok(mut mdns) => {
-            let hostname_ok = mdns.set_hostname(env!("DEVICE_HOSTNAME")).is_ok();
-            let instance_ok = mdns.set_instance_name("GPS+PPS NTP Server").is_ok();
-            let service_ok = mdns
-                .add_service(None, "_ntp", "_udp", 123, &[("stratum", "1")])
-                .is_ok();
-            if hostname_ok && instance_ok && service_ok {
-                log::info!(
-                    "mDNS: registered as {}.local (_ntp._udp port 123)",
-                    env!("DEVICE_HOSTNAME")
-                );
-            } else {
-                log::warn!(
-                    "mDNS: partial registration failure (hostname={hostname_ok} instance={instance_ok} service={service_ok})"
-                );
-            }
-            Some(mdns)
-        }
-        Err(err) => {
-            log::warn!("mDNS: failed to acquire singleton: {}", err);
-            None
-        }
-    };
-
-    let gps_uart = gps::init_uart(uart1, pins.gpio1, pins.gpio2)?;
-
-    // Arm PPS immediately after GPS UART so edges are captured during display/SD init.
-    let pps = PpsMonitor::new();
-    let mut pps_poll = PpsPollState::default();
-    let mut pps_pin =
-        PinDriver::input(pins.gpio12).context("failed to initialize PPS input pin")?;
-    pps::configure_interrupt(&mut pps_pin, &pps)?;
-
-    let _tft_power = display::enable_power(pins.gpio21)?;
-
-    let mut i2c_bus = FeatherI2cBus::init(i2c0, pins.gpio42, pins.gpio41)?;
-    let battery = BatteryDevice::detect(&mut i2c_bus);
-    let rtc = RtcDevice::init(&mut i2c_bus);
-    let rtc_present = rtc.present;
-    let boot_rtc_unix = rtc.boot_utc;
-
-    // Leak the SPI bus driver so TFT and SD borrows satisfy the UI task `'static` bound.
-    let spi_driver: &'static spi::SpiDriver<'static> = Box::leak(Box::new(
-        spi::SpiDriver::new(
-            spi2,
-            pins.gpio36,
-            pins.gpio35,
-            Some(pins.gpio37),
-            &storage::shared_spi_bus_config(),
-        )
-        .context("failed to initialize shared SPI bus for TFT and SD card")?,
-    ));
-
-    FreeRtos::delay_ms(50);
-
-    // Hold TFT deselected while the SD card owns the shared Feather SPI bus.
-    display::deselect_spi_cs().context("failed to deselect TFT before SD init")?;
-
-    let (mut storage_status, mut storage_mount) =
-        storage::try_mount(spi_driver, pins.gpio10, storage::ADALOGGER_SD_CS_PIN);
-    if !storage_status.mounted {
-        log::info!(
-            "Storage: retrying on GPIO{} (alternate Adalogger CS)",
-            storage::ADALOGGER_SD_CS_ALT_PIN
-        );
-        (storage_status, storage_mount) =
-            storage::try_mount(spi_driver, pins.gpio33, storage::ADALOGGER_SD_CS_ALT_PIN);
-    }
-    if !storage_status.mounted {
-        log::warn!(
-            "Storage: microSD unavailable — insert a FAT32 card; tried CS GPIO{} and GPIO{}",
-            storage::ADALOGGER_SD_CS_PIN,
-            storage::ADALOGGER_SD_CS_ALT_PIN
-        );
-    }
-    let _storage_mount = storage_mount;
-
-    let tft_spi = spi::SpiDeviceDriver::new(
-        spi_driver,
-        Some(pins.gpio7),
-        &spi::config::Config::new().baudrate(display::SPI_BAUD_MHZ.MHz().into()),
-    )
-    .context("failed to initialize SPI device for TFT")?;
-    let dc = PinDriver::output(pins.gpio39).context("failed to init TFT DC")?;
-    let rst = PinDriver::output(pins.gpio40).context("failed to init TFT RST")?;
-    let backlight = PinDriver::output(pins.gpio45).context("failed to init TFT backlight")?;
-    let button = PinDriver::input(pins.gpio0).context("failed to init page button")?;
-
-    let di = SPIInterfaceNoCS::new(tft_spi, dc);
-    let mut display = ST7789::new(
-        di,
-        Some(rst),
-        Some(backlight),
-        display::PANEL_WIDTH,
-        display::PANEL_HEIGHT,
-    );
-    let mut ets = Ets;
-    let backlight_on_state = display::init_display(&mut display, &mut ets)?;
-
-    let mut gps = GpsSnapshot::default();
-    let mut tz_store = match TimezoneStore::new(default_nvs_tz.clone()) {
-        Ok(store) => Some(store),
-        Err(err) => {
-            log::warn!("GPS: timezone NVS store unavailable: {}", err);
-            None
-        }
-    };
-    let mut tz_initialized = false;
-    let mut current_tz_name: Option<String> = None;
-
-    let mut cached_tz_name = None;
-    if let Some(store) = tz_store.as_ref() {
-        match store.load_cached() {
-            Ok(Some(tz_name)) => cached_tz_name = Some((tz_name, "NVS")),
-            Ok(None) => {}
-            Err(err) => log::warn!("GPS: failed to read timezone cache from NVS: {}", err),
-        }
-    }
-    if cached_tz_name.is_none() {
-        if let Some(tz_name) = timezone::load_cached_sd() {
-            cached_tz_name = Some((tz_name, "SD"));
-        }
-    }
-    if let Some((tz_name, source)) = cached_tz_name {
-        if timezone::apply_cached_timezone(&tz_name, source) {
-            tz_initialized = true;
-            current_tz_name = Some(tz_name);
-        }
-    }
-    if let Some(utc) = boot_rtc_unix {
-        gps.tz_offset_hours = gps::tz_offset_hours_at_unix(utc);
-    }
-    if !tz_initialized && gps.tz_offset_hours == 0 {
-        log::warn!(
-            "GPS: no cached timezone; RTC display shows UTC until GPS fix + Wi-Fi resolves TZ"
-        );
-    }
-
-    let ui_feed = UiFeed::new(storage_status);
-    if rtc_present {
-        ui_feed.publish_rtc(rtc::RtcSnapshot {
-            detected: true,
-            utc_unix_seconds: boot_rtc_unix,
-        });
-    }
-    ui_feed.publish_gps(&gps);
-    let _ui_task = UiTaskHandle::spawn(
-        Arc::clone(&ui_feed),
-        display,
-        button,
-        i2c_bus,
-        battery,
-        rtc,
-        backlight_on_state,
-    )?;
+    let gps_uart = runtime.gps_uart;
+    let mut pps = runtime.pps;
+    let ui_feed = runtime.ui_feed;
+    let rtc_present = runtime.rtc_present;
+    let boot_rtc_unix = runtime.boot_rtc_unix;
+    let mut gps = runtime.timezone.gps;
+    let mut tz_store = runtime.timezone.tz_store;
+    let mut tz_initialized = runtime.timezone.tz_initialized;
+    let mut current_tz_name = runtime.timezone.current_tz_name;
 
     let mut rx_buf = [0_u8; 256];
     let mut line_buf = String::new();
     let mut bytes_seen: u64 = 0;
-
-    let mut ntp_server = ntp::NtpServer::bind()?;
-    let acl_cidr = env!("NTP_ACL_CIDR");
-    ntp_server.set_acl(ntp::Acl::from_config(acl_cidr));
-    if acl_cidr.is_empty() {
-        log::info!("NTP: ACL restricted to RFC 1918 private networks");
-    } else {
-        log::info!("NTP: ACL restricted to {acl_cidr}");
-    }
-
-    if let Some(secs) = boot_rtc_unix {
-        ntp_server.seed_utc_seconds(secs);
-        log::info!("RTC: seeded NTP anchor from cached time (UTC {secs})");
-    }
 
     let mut tz_worker = TimezoneWorker::spawn().ok();
     let mut last_tz_lookup_us = 0_i64;
@@ -273,14 +82,6 @@ pub fn run() -> anyhow::Result<()> {
     let mut last_rtc_write_us = 0_i64;
     let mut last_rtc_utc = boot_rtc_unix;
     let mut last_storage_refresh_us = 0_i64;
-
-    log::info!("NTP: listening on UDP/123");
-    log::info!("System: booted; Wi-Fi + GPS UART diagnostics mode");
-    log::info!(
-        "Listening for raw NMEA on UART1 (9600 baud), TX=GPIO{}, RX=GPIO{}",
-        gps::UART_TX_PIN,
-        gps::UART_RX_PIN
-    );
 
     // --- Self-check state: track first-event milestones and emit timeout warnings. ---
     let boot_us = monotonic_us();
@@ -356,7 +157,7 @@ pub fn run() -> anyhow::Result<()> {
             &mut last_rtc_write_us,
         );
 
-        if storage_status.mounted
+        if ui_feed.storage().mounted
             && (last_storage_refresh_us == 0
                 || (now_us - last_storage_refresh_us) >= storage::STATUS_REFRESH_US)
         {
@@ -371,7 +172,7 @@ pub fn run() -> anyhow::Result<()> {
             log::debug!("GPS: diagnostics bytes received={}", bytes_seen);
         }
 
-        if let Some(event) = pps.poll(&mut pps_poll) {
+        if let Some(event) = pps.poll() {
             match event {
                 PpsEvent::First { edge_us } => {
                     first_pps_logged = true;
@@ -386,18 +187,14 @@ pub fn run() -> anyhow::Result<()> {
                     edge_us,
                 } => {
                     ui_feed.publish_pps_delta(interval_us);
-                    log::debug!(
-                        "PPS: pulse #{} delta={}us",
-                        pps_poll.pulse_count(),
-                        interval_us
-                    );
+                    log::debug!("PPS: pulse #{} delta={}us", pps.pulse_count(), interval_us);
                     ntp_server.observe_pps_pulse(Some(interval_us), edge_us);
                 }
             }
             // Publish fresh discipline metrics whenever PPS fires (every ~1 s when locked).
             ui_feed.publish_ntp(ntp_server.ntp_snapshot(gps.fix));
             last_ntp_publish_us = monotonic_us();
-            if let Err(err) = pps_pin.enable_interrupt() {
+            if let Err(err) = pps.reenable_interrupt() {
                 log::warn!("PPS: failed to re-enable interrupt: {}", err);
             }
         }
@@ -561,7 +358,7 @@ fn monotonic_us() -> i64 {
 /// # Returns
 /// - No return value.
 fn poll_gps_uart(
-    gps_uart: &UartDriver<'_>,
+    gps_uart: &GpsUart,
     rx_buf: &mut [u8; 256],
     line_buf: &mut String,
     bytes_seen: &mut u64,

@@ -28,23 +28,55 @@ pub const UART_TX_PIN: i32 = 1;
 #[cfg(target_os = "espidf")]
 pub const UART_RX_PIN: i32 = 2;
 
-/// Initialize UART1 for GPS NMEA at 9600 baud.
+/// GPS NMEA UART driver with GPIO lines claimed from [`crate::pins::PinPool`].
 #[cfg(target_os = "espidf")]
-pub fn init_uart<UART: uart::Uart>(
-    uart_peripheral: impl Peripheral<P = UART> + 'static,
-    tx: impl gpio::InputPin + gpio::OutputPin + 'static,
-    rx: impl gpio::InputPin + 'static,
-) -> anyhow::Result<UartDriver<'static>> {
-    let cfg = uart::config::Config::default().baudrate(Hertz(9_600));
-    UartDriver::new(
-        uart_peripheral,
-        tx,
-        rx,
-        Option::<gpio::Gpio0>::None,
-        Option::<gpio::Gpio1>::None,
-        &cfg,
-    )
-    .context("failed to initialize GPS UART")
+pub struct GpsUart {
+    driver: UartDriver<'static>,
+}
+
+#[cfg(target_os = "espidf")]
+impl GpsUart {
+    const MODULE: &'static str = "gps";
+
+    /// Initialize UART1 for GPS NMEA at 9600 baud.
+    pub fn init<UART: uart::Uart>(
+        pool: &mut crate::pins::PinPool,
+        uart_peripheral: impl Peripheral<P = UART> + 'static,
+    ) -> anyhow::Result<Self> {
+        let tx = pool.take_gpio1(Self::MODULE).map_err(anyhow::Error::from)?;
+        let rx = pool.take_gpio2(Self::MODULE).map_err(anyhow::Error::from)?;
+        let cfg = uart::config::Config::default().baudrate(Hertz(9_600));
+        let driver = UartDriver::new(
+            uart_peripheral,
+            tx,
+            rx,
+            Option::<gpio::Gpio0>::None,
+            Option::<gpio::Gpio1>::None,
+            &cfg,
+        )
+        .context("failed to initialize GPS UART")?;
+        log::info!(
+            "GPS: listening for raw NMEA on UART1 (9600 baud), TX=GPIO{}, RX=GPIO{}",
+            UART_TX_PIN,
+            UART_RX_PIN
+        );
+        Ok(Self { driver })
+    }
+
+    /// Release GPIO claims held by this UART driver.
+    pub fn close(self, pool: &mut crate::pins::PinPool) {
+        pool.release(UART_TX_PIN);
+        pool.release(UART_RX_PIN);
+    }
+}
+
+#[cfg(target_os = "espidf")]
+impl std::ops::Deref for GpsUart {
+    type Target = UartDriver<'static>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.driver
+    }
 }
 
 static RUNTIME_TZ: OnceLock<RwLock<Option<Tz>>> = OnceLock::new();

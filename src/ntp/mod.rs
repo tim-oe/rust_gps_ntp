@@ -234,6 +234,8 @@ impl NtpServer {
             .set_nonblocking(true)
             .context("failed to set NTP socket nonblocking")?;
 
+        log::info!("NTP: listening on UDP/123");
+
         Ok(Self {
             socket,
             served: 0,
@@ -271,6 +273,17 @@ impl NtpServer {
     /// ```
     pub fn set_acl(&mut self, acl: Acl) {
         self.acl = acl;
+    }
+
+    /// Apply compile-time `NTP_ACL_CIDR` and log the effective restriction.
+    pub fn apply_boot_acl(server: &mut NtpServer) {
+        let acl_cidr = env!("NTP_ACL_CIDR");
+        server.set_acl(Acl::from_config(acl_cidr));
+        if acl_cidr.is_empty() {
+            log::info!("NTP: ACL restricted to RFC 1918 private networks");
+        } else {
+            log::info!("NTP: ACL restricted to {acl_cidr}");
+        }
     }
 
     /// Set the leap second indicator broadcast in NTP responses (RFC 5905 §7.3).

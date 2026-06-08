@@ -150,7 +150,7 @@ impl PpsMonitor {
 
 /// Configure a GPIO input for PPS rising-edge capture via ISR.
 #[cfg(target_os = "espidf")]
-pub fn configure_interrupt<P>(
+fn configure_interrupt<P>(
     pin: &mut PinDriver<'static, P, Input>,
     monitor: &PpsMonitor,
 ) -> anyhow::Result<()>
@@ -172,6 +172,56 @@ where
         .context("failed to enable PPS interrupt")?;
     log::info!("PPS: monitoring GPIO{GPIO_PIN} (rising-edge interrupt)");
     Ok(())
+}
+
+/// PPS input pin, ISR state, and poll cursor owned by the PPS module.
+#[cfg(target_os = "espidf")]
+pub struct PpsDevice {
+    pin: PinDriver<'static, gpio::Gpio12, Input>,
+    monitor: PpsMonitor,
+    poll_state: PpsPollState,
+}
+
+#[cfg(target_os = "espidf")]
+impl PpsDevice {
+    const MODULE: &'static str = "pps";
+
+    /// Claim the PPS GPIO and arm the rising-edge interrupt handler.
+    pub fn init(pool: &mut crate::pins::PinPool) -> anyhow::Result<Self> {
+        let pin_gpio = pool
+            .take_gpio12(Self::MODULE)
+            .map_err(anyhow::Error::from)?;
+        let mut pin = PinDriver::input(pin_gpio).context("failed to initialize PPS input pin")?;
+        let monitor = PpsMonitor::new();
+        configure_interrupt(&mut pin, &monitor)?;
+        Ok(Self {
+            pin,
+            monitor,
+            poll_state: PpsPollState::default(),
+        })
+    }
+
+    /// Poll for a newly captured PPS edge.
+    pub fn poll(&mut self) -> Option<PpsEvent> {
+        self.monitor.poll(&mut self.poll_state)
+    }
+
+    /// Pulse count from the last successful [`Self::poll`].
+    pub fn pulse_count(&self) -> u32 {
+        self.poll_state.pulse_count()
+    }
+
+    /// Re-enable the GPIO interrupt after the ISR fires (ESP-IDF auto-disables it).
+    pub fn reenable_interrupt(&mut self) -> anyhow::Result<()> {
+        self.pin
+            .enable_interrupt()
+            .context("failed to re-enable PPS interrupt")
+    }
+
+    /// Release the PPS GPIO claim.
+    pub fn close(self, pool: &mut crate::pins::PinPool) {
+        pool.release(GPIO_PIN);
+    }
 }
 
 /// Compute the microsecond interval between consecutive PPS edges.

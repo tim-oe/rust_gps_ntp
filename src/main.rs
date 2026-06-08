@@ -10,7 +10,12 @@
 /// - `Err` when initialization in [`rust_gps_ntp::app::run`] fails.
 #[cfg(target_os = "espidf")]
 fn main() -> anyhow::Result<()> {
+    // https://esp-rs.github.io/esp-idf-sys/esp_idf_sys/fn.link_patches.html
+    // cargo doc --open -p esp-idf-sys --no-deps
+    // run first to makes sure esp rust libs are loaded
     esp_idf_svc::sys::link_patches();
+
+    // actual application entry point
     rust_gps_ntp::app::run()
 }
 
