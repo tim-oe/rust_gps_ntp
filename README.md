@@ -4,8 +4,9 @@ Rust firmware for a GPS-disciplined NTP server on:
 
 - Adafruit ESP32-S3 TFT Feather (default build target)
 - Adafruit Ultimate GPS FeatherWing
+- Adafruit adlogger FeatherWing
 
-
+![ESP32 Board](docs/imgs/feather-gps-ntp.jpg)
 
 This repository includes project setup, hardware notes, and a flash workflow
 for your connected board at `/dev/ttyACM0`.
