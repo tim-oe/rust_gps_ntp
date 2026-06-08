@@ -48,12 +48,13 @@ SAMPLE_INTERVAL_S = MIN_POLL_INTERVAL_S
 def measure(host: str, samples: int = SAMPLES) -> dict | None:
     """Return median measurement over `samples` queries, or None on failure."""
     results = []
-    for _ in range(samples):
+    for i in range(samples):
         try:
             results.append(query_ntp(host))
-            time.sleep(SAMPLE_INTERVAL_S)
         except Exception as exc:
             print(f"  [warn] {host}: {exc}")
+        if i < samples - 1:
+            time.sleep(SAMPLE_INTERVAL_S)
     if not results:
         return None
     offsets = sorted(r["offset_ms"] for r in results)
@@ -116,6 +117,11 @@ def main() -> int:
     dev = results[args.device]
     if dev is None:
         print(f"FAIL  device '{args.device}' is unreachable")
+        print(
+            "      hint: if warnings show KoD RATE, another client on this host"
+            f" (e.g. ntpd) may be polling the device — wait {SAMPLE_INTERVAL_S:.0f} s"
+            " and retry, or stop the local NTP client briefly"
+        )
         return 2
 
     if dev["stratum"] != 1:
@@ -140,6 +146,12 @@ def main() -> int:
         f" reference median {ref_median:+.3f} ms,"
         f" divergence {divergence:.3f} ms"
     )
+    if abs(dev["offset_ms"]) > 60_000:
+        print(
+            "FAIL  device offset is absurd (>60 s); likely unsynced RTC bootstrap"
+            " or stale anchor — reflash firmware and power-cycle after GPS lock"
+        )
+        return 2
     if divergence > args.tolerance:
         print(
             f"FAIL  divergence {divergence:.1f} ms exceeds tolerance {args.tolerance:.0f} ms"

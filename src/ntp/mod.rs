@@ -305,38 +305,39 @@ impl NtpServer {
         self.pending_leap = li.min(2);
     }
 
-    /// Update absolute UTC seconds from GPS, RTC, or another cached time source.
+    /// Seed coarse UTC from the RTC before GPS lock.
     ///
-    /// # Parameters
-    /// - `utc_unix_seconds`: UTC seconds since Unix epoch.
+    /// Only establishes an anchor when none exists yet.  Does **not** touch
+    /// [`Self::last_gps_utc_seconds`] or [`Self::last_gps_utc_update_us`] so a
+    /// stale RTC value cannot satisfy the PPS "GPS fresh" guard or masquerade as
+    /// a GPS fix.  No-op while PPS locked.
+    pub fn seed_utc_seconds(&mut self, utc_unix_seconds: i64) {
+        if self.pps_locked || self.clock_anchor.is_some() {
+            return;
+        }
+        self.clock_anchor = Some(ClockAnchor {
+            unix_seconds: utc_unix_seconds,
+            monotonic_us: monotonic_us_now(),
+        });
+    }
+
+    /// Update the latest GPS NMEA UTC second and anchor the clock pre-PPS.
     ///
-    /// # Returns
-    /// - No return value.
+    /// Applies [`NMEA_PPS_FUDGE_S`] because NMEA typically lags the PPS edge by
+    /// one second, and always overwrites any RTC bootstrap anchor.  Once PPS
+    /// discipline is active, only freshness is updated so lagged NMEA cannot pull
+    /// the anchor backward.
     pub fn update_gps_utc_seconds(&mut self, utc_unix_seconds: i64) {
         self.last_gps_utc_seconds = Some(utc_unix_seconds);
         let now_us = monotonic_us_now();
         self.last_gps_utc_update_us = Some(now_us);
-        match self.clock_anchor {
-            Some(anchor) => {
-                let elapsed_sec = now_us
-                    .saturating_sub(anchor.monotonic_us)
-                    .div_euclid(MICROS_PER_SEC);
-                let predicted = anchor.unix_seconds.saturating_add(elapsed_sec);
-                if predicted.saturating_sub(utc_unix_seconds).abs() > 1 {
-                    self.clock_anchor = Some(ClockAnchor {
-                        unix_seconds: utc_unix_seconds,
-                        monotonic_us: now_us,
-                    });
-                    log::debug!("NTP: UTC re-anchor from GPS");
-                }
-            }
-            None => {
-                self.clock_anchor = Some(ClockAnchor {
-                    unix_seconds: utc_unix_seconds,
-                    monotonic_us: now_us,
-                });
-            }
+        if self.pps_locked {
+            return;
         }
+        self.clock_anchor = Some(ClockAnchor {
+            unix_seconds: utc_unix_seconds.saturating_add(NMEA_PPS_FUDGE_S),
+            monotonic_us: now_us,
+        });
     }
 
     /// Feed a PPS pulse event into the discipline servo.
@@ -520,9 +521,11 @@ impl NtpServer {
             MAX_DISP_US
         };
 
-        // Declare stratum 1 as long as uncertainty is below the unsync threshold,
-        // even without a current GPS fix (holdover), so clients keep using us.
-        let stratum = if fully_synced || (has_anchor && disp_us < HOLDOVER_UNSYNC_US) {
+        // Stratum 1 requires live GPS+PPS or a PPS-locked holdover anchor.
+        // RTC/GPS bootstrap alone must stay at stratum 16 until PPS discipline.
+        let stratum = if fully_synced
+            || (self.pps_locked && has_anchor && pps_fresh && disp_us < HOLDOVER_UNSYNC_US)
+        {
             1_u8
         } else {
             16_u8
@@ -1420,20 +1423,89 @@ mod tests {
     }
 
     #[test]
-    fn update_gps_utc_seconds_establishes_anchor() {
+    fn update_gps_utc_seconds_establishes_anchor_with_nmea_fudge() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
         assert!(server.clock_anchor.is_some());
         assert_eq!(server.last_gps_utc_seconds, Some(1_700_000_000));
+        assert_eq!(
+            server.clock_anchor.expect("anchor").unix_seconds,
+            1_700_000_000 + NMEA_PPS_FUDGE_S
+        );
     }
 
     #[test]
-    fn update_gps_utc_seconds_reanchors_on_large_drift() {
+    fn update_gps_utc_seconds_tracks_latest_nmea_before_pps() {
         let mut server = NtpServer::new_for_test().expect("test socket");
         server.update_gps_utc_seconds(1_700_000_000);
         server.update_gps_utc_seconds(1_700_000_010);
         let anchor = server.clock_anchor.expect("anchor");
-        assert_eq!(anchor.unix_seconds, 1_700_000_010);
+        assert_eq!(anchor.unix_seconds, 1_700_000_010 + NMEA_PPS_FUDGE_S);
+    }
+
+    #[test]
+    fn update_gps_utc_seconds_overwrites_rtc_bootstrap_anchor() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.seed_utc_seconds(1_699_999_000);
+        server.update_gps_utc_seconds(1_700_000_000);
+        let anchor = server.clock_anchor.expect("anchor");
+        assert_eq!(
+            anchor.unix_seconds,
+            1_700_000_000 + NMEA_PPS_FUDGE_S,
+            "GPS+fudge must replace a 1 s-stale RTC bootstrap anchor"
+        );
+    }
+
+    #[test]
+    fn seed_utc_seconds_does_not_satisfy_pps_gps_fresh_guard() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.seed_utc_seconds(1_700_000_000);
+        server.pps_now(None);
+        assert!(
+            !server.pps_locked,
+            "PPS must not lock on RTC seed alone; wait for real GPS NMEA"
+        );
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.pps_now(None);
+        assert!(server.pps_locked);
+    }
+
+    #[test]
+    fn update_gps_utc_seconds_does_not_reanchor_when_pps_locked() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.pps_now(None);
+        let before = server.clock_anchor.expect("anchor").unix_seconds;
+        server.update_gps_utc_seconds(1_699_999_000);
+        assert_eq!(
+            server.clock_anchor.expect("anchor").unix_seconds,
+            before,
+            "lagged NMEA must not pull the PPS anchor backward"
+        );
+        assert_eq!(
+            server.last_gps_utc_seconds,
+            Some(1_699_999_000),
+            "freshness is still updated while PPS-locked"
+        );
+    }
+
+    #[test]
+    fn seed_utc_seconds_does_not_apply_nmea_fudge() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.seed_utc_seconds(1_700_000_000);
+        assert_eq!(
+            server.clock_anchor.expect("anchor").unix_seconds,
+            1_700_000_000
+        );
+    }
+
+    #[test]
+    fn seed_utc_seconds_does_not_overwrite_existing_anchor() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.update_gps_utc_seconds(1_700_000_000);
+        let before = server.clock_anchor.expect("anchor").unix_seconds;
+        server.seed_utc_seconds(1_699_999_000);
+        assert_eq!(server.clock_anchor.expect("anchor").unix_seconds, before);
     }
 
     #[test]
@@ -1801,8 +1873,8 @@ mod tests {
             "expected ~31 ms, got {:.1} ms",
             dp.root_disp_ms
         );
-        // Still stratum 1 since 31 ms < 1000 ms threshold.
-        assert_eq!(dp.stratum, 1, "should remain stratum 1 below 1 s threshold");
+        // PPS is stale (>10 s), so stratum 16 even though dispersion is still low.
+        assert_eq!(dp.stratum, 16, "stale PPS must drop to stratum 16");
     }
 
     #[test]

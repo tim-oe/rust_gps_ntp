@@ -314,7 +314,7 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     if let Some(secs) = boot_rtc_unix {
-        ntp_server.update_gps_utc_seconds(secs);
+        ntp_server.seed_utc_seconds(secs);
         log::info!("RTC: seeded NTP anchor from cached time (UTC {secs})");
     }
 
@@ -569,7 +569,7 @@ fn maybe_apply_rtc_fallback(
     if last_rtc_utc != &Some(secs) {
         log::debug!("RTC: feeding cached UTC {secs} (GPS fix lost)");
     }
-    ntp_server.update_gps_utc_seconds(secs);
+    ntp_server.seed_utc_seconds(secs);
     *last_rtc_utc = Some(secs);
     *last_rtc_fallback_us = now_us;
 }
