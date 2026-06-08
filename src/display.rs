@@ -3,7 +3,7 @@
 //! The display pipeline renders four rotating pages with GPS, battery, and
 //! system-health information.
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use core::sync::atomic::{AtomicBool, Ordering};
 // Official font docs (embedded-graphics mono/ascii):
 // https://docs.rs/embedded-graphics/latest/embedded_graphics/mono_font/ascii/index.html
@@ -22,6 +22,21 @@ use crate::ntp::{DisciplineState, NtpSnapshot};
 use crate::rtc::RtcSnapshot;
 use crate::storage::StorageStatus;
 
+/// TFT chip-select on the shared Feather SPI bus.
+pub const CS_PIN: i32 = 7;
+/// TFT data/command select.
+pub const DC_PIN: i32 = 39;
+/// TFT hardware reset.
+pub const RST_PIN: i32 = 40;
+/// TFT backlight PWM/GPIO.
+pub const BL_PIN: i32 = 45;
+/// TFT power-enable GPIO (active high).
+pub const POWER_PIN: i32 = 21;
+/// Page-toggle / wake button (active low with pull-up).
+pub const BUTTON_PIN: i32 = 0;
+/// SPI clock for the TFT device (40 MHz).
+pub const SPI_BAUD_MHZ: u32 = 40;
+
 pub const DISPLAY_DEBUG_ALWAYS_ON: bool = false;
 pub const DISPLAY_BACKLIGHT_ACTIVE_LOW: bool = false;
 pub const DISPLAY_X_OFFSET: i32 = 40;
@@ -29,6 +44,46 @@ pub const DISPLAY_Y_OFFSET: i32 = 52;
 const DISPLAY_WIDTH: u16 = 240;
 const DISPLAY_HEIGHT: u16 = 135;
 static BOOT_TEST_DRAWN: AtomicBool = AtomicBool::new(false);
+
+/// Logical panel width passed to ST7789 construction.
+pub const PANEL_WIDTH: u16 = DISPLAY_WIDTH;
+/// Logical panel height passed to ST7789 construction.
+pub const PANEL_HEIGHT: u16 = DISPLAY_HEIGHT;
+
+/// Enable the TFT power rail and wait for the panel to stabilize.
+pub fn enable_power(
+    pin: esp_idf_svc::hal::gpio::Gpio21,
+) -> anyhow::Result<
+    esp_idf_svc::hal::gpio::PinDriver<
+        'static,
+        esp_idf_svc::hal::gpio::Gpio21,
+        esp_idf_svc::hal::gpio::Output,
+    >,
+> {
+    use esp_idf_svc::hal::delay::FreeRtos;
+    use esp_idf_svc::hal::gpio::PinDriver;
+
+    let mut power = PinDriver::output(pin).context("failed to init TFT power enable")?;
+    power
+        .set_high()
+        .context("failed to enable TFT power rail")?;
+    FreeRtos::delay_ms(10);
+    Ok(power)
+}
+
+/// Drive the TFT chip-select high before another SPI device uses the shared bus.
+pub fn deselect_spi_cs() -> anyhow::Result<()> {
+    use esp_idf_svc::sys::{
+        GPIO_MODE_DEF_OUTPUT, gpio_reset_pin, gpio_set_direction, gpio_set_level,
+    };
+
+    esp_idf_svc::sys::esp!(unsafe {
+        gpio_reset_pin(CS_PIN);
+        gpio_set_direction(CS_PIN, GPIO_MODE_DEF_OUTPUT);
+        gpio_set_level(CS_PIN, 1)
+    })
+    .context("failed to deselect TFT SPI CS")
+}
 
 /// Application display pages shown by button rotation.
 #[derive(Debug, Copy, Clone)]

@@ -31,14 +31,16 @@ When stacked as a FeatherWing, the GPS board uses shared Feather rails:
 - Serial lines for NMEA traffic (GPS -> MCU UART receive)
 - Optional PPS line can be jumper-wired to any interrupt-capable GPIO
 
-## Firmware pin map (matches `src/app.rs` constants)
+## Firmware pin map (module-owned constants)
+
+Pin assignments live with the module that owns each peripheral (`gps.rs`, `pps.rs`, `display.rs`, `i2c_bus.rs`, `rtc.rs`, `storage.rs`):
 
 - GPS UART: TX=`GPIO1`, RX=`GPIO2`
 - PPS input: `GPIO12` (rising-edge interrupt)
-- TFT SPI: SCK=`GPIO36`, MOSI=`GPIO35`, CS=`GPIO7`, DC=`GPIO39`, RST=`GPIO40`, BL=`GPIO45`
+- TFT SPI: SCK=`GPIO36`, MOSI=`GPIO35`, CS=`GPIO7`, DC=`GPIO39`, RST=`GPIO40`, BL=`GPIO45`, power=`GPIO21`
 - Button (page toggle / wake): `GPIO0` (active low with pull-up)
-- Battery monitor I2C: SDA=`GPIO42`, SCL=`GPIO41` (MAX17048 or LC709203)
-- Adalogger RTC (PCF8523): Feather I2C SDA/SCL → `GPIO42`/`GPIO41` @ `0x68`
+- Feather I2C bus: SDA=`GPIO42`, SCL=`GPIO41` (battery gauge + Adalogger RTC)
+- Adalogger RTC (PCF8523): Feather I2C @ `0x68`
 - Adalogger microSD SPI ([pinouts](https://learn.adafruit.com/adafruit-adalogger-featherwing/pinouts)):
   - SCK=`GPIO36`, MOSI=`GPIO35`, MISO=`GPIO37` (shared with TFT SPI bus; TFT CS=`GPIO7`)
   - SD CS=`GPIO10` on ESP32-S3 TFT Feather + Adalogger (GPIO33 fallback; classic ESP32 uses GPIO33)

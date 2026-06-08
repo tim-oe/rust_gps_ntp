@@ -16,6 +16,9 @@ use esp_idf_svc::io::vfs::MountedFatfs;
 /// VFS mount point for the Adalogger microSD card.
 pub const MOUNT_POINT: &str = "/sdcard";
 
+/// How often the main loop refreshes FAT free/total bytes for the UI.
+pub const STATUS_REFRESH_US: i64 = 60_000_000;
+
 /// Marker file written at mount to confirm read/write access.
 const READY_MARKER: &str = "/sdcard/.rust_gps_ntp_ready";
 

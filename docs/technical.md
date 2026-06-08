@@ -57,7 +57,8 @@ The firmware is structured as a Rust library (`lib.rs`) that is conditionally co
 src/
 ├── lib.rs          # crate root; module declarations and cfg-gated exports
 ├── main.rs         # firmware entry point; calls app::run()
-├── app.rs          # peripheral init, main service loop, task coordination
+├── app.rs          # main service loop and task coordination
+├── i2c_bus.rs      # shared Feather I2C bus and I2cDevice trait
 ├── gps.rs          # NMEA sentence parsing, GpsSnapshot
 ├── pps.rs          # GPIO ISR capture, PPS interval tracking
 ├── ntp/
@@ -475,7 +476,7 @@ On first GPS fix the device looks up the IANA timezone for the current coordinat
 1. [Open-Meteo forecast API](https://open-meteo.com/en/docs) – no API key required; JSON field `timezone` (HTTPS).
 2. [GeoNames timezoneJSON](https://secure.geonames.org/) – demo account, rate-limited; JSON field `timezoneId` (HTTPS via `secure.geonames.org`; `api.geonames.org` has a mismatched TLS certificate).
 
-The timezone string is persisted to the ESP-IDF NVS partition (namespace `rust_gps_ntp`, key `local_tz`) so it survives power cycles. The cache is refreshed every 6 hours (`TZ_LOOKUP_REFRESH_US = 21_600_000_000 µs`); on cache miss a retry fires every 5 minutes (`TZ_LOOKUP_RETRY_US = 300_000_000 µs`).
+The timezone string is persisted to the ESP-IDF NVS partition (namespace `rust_gps_ntp`, key `local_tz`) so it survives power cycles. The cache is refreshed every 6 hours (`timezone::LOOKUP_REFRESH_US`); on cache miss a retry fires every 5 minutes (`timezone::LOOKUP_RETRY_US`).
 
 ---
 
@@ -510,7 +511,7 @@ Uses `esp_idf_svc::wifi::EspWifi` to connect to a WPA2 access point. Credentials
 
 ## Pin Map
 
-See [`docs/hardware.md`](hardware.md) for the canonical pin map, assembly notes, and bring-up checklist. The GPIO assignments referenced in the code are defined as named constants in `src/app.rs` (`GPS_UART_TX_PIN`, `GPS_UART_RX_PIN`, `PPS_GPIO_PIN`, `BOARD_I2C_SDA_PIN`, `BOARD_I2C_SCL_PIN`).
+See [`docs/hardware.md`](hardware.md) for the canonical pin map, assembly notes, and bring-up checklist. GPIO assignments are defined as named constants in each peripheral module (`gps`, `pps`, `display`, `i2c_bus`, `rtc`, `storage`).
 
 ---
 

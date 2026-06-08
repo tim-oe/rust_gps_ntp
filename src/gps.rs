@@ -10,6 +10,43 @@ use chrono_tz::Tz;
 use std::str::FromStr;
 use std::sync::{OnceLock, RwLock};
 
+#[cfg(target_os = "espidf")]
+use anyhow::Context;
+#[cfg(target_os = "espidf")]
+use esp_idf_svc::hal::gpio;
+#[cfg(target_os = "espidf")]
+use esp_idf_svc::hal::peripheral::Peripheral;
+#[cfg(target_os = "espidf")]
+use esp_idf_svc::hal::prelude::*;
+#[cfg(target_os = "espidf")]
+use esp_idf_svc::hal::uart::{self, UartDriver};
+
+/// GPS module UART TX pin (NMEA output from the FeatherWing).
+#[cfg(target_os = "espidf")]
+pub const UART_TX_PIN: i32 = 1;
+/// GPS module UART RX pin (NMEA input to the ESP32).
+#[cfg(target_os = "espidf")]
+pub const UART_RX_PIN: i32 = 2;
+
+/// Initialize UART1 for GPS NMEA at 9600 baud.
+#[cfg(target_os = "espidf")]
+pub fn init_uart<UART: uart::Uart>(
+    uart_peripheral: impl Peripheral<P = UART> + 'static,
+    tx: impl gpio::InputPin + gpio::OutputPin + 'static,
+    rx: impl gpio::InputPin + 'static,
+) -> anyhow::Result<UartDriver<'static>> {
+    let cfg = uart::config::Config::default().baudrate(Hertz(9_600));
+    UartDriver::new(
+        uart_peripheral,
+        tx,
+        rx,
+        Option::<gpio::Gpio0>::None,
+        Option::<gpio::Gpio1>::None,
+        &cfg,
+    )
+    .context("failed to initialize GPS UART")
+}
+
 static RUNTIME_TZ: OnceLock<RwLock<Option<Tz>>> = OnceLock::new();
 
 /// Current GPS-derived values used by UI and NTP logic.

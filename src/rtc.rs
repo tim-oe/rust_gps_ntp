@@ -6,10 +6,15 @@
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
 
 #[cfg(target_os = "espidf")]
-use esp_idf_svc::hal::i2c;
+use crate::i2c_bus::{FeatherI2cBus, I2cDevice};
 
 /// PCF8523 7-bit I2C address on the Adalogger FeatherWing.
 pub const PCF8523_ADDR: u8 = 0x68;
+
+/// Minimum interval between PCF8523 writebacks from disciplined GPS time.
+pub const WRITEBACK_INTERVAL_US: i64 = 60_000_000;
+/// How often to feed cached RTC UTC into NTP when GPS fix is lost.
+pub const FALLBACK_INTERVAL_US: i64 = 1_000_000;
 
 /// Decoded calendar fields from PCF8523 time registers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,11 +158,60 @@ pub enum RtcProbe {
     Absent,
 }
 
+#[cfg(target_os = "espidf")]
+struct Pcf8523;
+
+#[cfg(target_os = "espidf")]
+impl I2cDevice for Pcf8523 {
+    const ADDR: u8 = PCF8523_ADDR;
+}
+
+/// Boot-time RTC probe result on the shared Feather I2C bus.
+#[cfg(target_os = "espidf")]
+#[derive(Debug, Clone, Copy)]
+pub struct RtcDevice {
+    /// Whether a PCF8523 responded on I2C.
+    pub present: bool,
+    /// Cached UTC seconds read at boot, when valid.
+    pub boot_utc: Option<i64>,
+}
+
+#[cfg(target_os = "espidf")]
+impl RtcDevice {
+    /// Probe, initialize, and read the Adalogger PCF8523 RTC.
+    pub fn init(bus: &mut FeatherI2cBus) -> Self {
+        let present = detect(bus);
+        let boot_utc = if present {
+            if let Err(err) = init_chip(bus) {
+                log::warn!("RTC: PCF8523 init failed: {err}");
+            }
+            match read_unix_seconds(bus) {
+                Ok(secs) => {
+                    log::info!("RTC: PCF8523 @ 0x{PCF8523_ADDR:02X} reads UTC {secs}");
+                    Some(secs)
+                }
+                Err(err) => {
+                    log::warn!(
+                        "RTC: PCF8523 present @ 0x{PCF8523_ADDR:02X} but time unset/invalid ({err}); waiting for GPS"
+                    );
+                    None
+                }
+            }
+        } else {
+            log::warn!(
+                "RTC: no PCF8523 response @ 0x{PCF8523_ADDR:02X} — check Adalogger stack and CR1220"
+            );
+            None
+        };
+        Self { present, boot_utc }
+    }
+}
+
 /// Check whether a PCF8523 responds on I2C (does not require valid time).
 #[cfg(target_os = "espidf")]
-pub fn probe(i2c: &mut i2c::I2cDriver<'_>) -> RtcProbe {
+pub fn probe(bus: &mut FeatherI2cBus) -> RtcProbe {
     let mut control = [0_u8];
-    match i2c.write_read(PCF8523_ADDR, &[REG_CONTROL1], &mut control, 50) {
+    match bus.write_read::<Pcf8523>(&[REG_CONTROL1], &mut control) {
         Ok(()) => RtcProbe::Present,
         Err(err) => {
             log::debug!("RTC: I2C probe @ 0x{PCF8523_ADDR:02X} failed: {err}");
@@ -168,36 +222,32 @@ pub fn probe(i2c: &mut i2c::I2cDriver<'_>) -> RtcProbe {
 
 /// Clear stop/run flags and set battery switchover defaults (matches RTClib `begin()`).
 #[cfg(target_os = "espidf")]
-pub fn init(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<()> {
-    i2c.write(PCF8523_ADDR, &[REG_CONTROL1, 0x00], 50)
-        .map_err(|e| anyhow::anyhow!("PCF8523 init CONTROL1 failed: {e}"))?;
-    i2c.write(PCF8523_ADDR, &[REG_CONTROL2, 0x00], 50)
-        .map_err(|e| anyhow::anyhow!("PCF8523 init CONTROL2 failed: {e}"))?;
-    i2c.write(PCF8523_ADDR, &[REG_CONTROL3, 0x00], 50)
-        .map_err(|e| anyhow::anyhow!("PCF8523 init CONTROL3 failed: {e}"))?;
+pub fn init_chip(bus: &mut FeatherI2cBus) -> anyhow::Result<()> {
+    bus.write::<Pcf8523>(&[REG_CONTROL1, 0x00])?;
+    bus.write::<Pcf8523>(&[REG_CONTROL2, 0x00])?;
+    bus.write::<Pcf8523>(&[REG_CONTROL3, 0x00])?;
     Ok(())
 }
 
 /// Probe the shared I2C bus for a PCF8523 RTC.
 #[cfg(target_os = "espidf")]
-pub fn detect(i2c: &mut i2c::I2cDriver<'_>) -> bool {
-    matches!(probe(i2c), RtcProbe::Present)
+pub fn detect(bus: &mut FeatherI2cBus) -> bool {
+    matches!(probe(bus), RtcProbe::Present)
 }
 
 /// Read the current RTC time as Unix UTC seconds.
 #[cfg(target_os = "espidf")]
-pub fn read_unix_seconds(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<i64> {
-    let dt = read_datetime(i2c)?;
+pub fn read_unix_seconds(bus: &mut FeatherI2cBus) -> anyhow::Result<i64> {
+    let dt = read_datetime(bus)?;
     datetime_to_unix_seconds(dt)
         .ok_or_else(|| anyhow::anyhow!("PCF8523 datetime invalid after decode"))
 }
 
 /// Read and decode the PCF8523 calendar registers.
 #[cfg(target_os = "espidf")]
-pub fn read_datetime(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<RtcDateTime> {
+pub fn read_datetime(bus: &mut FeatherI2cBus) -> anyhow::Result<RtcDateTime> {
     let mut regs = [0_u8; 7];
-    i2c.write_read(PCF8523_ADDR, &[REG_SECONDS], &mut regs, 50)
-        .map_err(|e| anyhow::anyhow!("PCF8523 read time failed: {e}"))?;
+    bus.write_read::<Pcf8523>(&[REG_SECONDS], &mut regs)?;
 
     decode_datetime_regs(regs)
         .ok_or_else(|| anyhow::anyhow!("PCF8523 returned invalid or unset time"))
@@ -205,35 +255,33 @@ pub fn read_datetime(i2c: &mut i2c::I2cDriver<'_>) -> anyhow::Result<RtcDateTime
 
 /// Write UTC time to the PCF8523 (clock is briefly stopped during the write).
 #[cfg(target_os = "espidf")]
-pub fn write_unix_seconds(i2c: &mut i2c::I2cDriver<'_>, unix_seconds: i64) -> anyhow::Result<()> {
+pub fn write_unix_seconds(bus: &mut FeatherI2cBus, unix_seconds: i64) -> anyhow::Result<()> {
     let dt = unix_seconds_to_datetime(unix_seconds)
         .ok_or_else(|| anyhow::anyhow!("UTC {unix_seconds} out of PCF8523 range"))?;
-    write_datetime(i2c, dt)
+    write_datetime(bus, dt)
 }
 
 /// Write calendar fields to the PCF8523.
 #[cfg(target_os = "espidf")]
-pub fn write_datetime(i2c: &mut i2c::I2cDriver<'_>, dt: RtcDateTime) -> anyhow::Result<()> {
+pub fn write_datetime(bus: &mut FeatherI2cBus, dt: RtcDateTime) -> anyhow::Result<()> {
     let mut control = [0_u8];
-    i2c.write_read(PCF8523_ADDR, &[REG_CONTROL1], &mut control, 50)
-        .map_err(|e| anyhow::anyhow!("PCF8523 read CONTROL1 failed: {e}"))?;
+    bus.write_read::<Pcf8523>(&[REG_CONTROL1], &mut control)?;
 
     let stop = control[0] | STOP_BIT;
-    i2c.write(PCF8523_ADDR, &[REG_CONTROL1, stop], 50)
-        .map_err(|e| anyhow::anyhow!("PCF8523 stop clock failed: {e}"))?;
+    bus.write::<Pcf8523>(&[REG_CONTROL1, stop])?;
 
     let payload = encode_datetime_regs(dt);
     let mut buf = [0_u8; 8];
     buf[0] = REG_SECONDS;
     buf[1..].copy_from_slice(&payload);
-    let write_result = i2c.write(PCF8523_ADDR, &buf, 50);
+    let write_result = bus.write::<Pcf8523>(&buf);
 
     let run = control[0] & !STOP_BIT;
-    if let Err(err) = i2c.write(PCF8523_ADDR, &[REG_CONTROL1, run], 50) {
+    if let Err(err) = bus.write::<Pcf8523>(&[REG_CONTROL1, run]) {
         log::warn!("PCF8523 restart clock failed: {err}");
     }
 
-    write_result.map_err(|e| anyhow::anyhow!("PCF8523 write time failed: {e}"))
+    write_result
 }
 
 #[cfg(test)]

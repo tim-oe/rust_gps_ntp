@@ -340,6 +340,12 @@ impl NtpServer {
         });
     }
 
+    fn gps_time_fresh(&self, edge_us: i64) -> bool {
+        self.last_gps_utc_update_us
+            .map(|t| edge_us.saturating_sub(t) < GPS_STALE_THRESHOLD_US)
+            .unwrap_or(false)
+    }
+
     /// Feed a PPS pulse event into the discipline servo.
     ///
     /// Pass `None` for the first observed pulse to align the anchor to GPS UTC
@@ -366,10 +372,7 @@ impl NtpServer {
                 // fed us a UTC value recently.  Stale GPS data (from before a
                 // module reset or cold-start) must not be used to initialise the
                 // clock anchor.
-                let gps_fresh = self
-                    .last_gps_utc_update_us
-                    .map(|t| now_us.saturating_sub(t) < GPS_STALE_THRESHOLD_US)
-                    .unwrap_or(false);
+                let gps_fresh = self.gps_time_fresh(now_us);
 
                 if !gps_fresh {
                     log::debug!(
@@ -399,6 +402,28 @@ impl NtpServer {
             }
             Some(interval) => {
                 if !(800_000..=1_200_000).contains(&interval) {
+                    return;
+                }
+
+                // First lock may arrive on the Delta path when the initial pulse
+                // was skipped (no GPS fix yet) or when pulses accumulated during
+                // boot before the main loop ran.  Align to GPS+PPS fudge — do not
+                // increment an RTC bootstrap anchor, which lacks NMEA_PPS_FUDGE_S.
+                if !self.pps_locked {
+                    if !self.gps_time_fresh(now_us) {
+                        return;
+                    }
+                    let Some(gps_utc) = self.last_gps_utc_seconds else {
+                        return;
+                    };
+                    self.clock_anchor = Some(ClockAnchor {
+                        unix_seconds: gps_utc + NMEA_PPS_FUDGE_S,
+                        monotonic_us: now_us,
+                    });
+                    self.pps_locked = true;
+                    self.last_pps_monotonic_us = Some(now_us);
+                    self.last_sync_ntp_ts = self.current_ntp_timestamp();
+                    log::debug!("NTP: PPS delta first lock, aligned to GPS UTC {gps_utc}");
                     return;
                 }
 
@@ -1468,6 +1493,36 @@ mod tests {
         server.update_gps_utc_seconds(1_700_000_000);
         server.pps_now(None);
         assert!(server.pps_locked);
+    }
+
+    #[test]
+    fn observe_pps_pulse_delta_does_not_lock_on_rtc_seed_without_gps() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.seed_utc_seconds(1_700_000_000);
+        server.pps_now(Some(1_000_000));
+        assert!(
+            !server.pps_locked,
+            "Delta path must not lock on RTC bootstrap without GPS UTC"
+        );
+        assert_eq!(
+            server.clock_anchor.expect("anchor").unix_seconds,
+            1_700_000_000,
+            "RTC anchor must not be incremented without GPS lock"
+        );
+    }
+
+    #[test]
+    fn observe_pps_pulse_delta_first_lock_applies_nmea_pps_fudge() {
+        let mut server = NtpServer::new_for_test().expect("test socket");
+        server.seed_utc_seconds(1_700_000_000);
+        server.pps_now(None);
+        server.update_gps_utc_seconds(1_700_000_000);
+        server.pps_now(Some(1_000_000));
+        assert!(server.pps_locked);
+        assert_eq!(
+            server.clock_anchor.expect("anchor").unix_seconds,
+            1_700_000_000 + NMEA_PPS_FUDGE_S
+        );
     }
 
     #[test]

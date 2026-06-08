@@ -7,6 +7,15 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
 
+#[cfg(target_os = "espidf")]
+use anyhow::Context;
+#[cfg(target_os = "espidf")]
+use esp_idf_svc::hal::gpio::{self, Input, InterruptType, PinDriver};
+
+/// PPS input GPIO monitored with a rising-edge interrupt.
+#[cfg(target_os = "espidf")]
+pub const GPIO_PIN: i32 = 12;
+
 /// Atomic state shared between the PPS GPIO ISR and the main service loop.
 pub struct PpsMonitor {
     edge_us: Arc<AtomicU64>,
@@ -137,6 +146,32 @@ impl PpsMonitor {
         state.last_edge_us = now_us;
         Some(event)
     }
+}
+
+/// Configure a GPIO input for PPS rising-edge capture via ISR.
+#[cfg(target_os = "espidf")]
+pub fn configure_interrupt<P>(
+    pin: &mut PinDriver<'static, P, Input>,
+    monitor: &PpsMonitor,
+) -> anyhow::Result<()>
+where
+    P: gpio::InputPin,
+{
+    let edge_us = monitor.edge_us();
+    let count = monitor.count();
+    unsafe {
+        pin.subscribe_nonstatic(move || {
+            let now_us = esp_idf_svc::sys::esp_timer_get_time() as u64;
+            PpsMonitor::record_edge(&edge_us, &count, now_us);
+        })
+        .context("failed to subscribe PPS ISR callback")?;
+    }
+    pin.set_interrupt_type(InterruptType::PosEdge)
+        .context("failed to set PPS interrupt type")?;
+    pin.enable_interrupt()
+        .context("failed to enable PPS interrupt")?;
+    log::info!("PPS: monitoring GPIO{GPIO_PIN} (rising-edge interrupt)");
+    Ok(())
 }
 
 /// Compute the microsecond interval between consecutive PPS edges.

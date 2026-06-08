@@ -26,6 +26,20 @@ const SD_TZ_CACHE_DIR: &str = "/sdcard/.rust_gps_ntp";
 #[cfg(target_os = "espidf")]
 const SD_TZ_CACHE_PATH: &str = "/sdcard/.rust_gps_ntp/local_tz";
 
+/// Retry interval while no timezone has been resolved yet (5 minutes).
+pub const LOOKUP_RETRY_US: i64 = 300_000_000;
+/// Refresh interval for cached timezone lookups (6 hours).
+pub const LOOKUP_REFRESH_US: i64 = 21_600_000_000;
+
+/// Return the lookup interval for the current timezone initialization state.
+pub fn lookup_interval_us(tz_initialized: bool) -> i64 {
+    if tz_initialized {
+        LOOKUP_REFRESH_US
+    } else {
+        LOOKUP_RETRY_US
+    }
+}
+
 /// NVS-backed storage for resolved IANA timezone names.
 #[cfg(target_os = "espidf")]
 pub struct TimezoneStore {

@@ -9,14 +9,14 @@ use std::thread::{self, JoinHandle};
 use anyhow::Context;
 use esp_idf_svc::hal::delay::{Ets, FreeRtos};
 use esp_idf_svc::hal::gpio::{self, Input, PinDriver, Pull};
-use esp_idf_svc::hal::i2c;
 use portable_atomic::{AtomicI64, AtomicU32};
 use st7789::{BacklightState, ST7789};
 use std::sync::atomic::Ordering;
 
-use crate::battery::{self, BatteryMonitor, BatterySnapshot};
+use crate::battery::{self, BatteryDevice, BatterySnapshot};
 use crate::display::{self, Page};
 use crate::gps::GpsSnapshot;
+use crate::i2c_bus::FeatherI2cBus;
 use crate::ntp::NtpSnapshot;
 use crate::rtc::{self, RtcSnapshot};
 use crate::storage::StorageStatus;
@@ -157,9 +157,9 @@ impl UiTaskHandle {
     /// - `feed`: Shared feed updated by the main service loop.
     /// - `display`: Initialized ST7789 panel driver (moved into the UI task).
     /// - `button`: Page/wake button on `GPIO0` (moved into the UI task).
-    /// - `i2c_drv`: I2C driver for battery monitor reads (moved into the UI task).
-    /// - `battery_monitor`: Detected gauge type, if any, for periodic sampling.
-    /// - `rtc_present`: Whether a PCF8523 RTC was detected on the I2C bus.
+    /// - `i2c_bus`: Shared Feather I2C bus for battery and RTC access (moved into the UI task).
+    /// - `battery`: Detected fuel gauge, if any, for periodic sampling.
+    /// - `rtc`: Boot-time RTC probe result.
     /// - `backlight_on_state`: Backlight level that represents the panel-on state.
     ///
     /// # Returns
@@ -170,9 +170,9 @@ impl UiTaskHandle {
         feed: Arc<UiFeed>,
         mut display: ST7789<DI, RST, BL>,
         mut button: PinDriver<'static, gpio::Gpio0, Input>,
-        mut i2c_drv: i2c::I2cDriver<'static>,
-        battery_monitor: Option<BatteryMonitor>,
-        rtc_present: bool,
+        mut i2c_bus: FeatherI2cBus,
+        battery: BatteryDevice,
+        rtc: rtc::RtcDevice,
         backlight_on_state: BacklightState,
     ) -> anyhow::Result<Self>
     where
@@ -208,9 +208,9 @@ impl UiTaskHandle {
                     feed,
                     &mut display,
                     &mut button,
-                    &mut i2c_drv,
-                    battery_monitor,
-                    rtc_present,
+                    &mut i2c_bus,
+                    battery,
+                    rtc,
                     backlight_on_state,
                 );
             })
@@ -237,8 +237,9 @@ impl UiTaskHandle {
 /// - `feed`: Shared GPS/PPS feed written by the main loop.
 /// - `display`: ST7789 panel used for SPI drawing.
 /// - `button`: Active-low page button with internal pull-up.
-/// - `i2c_drv`: I2C bus used for battery monitor register reads.
-/// - `battery_monitor`: Detected gauge type, if any.
+/// - `i2c_bus`: Shared Feather I2C bus for battery and RTC register access.
+/// - `battery`: Detected fuel gauge, if any.
+/// - `rtc`: Boot-time RTC probe result.
 /// - `backlight_on_state`: Backlight level representing panel-on.
 ///
 /// # Returns
@@ -247,9 +248,9 @@ fn ui_task_main<DI, RST, BL, PinE>(
     feed: Arc<UiFeed>,
     display: &mut ST7789<DI, RST, BL>,
     button: &mut PinDriver<'static, gpio::Gpio0, Input>,
-    i2c_drv: &mut i2c::I2cDriver<'static>,
-    battery_monitor: Option<BatteryMonitor>,
-    rtc_present: bool,
+    i2c_bus: &mut FeatherI2cBus,
+    battery: BatteryDevice,
+    rtc: rtc::RtcDevice,
     backlight_on_state: BacklightState,
 ) where
     DI: display_interface::WriteOnlyDataCommand,
@@ -262,7 +263,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
         >,
 {
     let mut ets = Ets;
-    let mut battery = BatterySnapshot::default();
+    let mut battery_sample = BatterySnapshot::default();
     let mut last_battery_us = 0_i64;
     let mut last_rtc_us = 0_i64;
     let mut last_draw_us = 0_i64;
@@ -277,26 +278,26 @@ fn ui_task_main<DI, RST, BL, PinE>(
         let now_us = monotonic_us();
 
         if last_battery_us == 0 || (now_us - last_battery_us) >= BATTERY_SAMPLE_US {
-            if let Some(kind) = battery_monitor {
-                match battery::read_battery(i2c_drv, kind) {
-                    Ok(reading) => battery = reading,
+            if let Some(kind) = battery.monitor {
+                match battery::read_battery(i2c_bus, kind) {
+                    Ok(reading) => battery_sample = reading,
                     Err(err) => log::debug!("Battery: read failed: {}", err),
                 }
             }
             last_battery_us = now_us;
         }
 
-        if rtc_present {
+        if rtc.present {
             let pending_write = feed.rtc_write_pending.swap(0, Ordering::Relaxed);
             if pending_write > 0 {
-                match rtc::write_unix_seconds(i2c_drv, pending_write) {
+                match rtc::write_unix_seconds(i2c_bus, pending_write) {
                     Ok(()) => log::debug!("RTC: wrote UTC {pending_write} from discipline"),
                     Err(err) => log::warn!("RTC: write failed: {err}"),
                 }
             }
 
             if last_rtc_us == 0 || (now_us - last_rtc_us) >= RTC_SAMPLE_US {
-                let snap = match rtc::read_unix_seconds(i2c_drv) {
+                let snap = match rtc::read_unix_seconds(i2c_bus) {
                     Ok(secs) => RtcSnapshot {
                         detected: true,
                         utc_unix_seconds: Some(secs),
@@ -348,7 +349,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
                 &mut panel,
                 current_page,
                 &gps,
-                &battery,
+                &battery_sample,
                 pps_delta_us,
                 &ntp,
                 storage,
