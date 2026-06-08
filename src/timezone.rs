@@ -13,11 +13,18 @@ use embedded_svc::utils::io;
 use esp_idf_svc::http::client::{Configuration as HttpConfiguration, EspHttpConnection};
 #[cfg(target_os = "espidf")]
 use esp_idf_svc::nvs::{EspDefaultNvs, EspDefaultNvsPartition, EspNvs};
+#[cfg(target_os = "espidf")]
+use std::str::FromStr;
 
 #[cfg(target_os = "espidf")]
 const NVS_NAMESPACE: &str = "rust_gps_ntp";
 #[cfg(target_os = "espidf")]
 const NVS_KEY_LOCAL_TZ: &str = "local_tz";
+/// IANA timezone backup on microSD (survives NVS erase during development flashes).
+#[cfg(target_os = "espidf")]
+const SD_TZ_CACHE_DIR: &str = "/sdcard/.rust_gps_ntp";
+#[cfg(target_os = "espidf")]
+const SD_TZ_CACHE_PATH: &str = "/sdcard/.rust_gps_ntp/local_tz";
 
 /// NVS-backed storage for resolved IANA timezone names.
 #[cfg(target_os = "espidf")]
@@ -71,6 +78,83 @@ impl TimezoneStore {
         self.nvs
             .set_str(NVS_KEY_LOCAL_TZ, tz_name)
             .map_err(|e| anyhow!("failed to write NVS key {NVS_KEY_LOCAL_TZ}: {e}"))
+    }
+}
+
+/// Load a cached IANA timezone from the microSD backup file.
+#[cfg(target_os = "espidf")]
+pub fn load_cached_sd() -> Option<String> {
+    use std::fs;
+    use std::io::Read;
+
+    if !crate::storage::is_ready() {
+        return None;
+    }
+    let mut file = fs::File::open(SD_TZ_CACHE_PATH).ok()?;
+    let mut buf = [0_u8; 64];
+    let n = file.read(&mut buf).ok()?;
+    let name = std::str::from_utf8(&buf[..n]).ok()?.trim();
+    if name.is_empty() || chrono_tz::Tz::from_str(name).is_err() {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// Persist an IANA timezone to the microSD backup file.
+#[cfg(target_os = "espidf")]
+pub fn save_cached_sd(tz_name: &str) -> anyhow::Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+
+    if !crate::storage::is_ready() {
+        return Ok(());
+    }
+    fs::create_dir_all(SD_TZ_CACHE_DIR)
+        .map_err(|e| anyhow!("failed to create {SD_TZ_CACHE_DIR}: {e}"))?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(SD_TZ_CACHE_PATH)
+        .map_err(|e| anyhow!("failed to open {SD_TZ_CACHE_PATH}: {e}"))?;
+    file.write_all(tz_name.as_bytes())
+        .map_err(|e| anyhow!("failed to write {SD_TZ_CACHE_PATH}: {e}"))
+}
+
+/// Persist timezone to NVS and, when mounted, microSD.
+#[cfg(target_os = "espidf")]
+pub fn persist_cached(tz_name: &str, store: Option<&mut TimezoneStore>) {
+    if let Some(store) = store {
+        if let Err(err) = store.save(tz_name) {
+            log::warn!(
+                "GPS: failed to persist timezone to NVS '{}': {}",
+                tz_name,
+                err
+            );
+        }
+    }
+    if let Err(err) = save_cached_sd(tz_name) {
+        log::warn!(
+            "GPS: failed to persist timezone to SD '{}': {}",
+            tz_name,
+            err
+        );
+    }
+}
+
+/// Apply a cached IANA timezone name to the runtime clock and log the source.
+#[cfg(target_os = "espidf")]
+pub fn apply_cached_timezone(tz_name: &str, source: &str) -> bool {
+    if crate::gps::set_runtime_timezone(tz_name) {
+        log::info!("GPS: loaded cached timezone {} ({source})", tz_name);
+        true
+    } else {
+        log::warn!(
+            "GPS: cached timezone '{}' from {} is invalid; will refresh",
+            tz_name,
+            source
+        );
+        false
     }
 }
 

@@ -3,7 +3,9 @@
 //! The parser ingests NMEA RMC/GGA sentences and maintains a lightweight state
 //! object that is consumed by display and NTP paths.
 
-use chrono::{Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Offset};
+use chrono::{
+    Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc,
+};
 use chrono_tz::Tz;
 use std::str::FromStr;
 use std::sync::{OnceLock, RwLock};
@@ -213,6 +215,35 @@ pub fn set_runtime_timezone(tz_name: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Local offset in whole hours for `utc_unix_seconds` using the active IANA TZ.
+///
+/// Uses the runtime timezone when set, otherwise the `LOCAL_TZ` build-time default.
+/// Returns `0` when neither is configured.
+pub fn tz_offset_hours_at_unix(utc_unix_seconds: i64) -> i8 {
+    let Some(tz) = configured_timezone() else {
+        return 0;
+    };
+    let Some(utc_dt) = Utc.timestamp_opt(utc_unix_seconds, 0).single() else {
+        return 0;
+    };
+    let local = utc_dt.with_timezone(&tz);
+    (local.offset().fix().local_minus_utc() / 3600) as i8
+}
+
+/// Format UTC Unix seconds as local date/time using the active IANA timezone.
+///
+/// Uses the runtime timezone when set, otherwise the `LOCAL_TZ` build-time default.
+/// Returns `None` when neither is configured.
+pub fn local_from_utc_unix(utc_unix_seconds: i64) -> Option<(String, String)> {
+    let tz = configured_timezone()?;
+    let utc_dt = Utc.timestamp_opt(utc_unix_seconds, 0).single()?;
+    let local = utc_dt.with_timezone(&tz);
+    Some((
+        local.date_naive().format("%Y-%m-%d").to_string(),
+        local.time().format("%H:%M:%S").to_string(),
+    ))
 }
 
 /// Convert raw UTC date/time NMEA fields into a UTC `NaiveDateTime`.
@@ -457,6 +488,16 @@ mod tests {
 
     #[test]
     #[serial]
+    fn local_from_utc_unix_uses_runtime_timezone() {
+        assert!(set_runtime_timezone("America/Chicago"));
+        // 2026-06-01 18:00:00 UTC -> 13:00:00 CDT.
+        let (date, time) = local_from_utc_unix(1_780_336_800).expect("local time");
+        assert_eq!(date, "2026-06-01");
+        assert_eq!(time, "13:00:00");
+        assert_eq!(tz_offset_hours_at_unix(1_780_336_800), -5);
+    }
+
+    #[test]
     fn runtime_timezone_override_applies_dst_rules_for_winter() {
         assert!(set_runtime_timezone("America/Chicago"));
         let mut gps = GpsSnapshot::default();

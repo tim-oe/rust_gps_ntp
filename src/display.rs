@@ -409,9 +409,11 @@ fn gps_use_rtc_fallback(gps: &GpsSnapshot) -> bool {
 fn display_time_source(gps: &GpsSnapshot, rtc: RtcSnapshot) -> (String, String, bool) {
     if gps_use_rtc_fallback(gps) {
         if let Some(utc) = rtc.utc_unix_seconds {
-            if let Some((date, time)) =
-                crate::rtc::local_date_time_from_utc(utc, gps.tz_offset_hours)
-            {
+            if let Some((date, time)) = crate::gps::local_from_utc_unix(utc) {
+                return (time, date, true);
+            }
+            let offset = crate::gps::tz_offset_hours_at_unix(utc).max(gps.tz_offset_hours);
+            if let Some((date, time)) = crate::rtc::local_date_time_from_utc(utc, offset) {
                 return (time, date, true);
             }
         }
@@ -437,7 +439,11 @@ fn rtc_local_strings(rtc: RtcSnapshot, tz_offset_hours: i8) -> (String, String) 
         return ("n/a".to_owned(), "n/a".to_owned());
     }
     if let Some(utc) = rtc.utc_unix_seconds {
-        if let Some((date, time)) = crate::rtc::local_date_time_from_utc(utc, tz_offset_hours) {
+        if let Some((date, time)) = crate::gps::local_from_utc_unix(utc) {
+            return (time, date);
+        }
+        let offset = crate::gps::tz_offset_hours_at_unix(utc).max(tz_offset_hours);
+        if let Some((date, time)) = crate::rtc::local_date_time_from_utc(utc, offset) {
             return (time, date);
         }
     }

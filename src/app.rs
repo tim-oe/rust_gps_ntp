@@ -52,7 +52,7 @@ use crate::ntp::{self, DisciplineState};
 use crate::pps::{PpsEvent, PpsMonitor, PpsPollState};
 use crate::rtc;
 use crate::storage::{self, StorageStatus};
-use crate::timezone::{TimezoneStore, TimezoneWorker};
+use crate::timezone::{self, TimezoneStore, TimezoneWorker};
 use crate::ui_task::{UiFeed, UiTaskHandle};
 use crate::wifi;
 #[cfg(esp_idf_comp_mdns_enabled)]
@@ -257,6 +257,45 @@ pub fn run() -> anyhow::Result<()> {
     let mut ets = Ets;
     let backlight_on_state = display::init_display(&mut display, &mut ets)?;
 
+    let mut gps = GpsSnapshot::default();
+    let mut tz_store = match TimezoneStore::new(default_nvs_tz.clone()) {
+        Ok(store) => Some(store),
+        Err(err) => {
+            log::warn!("GPS: timezone NVS store unavailable: {}", err);
+            None
+        }
+    };
+    let mut tz_initialized = false;
+    let mut current_tz_name: Option<String> = None;
+
+    let mut cached_tz_name = None;
+    if let Some(store) = tz_store.as_ref() {
+        match store.load_cached() {
+            Ok(Some(tz_name)) => cached_tz_name = Some((tz_name, "NVS")),
+            Ok(None) => {}
+            Err(err) => log::warn!("GPS: failed to read timezone cache from NVS: {}", err),
+        }
+    }
+    if cached_tz_name.is_none() {
+        if let Some(tz_name) = timezone::load_cached_sd() {
+            cached_tz_name = Some((tz_name, "SD"));
+        }
+    }
+    if let Some((tz_name, source)) = cached_tz_name {
+        if timezone::apply_cached_timezone(&tz_name, source) {
+            tz_initialized = true;
+            current_tz_name = Some(tz_name);
+        }
+    }
+    if let Some(utc) = boot_rtc_unix {
+        gps.tz_offset_hours = gps::tz_offset_hours_at_unix(utc);
+    }
+    if !tz_initialized && gps.tz_offset_hours == 0 {
+        log::warn!(
+            "GPS: no cached timezone; RTC display shows UTC until GPS fix + Wi-Fi resolves TZ"
+        );
+    }
+
     let ui_feed = UiFeed::new(storage_status);
     if rtc_present {
         ui_feed.publish_rtc(rtc::RtcSnapshot {
@@ -264,6 +303,7 @@ pub fn run() -> anyhow::Result<()> {
             utc_unix_seconds: boot_rtc_unix,
         });
     }
+    ui_feed.publish_gps(&gps);
     let _ui_task = UiTaskHandle::spawn(
         Arc::clone(&ui_feed),
         display,
@@ -277,7 +317,6 @@ pub fn run() -> anyhow::Result<()> {
     let mut rx_buf = [0_u8; 256];
     let mut line_buf = String::new();
     let mut bytes_seen: u64 = 0;
-    let mut gps = GpsSnapshot::default();
 
     let pps = PpsMonitor::new();
     let pps_edge_us_isr = pps.edge_us();
@@ -318,10 +357,7 @@ pub fn run() -> anyhow::Result<()> {
         log::info!("RTC: seeded NTP anchor from cached time (UTC {secs})");
     }
 
-    let mut tz_store = TimezoneStore::new(default_nvs_tz).ok();
     let mut tz_worker = TimezoneWorker::spawn().ok();
-    let mut tz_initialized = false;
-    let mut current_tz_name: Option<String> = None;
     let mut last_tz_lookup_us = 0_i64;
     let mut last_ntp_publish_us = 0_i64;
     let mut last_ntp_served = 0_u64;
@@ -329,26 +365,6 @@ pub fn run() -> anyhow::Result<()> {
     let mut last_rtc_write_us = 0_i64;
     let mut last_rtc_utc = boot_rtc_unix;
     let mut last_storage_refresh_us = 0_i64;
-
-    if let Some(store) = tz_store.as_ref() {
-        match store.load_cached() {
-            Ok(Some(tz_name)) if gps::set_runtime_timezone(&tz_name) => {
-                tz_initialized = true;
-                current_tz_name = Some(tz_name.clone());
-                log::info!("GPS: loaded cached timezone {}", tz_name);
-            }
-            Ok(Some(tz_name)) => {
-                log::warn!(
-                    "GPS: cached timezone '{}' is invalid; will refresh",
-                    tz_name
-                );
-            }
-            Ok(None) => {}
-            Err(err) => {
-                log::warn!("GPS: failed to read timezone cache: {}", err);
-            }
-        }
-    }
 
     log::info!("NTP: listening on UDP/123");
     log::info!("System: booted; Wi-Fi + GPS UART diagnostics mode");
@@ -392,6 +408,15 @@ pub fn run() -> anyhow::Result<()> {
                     &mut tz_initialized,
                     &mut current_tz_name,
                 );
+                if tz_initialized {
+                    let utc = gps
+                        .utc_unix_seconds
+                        .or_else(|| ui_feed.rtc().utc_unix_seconds);
+                    if let Some(utc) = utc {
+                        gps.tz_offset_hours = gps::tz_offset_hours_at_unix(utc);
+                        ui_feed.publish_gps(&gps);
+                    }
+                }
             }
         }
 
@@ -767,11 +792,7 @@ fn apply_timezone_lookup_result(
                     } else {
                         log::info!("GPS: timezone resolved from coordinates: {}", tz_name);
                     }
-                    if let Some(store) = tz_store {
-                        if let Err(err) = store.save(&tz_name) {
-                            log::warn!("GPS: failed to persist timezone '{}': {}", tz_name, err);
-                        }
-                    }
+                    timezone::persist_cached(&tz_name, tz_store);
                 }
                 *current_tz_name = Some(tz_name);
             } else {
