@@ -57,14 +57,18 @@ The firmware is structured as a Rust library (`lib.rs`) that is conditionally co
 src/
 ├── lib.rs          # crate root; module declarations and cfg-gated exports
 ├── main.rs         # firmware entry point; calls app::run()
-├── app.rs          # main service loop and task coordination
+├── board.rs        # BoardBoot: Peripherals::take, PinPool, init order, UI spawn
+├── pins.rs         # PinPool / PinRegistry: GPIO claim tracking
+├── app.rs          # main service loop; GpsConsumer wiring to NTP/UI
 ├── i2c_bus.rs      # shared Feather I2C bus and I2cDevice trait
-├── gps.rs          # NMEA sentence parsing, GpsSnapshot
-├── pps.rs          # GPIO ISR capture, PPS interval tracking
+├── gps.rs          # GpsUart ingest, GpsConsumer callbacks, NMEA parse, GpsSnapshot
+├── pps.rs          # PpsDevice: GPIO ISR capture, PpsEvent polling
 ├── ntp/
 │   ├── mod.rs          # NTPv4 server, clock discipline, mode-6 diagnostics
 │   └── protection.rs   # per-client rate limiter and IP ACL
-├── display.rs      # ST7789 TFT rendering, page layout
+├── display.rs      # DisplayDevice: ST7789 TFT, shared SPI bus, panel init
+├── storage.rs      # StorageDevice: Adalogger microSD on shared SPI
+├── rtc.rs          # PCF8523 RTC on Feather I2C
 ├── battery.rs      # MAX17048 / LC709203 I2C fuel gauge
 ├── timezone.rs     # IANA timezone resolution, NVS cache, HTTP worker
 ├── ui_task.rs      # FreeRTOS task for display, button, battery sampling
@@ -75,19 +79,22 @@ src/
 ### Data Flow
 
 ```
-GPS UART (9600 baud)
-    │  NMEA sentences ($GPRMC, $GPGGA, $GNRMC, $GNGGA)
+BoardBoot::boot()
+    │  Peripherals::take → PinPool → module init (ordered: GPS, PPS, display SPI,
+    │  I2C, SD mount, TFT panel, UI task)
     ▼
-gps::parse_rmc / parse_gga
-    │  GpsSnapshot { utc_unix_seconds, lat, lon, fix, sats, local_time, local_date }
-    ├──► NtpServer::update_gps_utc_seconds()   (sets ClockAnchor)
-    └──► UiFeed::publish_gps()                 (shared Arc, read by ui_task)
+GpsUart::poll(consumer)          [non-blocking UART read, timeout=0]
+    │  parse_rmc / parse_gga → GpsSnapshot (held inside GpsUart)
+    │  synchronous GpsConsumer callbacks (no queue):
+    │    on_snapshot  → UiFeed::publish_gps()
+    │    on_fix       → NtpServer::update_gps_utc_seconds()
+    │                   + timezone lookup scheduling (via app::GpsDispatch)
 
-GPIO12 rising-edge ISR
+GPIO12 rising-edge ISR (PpsDevice)
     │  esp_timer_get_time() → AtomicU64
     ▼
-PpsMonitor::record_edge()
-    │  polled each loop iteration by PpsMonitor::poll()
+PpsDevice::poll() → PpsEvent
+    │  First / Delta { interval_us, edge_us }
     ▼
 NtpServer::observe_pps_pulse()
     │  First pulse: align anchor to GPS UTC
@@ -113,7 +120,7 @@ Main loop (every 1 s when no PPS, or on each PPS event)
 
 ## Module Details
 
-### `gps` – NMEA Parsing
+### `gps` – NMEA Parsing and UART Ingest
 
 **Relevant spec:** [NMEA 0183 §6](https://gpsd.gitlab.io/gpsd/NMEA.html)
 
@@ -142,8 +149,25 @@ pub struct GpsSnapshot {
     pub lon: f32,
     pub fix: bool,                // RMC status == "A"
     pub sats: u8,                 // from GGA field[7]
+    pub altitude_m: Option<f32>,  // GGA field 9 (metres MSL)
 }
 ```
+
+**`GpsUart`** (ESP-IDF only) owns UART1 at 9600 baud, line buffering, and the
+working [`GpsSnapshot`]. [`GpsUart::poll`] performs a non-blocking read
+(`timeout = 0`), assembles NMEA lines, parses RMC/GGA, and invokes registered
+consumers immediately:
+
+```rust
+pub trait GpsConsumer {
+    fn on_snapshot(&mut self, gps: &GpsSnapshot);  // any successful RMC/GGA
+    fn on_fix(&mut self, gps: &GpsSnapshot);        // RMC with active fix
+}
+```
+
+[`crate::app`] implements `GpsConsumer` via `GpsDispatch`, wiring UI publish,
+NTP UTC updates, and timezone lookup scheduling. There is no event queue — callbacks
+run synchronously in the ingest path for minimum latency.
 
 ---
 
@@ -153,10 +177,10 @@ The MTK3339 GPS module emits a 1 Hz PPS signal wired to GPIO 12. The rising edge
 
 **ISR-safe atomics**: The edge timestamp is stored in a `portable_atomic::AtomicU64` (not available in the standard library on all ESP32 targets without `portable-atomic`). A companion `AtomicU32` counts pulses.
 
-**Main-loop polling** (`PpsMonitor::poll`): Compares the ISR pulse counter against the last-seen count. On a new edge it computes the interval with `wrapping_sub` to handle 64-bit timer rollover safely. The result is one of:
+**Main-loop polling** (`PpsDevice::poll`): Compares the ISR pulse counter against the last-seen count. On a new edge it computes the interval with `wrapping_sub` to handle 64-bit timer rollover safely. The result is one of:
 
-- `PpsEvent::First` – first pulse since boot; no interval yet.
-- `PpsEvent::Delta(u32)` – subsequent pulse with microsecond interval.
+- `PpsEvent::First { edge_us }` – first pulse since boot; no interval yet.
+- `PpsEvent::Delta { interval_us, edge_us }` – subsequent pulse with microsecond interval and ISR-captured edge time.
 
 A valid interval is defined as `800_000 µs ≤ interval ≤ 1_200_000 µs` (±20% of 1 second) to reject spurious edges.
 
@@ -360,10 +384,12 @@ A fixed-capacity (8-entry) CIDR allowlist controls which sources can receive res
 | `Acl::deny_all()` | Block all; add entries with `add_ipv4_cidr` |
 | `Acl::private_lan()` | Allow RFC 1918 + loopback only (recommended for LAN deployment) |
 
-To configure a private-LAN ACL from `app.rs`:
+To configure the compile-time ACL (via `NTP_ACL_CIDR` in `build.rs`):
 
 ```rust
-ntp_server.set_acl(Acl::private_lan());
+// Applied automatically at boot by BoardBoot::init_ntp_server()
+NtpServer::apply_boot_acl(&mut server);
+// Empty NTP_ACL_CIDR → RFC 1918 private networks; non-empty → that CIDR only
 ```
 
 IPv6 sources always bypass the ACL (pass through unconditionally).
@@ -437,11 +463,11 @@ In normal operation (GPS outputs RMC at ~1 Hz, PPS fires ~1 s later) the guard i
 
 | Page | Content |
 |---|---|
-| Time (1/5) | Local time, date, timezone offset |
-| Location (2/5) | Latitude, longitude, satellite count |
-| Resources (3/5) | Flash partition size, heap free, heap minimum |
-| Battery (4/5) | Voltage, charge percent, PPS offset |
-| NTP (5/5) | Discipline state (LOCKED/HOLDOVER/UNSYNC), stratum, freq offset (ppm), PPS phase offset, jitter, root dispersion |
+| Time (1/5) | Local time, date, timezone offset, PPS offset |
+| Location (2/5) | Lat/lon/alt/sats, or RTC fallback when no fix |
+| Resources (3/5) | SD free/total (or flash partition if unmounted), heap free/min |
+| Battery (4/5) | Voltage, charge percent, RTC local time/date |
+| NTP (5/5) | Discipline state (LOCKED/HOLDOVER/UNSYNC), stratum, freq offset (ppm), jitter, root dispersion, served count |
 
 **Boot test:** On first boot, three horizontal RGB bands (red/green/blue) are drawn to verify panel visibility, followed by an 800 ms delay.
 
@@ -480,24 +506,46 @@ The timezone string is persisted to the ESP-IDF NVS partition (namespace `rust_g
 
 ---
 
+### `board` – Peripheral Routing
+
+[`BoardBoot::boot`] performs the full hardware bring-up sequence:
+
+1. `Peripherals::take()` and [`PinPool::from_board_pins`]
+2. Wi-Fi STA connect and optional mDNS registration
+3. Module init in dependency order: `GpsUart` → `PpsDevice` → `DisplayDevice` (SPI bus) → `FeatherI2cBus` → `StorageDevice` (shared SPI) → TFT panel → UI task spawn
+4. Timezone cache load and `UiFeed` seeding
+
+Returns [`BoardRuntime`] handles for the main loop plus [`BoardKeepalive`] (Wi-Fi,
+display bus, storage mount, UI thread). [`BoardBoot::init_ntp_server`] binds UDP/123,
+applies compile-time ACL, and seeds from boot-time RTC when available.
+
+---
+
+### `pins` – GPIO Registry
+
+[`PinPool`] holds unused Feather GPIOs extracted from `Peripherals::take()`.
+Each module calls `take_gpioN("module_name")` during init; a second claim for the
+same number returns [`PinError::AlreadyInUse`]. Modules release claims in `close()`.
+
+Peripheral controller blocks (`uart1`, `spi2`, `i2c0`) are passed only to the
+module that owns each bus; GPIO numbers are never exposed through `app`.
+
+---
+
 ### `app` – Main Service Loop
 
-`app::run()` executes the firmware orchestration sequence:
+`app::run()` executes:
 
-1. `logging::init()` – configure esp-idf log level.
-2. Load Wi-Fi credentials from build-time environment, connect STA.
-3. Initialize UART1 at 9600 baud (TX=GPIO1, RX=GPIO2) for GPS NMEA.
-4. Initialize I2C0 for battery monitor.
-5. Initialize SPI2 for ST7789 TFT, power rail on GPIO 21.
-6. Spawn `UiTaskHandle` (FreeRTOS task) with shared `UiFeed` arc.
-7. Subscribe GPIO12 rising-edge ISR for PPS capture.
-8. Bind `NtpServer` on UDP/123.
-9. Load cached timezone from NVS.
-10. **Loop (1 ms delay per iteration, requires `CONFIG_FREERTOS_HZ=1000`):**
-    - `poll_gps_uart` – read UART bytes, accumulate lines, parse RMC/GGA.
-    - Poll `TimezoneWorker` for completed HTTP result.
-    - `NtpServer::poll` – serve pending UDP requests.
-    - `PpsMonitor::poll` – forward new PPS events to `NtpServer` and `UiFeed`.
+1. `logging::init()`
+2. `BoardBoot::boot(&wifi_creds)` – all hardware and UI task setup
+3. `board.init_ntp_server()` – NTP bind, ACL, RTC seed
+4. `board.into_runtime()` – split loop handles from keep-alive drivers
+5. **Loop (1 ms delay per iteration, requires `CONFIG_FREERTOS_HZ=1000`):**
+    - `GpsUart::poll(&mut GpsDispatch)` – UART ingest with direct consumer callbacks
+    - Poll `TimezoneWorker` for completed HTTP result
+    - `NtpServer::poll` – serve pending UDP requests
+    - `PpsDevice::poll` – forward PPS events to `NtpServer` and `UiFeed`
+    - Periodic storage status refresh, RTC writeback, boot self-checks
 
 The main loop sleeps 1 ms per iteration (`FreeRtos::delay_ms(1)`). At the default 100 Hz FreeRTOS tick rate this would round up to 10 ms; `sdkconfig.defaults` sets `CONFIG_FREERTOS_HZ=1000` so the sleep is actually 1 ms. GPS sentences arrive at approximately 1 Hz with minimal per-sentence processing time; NTP requests are served non-blocking from a pre-bound UDP socket.
 
@@ -511,7 +559,7 @@ Uses `esp_idf_svc::wifi::EspWifi` to connect to a WPA2 access point. Credentials
 
 ## Pin Map
 
-See [`docs/hardware.md`](hardware.md) for the canonical pin map, assembly notes, and bring-up checklist. GPIO assignments are defined as named constants in each peripheral module (`gps`, `pps`, `display`, `i2c_bus`, `rtc`, `storage`).
+See [`docs/hardware.md`](hardware.md) for the canonical pin map, assembly notes, and bring-up checklist. GPIO assignments are defined as named constants in each peripheral module and claimed through [`pins::PinPool`] at init.
 
 ---
 
@@ -545,7 +593,7 @@ Host unit tests (`cargo test` or `just test`) cover pure modules:
 | `timezone` | JSON field extraction for Open-Meteo and GeoNames response shapes |
 | `battery` | MAX17048 and LC709203 register decoding arithmetic |
 
-ESP-IDF target modules (`app`, `display`, `wifi`, `ui_task`, `logging`) are excluded from host builds via `#[cfg(target_os = "espidf")]`.
+ESP-IDF target modules (`app`, `board`, `display`, `pins`, `storage`, `wifi`, `ui_task`, `logging`) are excluded from host builds via `#[cfg(target_os = "espidf")]`.
 
 ## NTP Client Interoperability
 

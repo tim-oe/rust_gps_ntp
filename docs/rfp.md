@@ -69,7 +69,7 @@ GPS NMEA + PPS.
 
 ### M6 — Testing and interoperability
 
-- [x] 121 host unit tests across all pure modules (`just test`)
+- [x] 151+ host unit tests across all pure modules (`just test`)
   - Timestamp math: RFC 868 epoch offset, NTP fraction encoding, frequency
     correction
   - Sync state machine: Locked → Holdover → Unsync full-cycle transitions
@@ -94,7 +94,10 @@ GPS NMEA + PPS.
 | Type | Role |
 |------|------|
 | `GpsSnapshot` | Fix status, satellite count, local time estimate, UTC epoch |
-| `PpsMonitor` | Last edge instant (`u64` monotonic µs) and pulse count |
+| `GpsUart` | UART ingest, line buffer, snapshot; calls `GpsConsumer` on parse |
+| `PpsDevice` / `PpsEvent` | PPS GPIO + ISR state; polled edge events for NTP/UI |
+| `BoardBoot` | Peripheral take, `PinPool`, ordered module init, UI spawn |
+| `PinPool` | GPIO claim registry; prevents double-allocation |
 | `NtpServer` / `ClockAnchor` | Monotonic-to-UTC conversion for NTP timestamps |
 | `NtpSnapshot` | Public metrics snapshot conveyed to the UI task each second |
 | `Acl` | Fixed-capacity CIDR allowlist (lives in `ntp::protection`) |

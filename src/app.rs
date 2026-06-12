@@ -12,7 +12,7 @@
 //!   `WIFI_PS_MIN_MODEM` mode buffers incoming UDP packets at the AP for up to ~100 ms
 //!   (one DTIM interval), dominating NTP round-trip time.
 //!
-//! * **Non-blocking UART reads** (`timeout = 0` in [`poll_gps_uart`]): a blocking read
+//! * **Non-blocking UART reads** (`timeout = 0` in [`GpsUart::poll`]): a blocking read
 //!   with even a 25-tick timeout stalls the loop for up to 250 ms, queueing NTP
 //!   packets and adding the same latency as power save.
 //!
@@ -35,7 +35,7 @@
 use esp_idf_svc::hal::delay::FreeRtos;
 
 use crate::board::BoardBoot;
-use crate::gps::{self, GpsSnapshot, GpsUart};
+use crate::gps::{self, GpsConsumer, GpsSnapshot};
 use crate::logging;
 use crate::ntp::{self, DisciplineState};
 use crate::pps::{self, PpsEvent};
@@ -47,12 +47,8 @@ use crate::wifi;
 
 /// Initialize peripherals, spawn the UI task, and run the main service loop.
 ///
-/// # Parameters
-/// - None.
-///
-/// # Returns
-/// - `Ok(())` only if the main loop exits cleanly (normally it runs forever).
-/// - `Err` when peripheral init, UI task spawn, or NTP bind fails.
+/// Delegates hardware bring-up to [`crate::board::BoardBoot`], then runs the
+/// GPS/NTP/PPS service loop with [`crate::gps::GpsConsumer`] callbacks.
 pub fn run() -> anyhow::Result<()> {
     logging::init();
     let wifi_creds = wifi::load_wifi_credentials_from_env()?;
@@ -60,19 +56,14 @@ pub fn run() -> anyhow::Result<()> {
     let mut ntp_server = board.init_ntp_server()?;
     let (runtime, _keepalive) = board.into_runtime();
 
-    let gps_uart = runtime.gps_uart;
+    let mut gps_uart = runtime.gps_uart;
     let mut pps = runtime.pps;
     let ui_feed = runtime.ui_feed;
     let rtc_present = runtime.rtc_present;
     let boot_rtc_unix = runtime.boot_rtc_unix;
-    let mut gps = runtime.timezone.gps;
     let mut tz_store = runtime.timezone.tz_store;
     let mut tz_initialized = runtime.timezone.tz_initialized;
     let mut current_tz_name = runtime.timezone.current_tz_name;
-
-    let mut rx_buf = [0_u8; 256];
-    let mut line_buf = String::new();
-    let mut bytes_seen: u64 = 0;
 
     let mut tz_worker = TimezoneWorker::spawn().ok();
     let mut last_tz_lookup_us = 0_i64;
@@ -94,21 +85,18 @@ pub fn run() -> anyhow::Result<()> {
     let mut rtc_seeded_from_gps = boot_rtc_unix.is_some();
 
     loop {
-        poll_gps_uart(
-            &gps_uart,
-            &mut rx_buf,
-            &mut line_buf,
-            &mut bytes_seen,
-            &mut gps,
-            &ui_feed,
-            &mut ntp_server,
-            tz_worker.as_mut(),
-            &mut tz_initialized,
-            &mut last_tz_lookup_us,
-        );
+        let mut gps_dispatch = GpsDispatch {
+            ui_feed: &ui_feed,
+            ntp_server: &mut ntp_server,
+            tz_worker: tz_worker.as_mut(),
+            tz_initialized: &mut tz_initialized,
+            last_tz_lookup_us: &mut last_tz_lookup_us,
+        };
+        gps_uart.poll(&mut gps_dispatch);
 
         if let Some(worker) = tz_worker.as_mut() {
             if let Some(result) = worker.poll() {
+                let gps = gps_uart.snapshot();
                 apply_timezone_lookup_result(
                     result,
                     gps.lat,
@@ -122,13 +110,14 @@ pub fn run() -> anyhow::Result<()> {
                         .utc_unix_seconds
                         .or_else(|| ui_feed.rtc().utc_unix_seconds);
                     if let Some(utc) = utc {
-                        gps.tz_offset_hours = gps::tz_offset_hours_at_unix(utc);
-                        ui_feed.publish_gps(&gps);
+                        gps_uart.snapshot_mut().tz_offset_hours = gps::tz_offset_hours_at_unix(utc);
+                        ui_feed.publish_gps(gps_uart.snapshot());
                     }
                 }
             }
         }
 
+        let gps = gps_uart.snapshot();
         if let Err(err) = ntp_server.poll(gps.fix) {
             log::warn!("NTP: poll failed: {}", err);
         } else {
@@ -168,8 +157,8 @@ pub fn run() -> anyhow::Result<()> {
             last_storage_refresh_us = now_us;
         }
 
-        if bytes_seen > 0 && bytes_seen % 512 == 0 {
-            log::debug!("GPS: diagnostics bytes received={}", bytes_seen);
+        if gps_uart.bytes_seen() > 0 && gps_uart.bytes_seen() % 512 == 0 {
+            log::debug!("GPS: diagnostics bytes received={}", gps_uart.bytes_seen());
         }
 
         if let Some(event) = pps.poll() {
@@ -216,7 +205,7 @@ pub fn run() -> anyhow::Result<()> {
         // --- Boot self-checks: log key lifecycle milestones once, warn on stalls. ---
         let elapsed_s = (monotonic_us() - boot_us) / 1_000_000;
 
-        if !first_nmea_logged && bytes_seen > 0 {
+        if !first_nmea_logged && gps_uart.bytes_seen() > 0 {
             first_nmea_logged = true;
             log::info!("GPS UART: first NMEA data received (+{}s)", elapsed_s);
         }
@@ -265,6 +254,35 @@ pub fn run() -> anyhow::Result<()> {
                 "PPS: no pulse in {}s since boot — check PPS pin wiring (GPIO{})",
                 elapsed_s,
                 pps::GPIO_PIN
+            );
+        }
+    }
+}
+
+/// Registered GPS consumers invoked synchronously from [`GpsUart::poll`].
+struct GpsDispatch<'a> {
+    ui_feed: &'a UiFeed,
+    ntp_server: &'a mut ntp::NtpServer,
+    tz_worker: Option<&'a mut TimezoneWorker>,
+    tz_initialized: &'a mut bool,
+    last_tz_lookup_us: &'a mut i64,
+}
+
+impl GpsConsumer for GpsDispatch<'_> {
+    fn on_snapshot(&mut self, gps: &GpsSnapshot) {
+        self.ui_feed.publish_gps(gps);
+    }
+
+    fn on_fix(&mut self, gps: &GpsSnapshot) {
+        if let Some(utc_unix_seconds) = gps.utc_unix_seconds {
+            self.ntp_server.update_gps_utc_seconds(utc_unix_seconds);
+        }
+        if let Some(worker) = self.tz_worker.as_mut() {
+            maybe_schedule_timezone_lookup(
+                gps,
+                worker,
+                self.tz_initialized,
+                self.last_tz_lookup_us,
             );
         }
     }
@@ -341,98 +359,7 @@ fn monotonic_us() -> i64 {
     unsafe { esp_idf_svc::sys::esp_timer_get_time() }
 }
 
-/// Read and parse available GPS UART bytes, updating shared state and NTP inputs.
-///
-/// # Parameters
-/// - `gps_uart`: GPS NMEA UART driver.
-/// - `rx_buf`: Scratch buffer for UART reads.
-/// - `line_buf`: Accumulator for partial NMEA lines spanning reads.
-/// - `bytes_seen`: Running total of UART bytes received (diagnostics).
-/// - `gps`: Mutable GPS snapshot updated by parsed sentences.
-/// - `ui_feed`: Shared feed published to the UI task after successful parses.
-/// - `ntp_server`: NTP server receiving UTC updates from valid RMC fixes.
-/// - `tz_worker`: Optional background timezone lookup worker.
-/// - `tz_initialized`: Whether a valid runtime timezone is already configured.
-/// - `last_tz_lookup_us`: Monotonic timestamp of the last timezone lookup request.
-///
-/// # Returns
-/// - No return value.
-fn poll_gps_uart(
-    gps_uart: &GpsUart,
-    rx_buf: &mut [u8; 256],
-    line_buf: &mut String,
-    bytes_seen: &mut u64,
-    gps: &mut GpsSnapshot,
-    ui_feed: &UiFeed,
-    ntp_server: &mut ntp::NtpServer,
-    mut tz_worker: Option<&mut TimezoneWorker>,
-    tz_initialized: &mut bool,
-    last_tz_lookup_us: &mut i64,
-) {
-    // timeout=0: non-blocking read.  A blocking timeout (e.g. 25 ticks at
-    // 100 Hz = 250 ms) stalls the loop and queues NTP packets for the same
-    // duration, adding it directly to NTP round-trip time.  At 9600 baud GPS
-    // delivers ~1 byte/ms, so a 1 ms loop drains the UART buffer adequately.
-    let Ok(read) = gps_uart.read(rx_buf, 0) else {
-        return;
-    };
-    if read == 0 {
-        return;
-    }
-
-    *bytes_seen += read as u64;
-    let Ok(chunk) = core::str::from_utf8(&rx_buf[..read]) else {
-        log::info!("GPS: UART received {} non-UTF8 bytes", read);
-        return;
-    };
-
-    line_buf.push_str(chunk);
-    let mut pending_line = String::new();
-    while let Some(newline_idx) = line_buf.find('\n') {
-        pending_line.clear();
-        pending_line.push_str(line_buf[..newline_idx].trim_end_matches('\r').trim());
-        line_buf.drain(..=newline_idx);
-        let trimmed = pending_line.as_str();
-
-        if !trimmed.starts_with('$') {
-            continue;
-        }
-
-        if trimmed.starts_with("$GNRMC") || trimmed.starts_with("$GPRMC") {
-            if gps::parse_rmc(trimmed, gps).is_some() {
-                ui_feed.publish_gps(gps);
-                if gps.fix {
-                    if let Some(utc_unix_seconds) = gps.utc_unix_seconds {
-                        ntp_server.update_gps_utc_seconds(utc_unix_seconds);
-                    }
-                    if let Some(worker) = tz_worker.as_mut() {
-                        maybe_schedule_timezone_lookup(
-                            gps,
-                            worker,
-                            tz_initialized,
-                            last_tz_lookup_us,
-                        );
-                    }
-                }
-            }
-        } else if trimmed.starts_with("$GNGGA") || trimmed.starts_with("$GPGGA") {
-            if gps::parse_gga(trimmed, gps).is_some() {
-                ui_feed.publish_gps(gps);
-            }
-        }
-    }
-}
-
 /// Queue a timezone lookup when the refresh interval has elapsed.
-///
-/// # Parameters
-/// - `gps`: GPS snapshot supplying latitude and longitude for lookup.
-/// - `worker`: Background timezone worker receiving coordinate requests.
-/// - `tz_initialized`: Whether a valid timezone is already active.
-/// - `last_tz_lookup_us`: Updated when a new lookup request is queued.
-///
-/// # Returns
-/// - No return value.
 fn maybe_schedule_timezone_lookup(
     gps: &GpsSnapshot,
     worker: &mut TimezoneWorker,

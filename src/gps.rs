@@ -2,6 +2,9 @@
 //!
 //! The parser ingests NMEA RMC/GGA sentences and maintains a lightweight state
 //! object that is consumed by display and NTP paths.
+//!
+//! On ESP-IDF, [`GpsUart`] owns UART ingest and calls [`GpsConsumer`] callbacks
+//! synchronously when sentences parse (no event queue).
 
 use chrono::{
     Duration as ChronoDuration, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc,
@@ -32,6 +35,22 @@ pub const UART_RX_PIN: i32 = 2;
 #[cfg(target_os = "espidf")]
 pub struct GpsUart {
     driver: UartDriver<'static>,
+    snapshot: GpsSnapshot,
+    rx_buf: [u8; 256],
+    line_buf: String,
+    bytes_seen: u64,
+}
+
+/// Synchronous callbacks invoked by [`GpsUart::poll`] when NMEA sentences parse.
+///
+/// Consumers are called directly in the ingest path (no queue) so UTC and fix
+/// updates reach NTP with minimal latency.
+#[cfg(target_os = "espidf")]
+pub trait GpsConsumer {
+    /// Latest snapshot changed (RMC or GGA).
+    fn on_snapshot(&mut self, gps: &GpsSnapshot);
+    /// RMC reported an active fix; called after [`Self::on_snapshot`].
+    fn on_fix(&mut self, gps: &GpsSnapshot);
 }
 
 #[cfg(target_os = "espidf")]
@@ -60,7 +79,78 @@ impl GpsUart {
             UART_TX_PIN,
             UART_RX_PIN
         );
-        Ok(Self { driver })
+        Ok(Self {
+            driver,
+            snapshot: GpsSnapshot::default(),
+            rx_buf: [0_u8; 256],
+            line_buf: String::new(),
+            bytes_seen: 0,
+        })
+    }
+
+    /// Replace the working snapshot (for example with a boot-time timezone seed).
+    pub fn set_snapshot(&mut self, snapshot: GpsSnapshot) {
+        self.snapshot = snapshot;
+    }
+
+    /// Read-only view of the latest parsed GPS state.
+    pub fn snapshot(&self) -> &GpsSnapshot {
+        &self.snapshot
+    }
+
+    /// Mutable view of the latest parsed GPS state.
+    pub fn snapshot_mut(&mut self) -> &mut GpsSnapshot {
+        &mut self.snapshot
+    }
+
+    /// Total UART bytes received since boot (diagnostics).
+    pub fn bytes_seen(&self) -> u64 {
+        self.bytes_seen
+    }
+
+    /// Non-blocking UART read, NMEA parse, and direct consumer notification.
+    ///
+    /// Uses `timeout = 0` on the UART read so the main loop never blocks waiting
+    /// for GPS bytes and NTP packets are not queued behind UART I/O.
+    pub fn poll<C: GpsConsumer>(&mut self, consumer: &mut C) {
+        let Ok(read) = self.driver.read(&mut self.rx_buf, 0) else {
+            return;
+        };
+        if read == 0 {
+            return;
+        }
+
+        self.bytes_seen += read as u64;
+        let Ok(chunk) = core::str::from_utf8(&self.rx_buf[..read]) else {
+            log::info!("GPS: UART received {} non-UTF8 bytes", read);
+            return;
+        };
+
+        self.line_buf.push_str(chunk);
+        let mut pending_line = String::new();
+        while let Some(newline_idx) = self.line_buf.find('\n') {
+            pending_line.clear();
+            pending_line.push_str(self.line_buf[..newline_idx].trim_end_matches('\r').trim());
+            self.line_buf.drain(..=newline_idx);
+            let trimmed = pending_line.as_str();
+
+            if !trimmed.starts_with('$') {
+                continue;
+            }
+
+            if trimmed.starts_with("$GNRMC") || trimmed.starts_with("$GPRMC") {
+                if parse_rmc(trimmed, &mut self.snapshot).is_some() {
+                    consumer.on_snapshot(&self.snapshot);
+                    if self.snapshot.fix {
+                        consumer.on_fix(&self.snapshot);
+                    }
+                }
+            } else if trimmed.starts_with("$GNGGA") || trimmed.starts_with("$GPGGA") {
+                if parse_gga(trimmed, &mut self.snapshot).is_some() {
+                    consumer.on_snapshot(&self.snapshot);
+                }
+            }
+        }
     }
 
     /// Release GPIO claims held by this UART driver.

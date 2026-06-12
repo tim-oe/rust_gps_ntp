@@ -31,8 +31,9 @@ for your connected board at `/dev/ttyACM0`.
 ## Rust code organization
 
 Logic lives in the library crate (`src/lib.rs`); `src/main.rs` is a thin ESP-IDF
-entrypoint. Modules include `gps`, `pps`, `ntp`, `display`, `battery`, `wifi`,
-`timezone`, `logging`, and `app` (main loop orchestrator).
+entrypoint. Key modules: `board` (peripheral routing), `pins` (GPIO registry),
+`gps`, `pps`, `ntp`, `display`, `storage`, `battery`, `wifi`, `timezone`,
+`logging`, and `app` (main loop orchestrator).
 
 ## Repo Layout
 

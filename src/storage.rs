@@ -2,6 +2,7 @@
 //!
 //! The SD socket shares the Feather SPI bus with the TFT display; both devices
 //! use separate chip-select lines and borrow the same [`SpiDriver`] instance.
+//! [`StorageDevice::init`] claims the SD CS GPIO from [`crate::pins::PinPool`].
 
 use std::fs::OpenOptions;
 use std::io::Write;

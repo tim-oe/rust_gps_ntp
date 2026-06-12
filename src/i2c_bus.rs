@@ -1,6 +1,7 @@
 //! Feather I2C bus shared by battery fuel gauges and the Adalogger RTC.
 //!
 //! Device modules implement [`I2cDevice`] and receive a [`FeatherI2cBus`] at init.
+//! SDA/SCL GPIOs are claimed from [`crate::pins::PinPool`] in [`FeatherI2cBus::init`].
 
 use anyhow::Context;
 use esp_idf_svc::hal::i2c::{self, I2c, I2cDriver};

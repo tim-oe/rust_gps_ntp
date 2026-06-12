@@ -78,7 +78,7 @@ impl BoardBoot {
             .context("failed to take system event loop")?;
         let wifi = wifi::connect_wifi_sta(peripherals.modem, sys_loop, default_nvs, wifi_creds)?;
 
-        let gps_uart = GpsUart::init(&mut pin_pool, peripherals.uart1)?;
+        let mut gps_uart = GpsUart::init(&mut pin_pool, peripherals.uart1)?;
         // Arm PPS before display/SD init so edges are captured during slow bring-up.
         let pps = PpsDevice::init(&mut pin_pool)?;
 
@@ -96,6 +96,7 @@ impl BoardBoot {
         let panel = display.init_panel(&mut pin_pool)?;
 
         let timezone = load_timezone_boot(nvs_tz, boot_rtc_unix);
+        gps_uart.set_snapshot(timezone.gps.clone());
 
         let ui_feed = UiFeed::new(storage_status);
         if rtc_present {

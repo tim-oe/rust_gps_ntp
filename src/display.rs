@@ -1,7 +1,7 @@
 //! TFT display initialization and page rendering helpers.
 //!
-//! The display pipeline renders four rotating pages with GPS, battery, and
-//! system-health information.
+//! [`DisplayDevice`] owns the shared SPI bus, TFT panel init, and five rotating
+//! UI pages with GPS, battery, and system-health information.
 
 use anyhow::{Context, anyhow};
 use core::sync::atomic::{AtomicBool, Ordering};

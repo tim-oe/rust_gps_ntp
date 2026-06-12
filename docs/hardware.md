@@ -33,7 +33,9 @@ When stacked as a FeatherWing, the GPS board uses shared Feather rails:
 
 ## Firmware pin map (module-owned constants)
 
-Pin assignments live with the module that owns each peripheral (`gps.rs`, `pps.rs`, `display.rs`, `i2c_bus.rs`, `rtc.rs`, `storage.rs`):
+Pin assignments live with the module that owns each peripheral. GPIO numbers
+are claimed through [`pins::PinPool`] at init (`gps.rs`, `pps.rs`, `display.rs`,
+`i2c_bus.rs`, `storage.rs`); see also `rtc.rs` for the PCF8523 on I2C:
 
 - GPS UART: TX=`GPIO1`, RX=`GPIO2`
 - PPS input: `GPIO12` (rising-edge interrupt)

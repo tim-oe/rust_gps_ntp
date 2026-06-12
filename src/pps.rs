@@ -1,7 +1,9 @@
 //! PPS pulse capture and interval tracking.
 //!
 //! Stores monotonic edge timestamps as `u64` microseconds to avoid wraparound
-//! issues from truncating ESP timer values to `u32`.
+//! issues from truncating ESP timer values to `u32`. On ESP-IDF, [`PpsDevice`]
+//! owns the GPIO pin (claimed from [`crate::pins::PinPool`]) and wraps
+//! [`PpsMonitor`] polling for the main loop.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 use portable_atomic::AtomicU64;
@@ -44,7 +46,7 @@ impl PpsPollState {
     /// Return the pulse count recorded at the last successful poll.
     ///
     /// # Parameters
-    /// - `self`: Poll state updated by the most recent [`PpsMonitor::poll`] call.
+    /// - `self`: Poll state updated by the most recent [`PpsDevice::poll`] call.
     ///
     /// # Returns
     /// - Total PPS pulse count last observed by the main loop.
