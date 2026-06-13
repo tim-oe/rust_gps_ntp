@@ -2,7 +2,7 @@ set shell := ["bash", "-cu"]
 
 port := "/dev/ttyACM0"
 chip := "esp32s3"
-esp_export := "$HOME/export-esp.sh"
+esp_export := "$HOME/.cargo/export-esp.sh"
 partition_table := "partitions.csv"
 host_target := `rustc -vV | sed -n 's/^host: //p'`
 DEFAULT_DEVICE := "gps-ntp"

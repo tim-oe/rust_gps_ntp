@@ -34,7 +34,7 @@ curl https://sh.rustup.rs -sSf | sh
 source "$HOME/.cargo/env"
 cargo install espup
 espup install
-source "$HOME/export-esp.sh"
+source "$HOME/.cargo/export-esp.sh"
 ```
 
 Verify Rust + ESP toolchains are installed:
@@ -54,8 +54,8 @@ cat <<'EOF' >> ~/.bashrc
 if [ -f "$HOME/.cargo/env" ]; then
   . "$HOME/.cargo/env"
 fi
-if [ -f "$HOME/export-esp.sh" ]; then
-  . "$HOME/export-esp.sh"
+if [ -f "$HOME/.cargo/export-esp.sh" ]; then
+  . "$HOME/.cargo/export-esp.sh"
 fi
 EOF
 source ~/.bashrc
