@@ -3,10 +3,12 @@
 use anyhow::{Context, anyhow, bail};
 use core::convert::TryInto;
 use embedded_svc::ipv4::Ipv4Addr;
-use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
-use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+use esp_idf_svc::wifi::{
+    AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent,
+};
 
 /// STA IP, gateway, hostname, and SSID for the Network display page.
 #[derive(Debug, Clone)]
@@ -109,14 +111,22 @@ pub fn load_wifi_credentials_from_env() -> anyhow::Result<WifiCredentials> {
 /// - `creds`: Wi-Fi credentials to apply.
 ///
 /// # Returns
-/// - `Ok(BlockingWifi<EspWifi<'static>>)` when station link is up with DHCP info.
+/// - `Ok((BlockingWifi<EspWifi<'static>>, EspSystemSubscription))` when the station
+///   link is up with DHCP info. The subscription drives automatic reconnect and
+///   MUST be kept alive for the firmware lifetime.
 /// - `Err` when setup, connect, or netif readiness fails.
 pub fn connect_wifi_sta(
     modem: Modem,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
     creds: &WifiCredentials,
-) -> anyhow::Result<BlockingWifi<EspWifi<'static>>> {
+) -> anyhow::Result<(
+    BlockingWifi<EspWifi<'static>>,
+    EspSystemSubscription<'static>,
+)> {
+    // Clone the loop before it is moved into the driver so the reconnect handler
+    // can subscribe to the same event source after the initial connection is up.
+    let reconnect_loop = sys_loop.clone();
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(modem, sys_loop.clone(), Some(nvs)).context("failed to create EspWifi")?,
         sys_loop,
@@ -171,5 +181,40 @@ pub fn connect_wifi_sta(
         .context("failed to read DHCP IP info")?;
     log::info!("Wi-Fi: connected; STA IP: {}", ip_info.ip);
 
-    Ok(wifi)
+    // Subscribe only after the initial connection succeeds so the handler does
+    // not race the blocking connect sequence during boot.
+    let reconnect = subscribe_wifi_reconnect(&reconnect_loop)?;
+
+    Ok((wifi, reconnect))
+}
+
+/// Subscribe to Wi-Fi STA disconnect events and re-initiate association.
+///
+/// The firmware otherwise connects once at boot; without this, any AP drop,
+/// roam, or beacon timeout leaves the station disconnected with IP `0.0.0.0`
+/// (unreachable to all clients) until a manual reset. `esp_netif` restarts the
+/// DHCP client automatically on reassociation, so re-acquiring the lease needs
+/// no extra call here.
+///
+/// # Parameters
+/// - `sys_loop`: System event loop the Wi-Fi driver posts events on.
+///
+/// # Returns
+/// - `Ok(EspSystemSubscription)` that MUST be kept alive for the handler to run;
+///   dropping it unsubscribes and disables automatic reconnect.
+/// - `Err` when the event subscription cannot be registered.
+fn subscribe_wifi_reconnect(
+    sys_loop: &EspSystemEventLoop,
+) -> anyhow::Result<EspSystemSubscription<'static>> {
+    sys_loop
+        .subscribe::<WifiEvent, _>(|event| {
+            if let WifiEvent::StaDisconnected(_) = event {
+                log::warn!("Wi-Fi: STA disconnected; re-initiating association");
+                let err = unsafe { esp_idf_svc::sys::esp_wifi_connect() };
+                if err != esp_idf_svc::sys::ESP_OK as i32 {
+                    log::warn!("Wi-Fi: esp_wifi_connect() failed (err={err})");
+                }
+            }
+        })
+        .context("failed to subscribe to Wi-Fi reconnect events")
 }

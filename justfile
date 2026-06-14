@@ -69,6 +69,18 @@ flash-monitor:
     just ci
     source {{esp_export}} && cargo +esp espflash flash --release --chip {{chip}} --port {{port}} --partition-table {{partition_table}} --monitor
 
+# Force a clean rebuild of the firmware crate so the next build can't reuse a stale image.
+# Drops only this package's artifacts (deps stay cached) so build.rs reruns and
+# sdkconfig-derived env values (e.g. NMEA_PPS_FUDGE_S) are re-baked from sdkconfig.defaults.
+rebuild:
+    cargo clean -p rust_gps_ntp
+
+# Guaranteed-fresh full flash: rebuild from source, then full flash (bootloader + table + app).
+reflash: rebuild flash
+
+# Guaranteed-fresh app-partition flash: rebuild from source, then flash the app partition only.
+reflash-app: rebuild flash-app
+
 # Attach serial monitor to the connected board without flashing.
 monitor:
     source {{esp_export}} && cargo +esp espflash monitor --chip {{chip}} --port {{port}}

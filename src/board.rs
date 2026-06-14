@@ -55,6 +55,8 @@ pub struct BoardBoot {
 /// Wi-Fi, display bus, storage mount, and UI task — held for the firmware lifetime.
 pub struct BoardKeepalive {
     _wifi: esp_idf_svc::wifi::BlockingWifi<esp_idf_svc::wifi::EspWifi<'static>>,
+    // Drives automatic Wi-Fi reconnect; dropping it disables recovery.
+    _wifi_reconnect: esp_idf_svc::eventloop::EspSystemSubscription<'static>,
     #[cfg(esp_idf_comp_mdns_enabled)]
     _mdns: Option<EspMdns<'static>>,
     _display: DisplayDevice,
@@ -76,7 +78,8 @@ impl BoardBoot {
         let nvs_tz = default_nvs.clone();
         let sys_loop = esp_idf_svc::eventloop::EspSystemEventLoop::take()
             .context("failed to take system event loop")?;
-        let wifi = wifi::connect_wifi_sta(peripherals.modem, sys_loop, default_nvs, wifi_creds)?;
+        let (wifi, wifi_reconnect) =
+            wifi::connect_wifi_sta(peripherals.modem, sys_loop, default_nvs, wifi_creds)?;
 
         let mut gps_uart = GpsUart::init(&mut pin_pool, peripherals.uart1)?;
         // Arm PPS before display/SD init so edges are captured during slow bring-up.
@@ -128,6 +131,7 @@ impl BoardBoot {
             timezone,
             keepalive: BoardKeepalive {
                 _wifi: wifi,
+                _wifi_reconnect: wifi_reconnect,
                 #[cfg(esp_idf_comp_mdns_enabled)]
                 _mdns: register_mdns(),
                 _display: display,
