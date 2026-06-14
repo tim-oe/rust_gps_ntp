@@ -2,10 +2,68 @@
 
 use anyhow::{Context, anyhow, bail};
 use core::convert::TryInto;
+use embedded_svc::ipv4::Ipv4Addr;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi};
+
+/// STA IP, gateway, hostname, and SSID for the Network display page.
+#[derive(Debug, Clone)]
+pub struct NetworkSnapshot {
+    /// DHCP-assigned station IPv4 address.
+    pub ip: String,
+    /// Default gateway IPv4 address.
+    pub gateway: String,
+    /// Compile-time hostname from `CONFIG_LWIP_LOCAL_HOSTNAME`.
+    pub hostname: String,
+    /// Compile-time SSID from `WIFI_SSID`.
+    pub ssid: String,
+}
+
+impl Default for NetworkSnapshot {
+    fn default() -> Self {
+        Self {
+            ip: "n/a".to_owned(),
+            gateway: "n/a".to_owned(),
+            hostname: env!("DEVICE_HOSTNAME").to_owned(),
+            ssid: compile_time_ssid(),
+        }
+    }
+}
+
+fn compile_time_ssid() -> String {
+    option_env!("WIFI_SSID")
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("n/a")
+        .to_owned()
+}
+
+/// Read the current STA interface addresses from the ESP-IDF netif layer.
+pub fn read_network_snapshot() -> NetworkSnapshot {
+    let mut snap = NetworkSnapshot::default();
+
+    #[cfg(target_os = "espidf")]
+    unsafe {
+        use esp_idf_svc::sys::{
+            esp_netif_get_handle_from_ifkey, esp_netif_get_ip_info, esp_netif_ip_info_t,
+        };
+
+        let netif = esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr());
+        if netif.is_null() {
+            return snap;
+        }
+        let mut ip_info = esp_netif_ip_info_t::default();
+        if esp_netif_get_ip_info(netif, &mut ip_info) != 0 {
+            return snap;
+        }
+        snap.ip = Ipv4Addr::from(ip_info.ip.addr.to_le_bytes()).to_string();
+        snap.gateway = Ipv4Addr::from(ip_info.gw.addr.to_le_bytes()).to_string();
+    }
+
+    snap
+}
 
 /// Compile-time Wi-Fi station credentials captured during firmware build.
 #[derive(Debug, Clone)]

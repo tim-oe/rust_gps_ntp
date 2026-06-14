@@ -1,7 +1,7 @@
 //! TFT display initialization and page rendering helpers.
 //!
-//! [`DisplayDevice`] owns the shared SPI bus, TFT panel init, and five rotating
-//! UI pages with GPS, battery, and system-health information.
+//! [`DisplayDevice`] owns the shared SPI bus, TFT panel init, and six rotating
+//! UI pages with GPS, battery, network, and system-health information.
 
 use anyhow::{Context, anyhow};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +27,7 @@ use crate::ntp::{DisciplineState, NtpSnapshot};
 use crate::pins::PinPool;
 use crate::rtc::RtcSnapshot;
 use crate::storage::{self, StorageStatus};
+use crate::wifi::NetworkSnapshot;
 
 /// Feather SPI clock line shared by TFT and microSD (re-exported from [`storage`]).
 pub use storage::{FEATHER_SPI_MISO_PIN, FEATHER_SPI_MOSI_PIN, FEATHER_SPI_SCK_PIN};
@@ -239,6 +240,7 @@ pub enum Page {
     Resources,
     Battery,
     Ntp,
+    Network,
 }
 
 impl Page {
@@ -248,14 +250,15 @@ impl Page {
     /// - `self`: Current page.
     ///
     /// # Returns
-    /// - Next page in the five-page rotation.
+    /// - Next page in the six-page rotation.
     pub fn next(self) -> Self {
         match self {
             Self::Time => Self::Location,
             Self::Location => Self::Resources,
             Self::Resources => Self::Battery,
             Self::Battery => Self::Ntp,
-            Self::Ntp => Self::Time,
+            Self::Ntp => Self::Network,
+            Self::Network => Self::Time,
         }
     }
 }
@@ -662,6 +665,7 @@ fn rtc_local_strings(rtc: RtcSnapshot, tz_offset_hours: i8) -> (String, String) 
 /// - `ntp`: Latest NTP discipline snapshot.
 /// - `storage`: MicroSD mount status, when available.
 /// - `rtc`: Latest RTC sample for GPS-loss fallback display.
+/// - `network`: Latest STA IP, gateway, and hostname snapshot.
 ///
 /// # Returns
 /// - No return value; draw errors are logged.
@@ -674,6 +678,7 @@ pub fn draw_page<D>(
     ntp: &NtpSnapshot,
     storage: StorageStatus,
     rtc: RtcSnapshot,
+    network: &NetworkSnapshot,
 ) where
     D: DrawTarget<Color = Rgb565>,
     D::Error: core::fmt::Debug,
@@ -698,7 +703,7 @@ pub fn draw_page<D>(
     match page {
         Page::Time => {
             let (time, date, rtc_fallback) = display_time_source(gps, rtc);
-            line("Page 1/5  TIME".to_owned());
+            line("Page 1/6  TIME".to_owned());
             if rtc_fallback {
                 line("RTC fallback".to_owned());
             }
@@ -708,7 +713,7 @@ pub fn draw_page<D>(
             line(pps_offset_label(pps_delta_us));
         }
         Page::Location => {
-            line("Page 2/5  LOCATION".to_owned());
+            line("Page 2/6  LOCATION".to_owned());
             if gps_use_rtc_fallback(gps) {
                 let (time, date, _) = display_time_source(gps, rtc);
                 line("RTC fallback".to_owned());
@@ -727,7 +732,7 @@ pub fn draw_page<D>(
         Page::Resources => {
             let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
             let min_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
-            line("Page 3/5  RESOURCES".to_owned());
+            line("Page 3/6  RESOURCES".to_owned());
             if storage.mounted {
                 line(format!(
                     "SD free: {}",
@@ -756,7 +761,7 @@ pub fn draw_page<D>(
         }
         Page::Battery => {
             let (rtc_time, rtc_date) = rtc_local_strings(rtc, gps.tz_offset_hours);
-            line("Page 4/5  BATT & RTC".to_owned());
+            line("Page 4/6  BATT & RTC".to_owned());
             line(format!("Voltage: {:.3} V", battery.voltage_v));
             line(format!("Charge:  {:.1} %", battery.percent));
             line(format!("Time:  {}", rtc_time));
@@ -769,7 +774,7 @@ pub fn draw_page<D>(
                 DisciplineState::Unsync => "UNSYNC",
             };
             let jitter_us = ntp.pps_jitter_us.round() as u32;
-            line("Page 5/5  NTP".to_owned());
+            line("Page 5/6  NTP".to_owned());
             line(format!("Str:{} {}", ntp.stratum, state_str));
             line(format!("Freq:{:+.3} ppm", ntp.freq_ppm));
             line(format!(
@@ -786,6 +791,13 @@ pub fn draw_page<D>(
                 "Proc:{}  srv:{} ko:{}",
                 proc_label, ntp.served, ntp.rate_limited
             ));
+        }
+        Page::Network => {
+            line("Page 6/6  NETWORK".to_owned());
+            line(format!("IP:  {}", network.ip));
+            line(format!("GW:  {}", network.gateway));
+            line(format!("Host: {}", network.hostname));
+            line(format!("SSID: {}", network.ssid));
         }
     }
 }

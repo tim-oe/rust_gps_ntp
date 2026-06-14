@@ -20,6 +20,7 @@ use crate::i2c_bus::FeatherI2cBus;
 use crate::ntp::NtpSnapshot;
 use crate::rtc::{self, RtcSnapshot};
 use crate::storage::StorageStatus;
+use crate::wifi;
 
 const UI_TASK_STACK_BYTES: usize = 16_384;
 const BATTERY_SAMPLE_US: i64 = 5_000_000;
@@ -344,6 +345,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
 
         if screen_on && (force_redraw || (now_us - last_draw_us) >= DRAW_INTERVAL_US) {
             let (gps, pps_delta_us, ntp, storage, rtc) = feed.snapshot();
+            let network = wifi::read_network_snapshot();
             let mut panel = display::make_panel(display);
             display::draw_page(
                 &mut panel,
@@ -354,6 +356,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
                 &ntp,
                 storage,
                 rtc,
+                &network,
             );
             if !rendered_once {
                 log::trace!("Display diag: first frame rendered");
