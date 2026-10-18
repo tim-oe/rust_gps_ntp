@@ -38,8 +38,13 @@ test:
     cargo test --target {{host_target}}
 
 # Run tests with coverage; enforces 90% minimums and writes HTML + LCOV reports.
+# Drop this package's coverage artifacts first. cargo-llvm-cov merges every
+# .profraw in target/llvm-cov-target and passes every leftover test binary to
+# llvm-cov. After a rustc upgrade those profiles are an unreadable version, and
+# the old binaries are counted as a second unexecuted copy of the crate.
 coverage:
     mkdir -p target/llvm-cov
+    cargo llvm-cov clean --workspace
     {{coverage_llvm_cov_run}}
     {{coverage_llvm_cov_gate}}
     {{coverage_llvm_cov_report}} --html

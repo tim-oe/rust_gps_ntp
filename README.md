@@ -15,6 +15,35 @@ for your connected board at `/dev/ttyACM0`.
 
 - Follow [setup doc](docs/setup.md) for Rust + Espressif toolchain installation and flashing tools.
 
+## Architecture
+
+Firmware is a Rust library (`src/lib.rs`) with a thin `main.rs` entrypoint. Two
+build targets share the same crate:
+
+- **ESP-IDF** — full device: Wi-Fi, GPIO, UART, SPI, display, NTP server
+- **Host** — pure logic modules for fast unit tests (`just test`)
+
+**Bring-up** — [`BoardBoot`](src/board.rs) takes ESP32 peripherals once, routes
+them through [`PinPool`](src/pins.rs) (GPIO claim tracking), and runs module
+`init` in the right order (GPS → PPS → display SPI → I2C → SD → TFT → UI task).
+[`app`](src/app.rs) only runs the service loop; it does not own pin numbers or
+bus wiring.
+
+**Time-critical paths** (no event queues on the hot path):
+
+| Source | Mechanism | Consumers |
+|--------|-----------|-----------|
+| GPS NMEA | [`GpsUart::poll`](src/gps.rs) + [`GpsConsumer`](src/gps.rs) callbacks | UI feed, NTP UTC, timezone worker |
+| PPS GPIO12 | ISR timestamp → [`PpsDevice::poll`](src/pps.rs) → `PpsEvent` | NTP PLL servo, UI |
+| UDP/123 | [`NtpServer::poll`](src/ntp/mod.rs) (nonblocking) | LAN clients, `ntpq` mode-6 |
+
+**UI** — display, button, and battery sampling run on a separate FreeRTOS task;
+the main loop publishes snapshots through [`UiFeed`](src/ui_task.rs).
+
+Pin map and stacking notes: [docs/hardware.md](docs/hardware.md). Module design,
+data-flow diagram, NTP discipline, and spec links:
+[docs/technical.md](docs/technical.md).
+
 ## Current Status
 
 - ESP-IDF Rust project scaffold is in place (`build.rs`, target config, deps)
@@ -28,12 +57,6 @@ for your connected board at `/dev/ttyACM0`.
 - NTP UDP/123 responder with GPS/PPS-backed timestamps and mode-6 diagnostics
 - IANA timezone lookup (background worker) with NVS cache
 - [docs/rfp.md](docs/rfp.md) - project record: milestones, data model, test plan
-## Rust code organization
-
-Logic lives in the library crate (`src/lib.rs`); `src/main.rs` is a thin ESP-IDF
-entrypoint. Key modules: `board` (peripheral routing), `pins` (GPIO registry),
-`gps`, `pps`, `ntp`, `display`, `storage`, `battery`, `wifi`, `timezone`,
-`logging`, and `app` (main loop orchestrator).
 
 ## Repo Layout
 
