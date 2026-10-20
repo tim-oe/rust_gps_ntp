@@ -125,6 +125,9 @@ Main loop (every 1 s when no PPS, or on each PPS event)
 
 ### `gps` – NMEA Parsing and UART Ingest
 
+**Module configuration:** at boot `GpsUart::init` writes `$PMTK314,0,1,0,1,…*28` (RMC + GGA only, every fix) to the FeatherWing. The default MTK sentence set at 9600 baud can take a full second to transmit, which pushes `RMC` (the only sentence that feeds NTP time) onto the next PPS edge and breaks the sentence↔edge pairing; see the `ntp` integer-second accounting section. The command is idempotent and ignored by non-MTK modules. `GpsUart::discard_backlog()` is called once by `app` immediately before the poll loop so the first parsed sentences are live rather than buffered during bring-up.
+
+
 **Relevant spec:** [NMEA 0183 §6](https://gpsd.gitlab.io/gpsd/NMEA.html)
 
 The module handles two sentence types:
@@ -240,7 +243,7 @@ anchor.unix_seconds = gps_second if fresh && gps_second ≠ predicted
                       else predicted
 ```
 
-The two-pulse confirmation exists because the sentence↔edge pairing is ambiguous after a main-loop stall: if the sentence for second *N* is only parsed after edge *N+1* has fired, `floor((edge_us − t_nmea) / 1 s)` is −1 and `gps_second` reads one low for exactly that pulse. Without confirmation this produced a −1 step immediately followed by a +1 step (observed in the field roughly every 100 s). The first disagreeing pulse is logged at `info` with the "NMEA lead" (`edge_us − t_nmea`; negative means the sentence was parsed after the edge, the stall signature); a confirmed step is logged at `warn` and counted in `anchor_step_count` (exposed in `NtpSnapshot`). A coalesced PPS interval (outside 0.8–1.2 s, i.e. the loop did not run for over a second) is also logged at `warn`.
+The two-pulse confirmation exists because the sentence↔edge pairing is ambiguous whenever the sentence for second *N* is parsed after edge *N+1* has fired: `floor((edge_us − t_nmea) / 1 s)` is −1 and `gps_second` reads one low for exactly that pulse. Without confirmation this produced a −1 step immediately followed by a +1 step. An overnight card log showed the dominant cause was not a loop stall but the module itself: with the MTK3333's default sentence set (GGA, GSA, GSV×n, RMC, VTG) and multi-GNSS satellite counts, the per-second burst at 9600 baud is ~0.9–1.05 s long and `RMC`, near the end of the burst, arrives within ±3 ms of the *next* PPS edge. `gps` therefore sends `PMTK314` at boot to restrict output to RMC + GGA (~150 ms burst) and discards the UART backlog before the first poll so stale buffered sentences cannot anchor the first lock a second low. The first disagreeing pulse is logged at `info` with the "NMEA lead" (`edge_us − t_nmea`; negative means the sentence was parsed after the edge, the stall signature); a confirmed step is logged at `warn` and counted in `anchor_step_count` (exposed in `NtpSnapshot`). A coalesced PPS interval (outside 0.8–1.2 s, i.e. the loop did not run for over a second) is also logged at `warn`.
 
 This is also how a positive leap second is handled: NMEA `23:59:60` fails to parse, the pulse count runs one ahead, and the post-leap sentences pull the anchor back on the second confirming pulse (served time is one second fast for two seconds after the event; clients were already warned through the LI bits).
 

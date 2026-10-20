@@ -31,6 +31,29 @@ pub const UART_TX_PIN: i32 = 1;
 #[cfg(target_os = "espidf")]
 pub const UART_RX_PIN: i32 = 2;
 
+/// MTK `PMTK314` body selecting RMC + GGA output only (both every fix).
+///
+/// Field order: GLL, RMC, VTG, GGA, GSA, GSV, then reserved/unused slots.
+/// Sent at every boot (the setting is lost without backup power) so the
+/// per-second NMEA burst shrinks from up to ~1000 chars (multi-GNSS GSV
+/// traffic at 9600 baud ≈ 1 s) to ~150 chars.  This keeps `RMC`, the only
+/// sentence that feeds NTP time, arriving ~150 ms after its PPS edge rather
+/// than straddling the next edge, which is what the sentence↔edge pairing in
+/// `ntp` needs.  Modules that do not speak PMTK ignore the sentence.
+pub const PMTK_SET_NMEA_OUTPUT_RMC_GGA: &str = "PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0";
+
+/// Frame an NMEA/PMTK sentence body with `$`, `*XX` checksum, and `\r\n`.
+///
+/// # Parameters
+/// - `body`: Sentence content between `$` and `*` (ASCII, no framing).
+///
+/// # Returns
+/// - The complete sentence ready to write to the module.
+pub fn nmea_frame(body: &str) -> String {
+    let checksum = body.bytes().fold(0_u8, |acc, b| acc ^ b);
+    format!("${body}*{checksum:02X}\r\n")
+}
+
 /// GPS NMEA UART driver with GPIO lines claimed from [`crate::pins::PinPool`].
 #[cfg(target_os = "espidf")]
 pub struct GpsUart {
@@ -79,6 +102,10 @@ impl GpsUart {
             UART_TX_PIN,
             UART_RX_PIN
         );
+        match driver.write(nmea_frame(PMTK_SET_NMEA_OUTPUT_RMC_GGA).as_bytes()) {
+            Ok(_) => log::info!("GPS: requested RMC+GGA-only NMEA output (PMTK314)"),
+            Err(err) => log::warn!("GPS: PMTK314 write failed: {err}"),
+        }
         Ok(Self {
             driver,
             snapshot: GpsSnapshot::default(),
@@ -86,6 +113,19 @@ impl GpsUart {
             line_buf: String::new(),
             bytes_seen: 0,
         })
+    }
+
+    /// Drop any NMEA received before the caller is ready to poll continuously.
+    ///
+    /// The UART driver starts buffering at [`Self::init`], one to two seconds
+    /// before the main loop's first `poll`.  Parsing that backlog would stamp
+    /// stale sentences with the current time and anchor the clock a second
+    /// low; call this immediately before entering the poll loop instead.
+    pub fn discard_backlog(&mut self) {
+        if let Err(err) = self.driver.clear_rx() {
+            log::warn!("GPS: failed to clear UART backlog: {err}");
+        }
+        self.line_buf.clear();
     }
 
     /// Replace the working snapshot (for example with a boot-time timezone seed).

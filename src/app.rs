@@ -84,6 +84,10 @@ pub fn run() -> anyhow::Result<()> {
     let mut warn_no_pps_done = false;
     let mut rtc_seeded_from_gps = boot_rtc_unix.is_some();
 
+    // Everything buffered during board bring-up is stale relative to the PPS
+    // edges we are about to pair it with; start from live data.
+    gps_uart.discard_backlog();
+
     loop {
         let mut gps_dispatch = GpsDispatch {
             ui_feed: &ui_feed,

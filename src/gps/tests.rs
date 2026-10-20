@@ -226,3 +226,15 @@ fn runtime_timezone_override_applies_dst_rules_for_winter() {
     assert_eq!(gps.local_time, "06:00:00");
     assert_eq!(gps.tz_offset_hours, -6);
 }
+
+/// The PMTK314 configuration sentence must carry the checksum the module
+/// expects (`*28` for the RMC+GGA-only body) and CRLF framing.
+#[test]
+fn nmea_frame_produces_known_pmtk314_sentence() {
+    let sentence = nmea_frame(PMTK_SET_NMEA_OUTPUT_RMC_GGA);
+    assert_eq!(
+        sentence,
+        "$PMTK314,0,1,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0*28\r\n"
+    );
+    assert!(nmea_checksum_valid(sentence.trim_end()));
+}

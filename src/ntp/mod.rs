@@ -34,6 +34,11 @@ const MODE6_ASSOC_ID: u16 = 1;
 /// pulse for second N fires, so `last_gps_utc_seconds` lags by one second at
 /// PPS time.  Set `CONFIG_GPS_NTP_NMEA_PPS_FUDGE_S=0` in `sdkconfig.defaults`
 /// for modules that transmit NMEA *before* the PPS edge (uncommon).
+///
+/// The pairing in [`NtpServer::gps_second_at_edge`] assumes the sentence is
+/// parsed strictly less than one second after its edge.  That requires the
+/// module's per-second NMEA burst to be well under 1 s of UART time; `gps`
+/// enforces this on MTK modules by restricting output to RMC + GGA at boot.
 const NMEA_PPS_FUDGE_S: i64 = match env!("NMEA_PPS_FUDGE_S").as_bytes() {
     [b'0'] => 0,
     _ => 1,
