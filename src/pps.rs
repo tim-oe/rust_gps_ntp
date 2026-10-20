@@ -5,7 +5,7 @@
 //! owns the GPIO pin (claimed from [`crate::pins::PinPool`]) and wraps
 //! [`PpsMonitor`] polling for the main loop.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering, fence};
 use portable_atomic::AtomicU64;
 use std::sync::Arc;
 
@@ -19,9 +19,15 @@ use esp_idf_svc::hal::gpio::{self, Input, InterruptType, PinDriver};
 pub const GPIO_PIN: i32 = 12;
 
 /// Atomic state shared between the PPS GPIO ISR and the main service loop.
+///
+/// The pair is published with a seqlock: the ISR increments `seq` to an odd
+/// value, stores the edge timestamp, then increments `seq` again to an even
+/// value.  `seq / 2` is therefore the pulse count, and a reader that observes
+/// the same even `seq` before and after loading `edge_us` knows the timestamp
+/// belongs to exactly that pulse.
 pub struct PpsMonitor {
     edge_us: Arc<AtomicU64>,
-    count: Arc<AtomicU32>,
+    seq: Arc<AtomicU32>,
 }
 
 /// Last pulse observed by the main loop when computing PPS intervals.
@@ -72,7 +78,7 @@ impl PpsMonitor {
     pub fn new() -> Self {
         Self {
             edge_us: Arc::new(AtomicU64::new(0)),
-            count: Arc::new(AtomicU32::new(0)),
+            seq: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -87,29 +93,58 @@ impl PpsMonitor {
         Arc::clone(&self.edge_us)
     }
 
-    /// Clone the pulse counter handle for GPIO ISR registration.
+    /// Clone the sequence counter handle for GPIO ISR registration.
     ///
     /// # Parameters
     /// - `self`: Monitor providing shared atomic state.
     ///
     /// # Returns
-    /// - `Arc<AtomicU32>` incremented on each PPS rising edge.
-    pub fn count(&self) -> Arc<AtomicU32> {
-        Arc::clone(&self.count)
+    /// - `Arc<AtomicU32>` advanced by two on each PPS rising edge (odd while
+    ///   the ISR is mid-update); `seq / 2` is the pulse count.
+    pub fn seq(&self) -> Arc<AtomicU32> {
+        Arc::clone(&self.seq)
     }
 
     /// Record a rising edge from interrupt context.
     ///
+    /// Seqlock writer side: bump `seq` to odd (`AcqRel` so the timestamp store
+    /// cannot be hoisted above it), store the timestamp, then bump `seq` to
+    /// even with `Release` so a reader that sees the even value also sees the
+    /// timestamp.  The ISR is the only writer, so no CAS loop is needed.
+    ///
     /// # Parameters
     /// - `edge_us`: Shared atomic storing the latest edge timestamp.
-    /// - `count`: Shared atomic incremented once per pulse.
+    /// - `seq`: Shared sequence counter (see [`PpsMonitor`]).
     /// - `now_us`: Monotonic timestamp in microseconds for the current edge.
     ///
     /// # Returns
     /// - No return value.
-    pub fn record_edge(edge_us: &AtomicU64, count: &AtomicU32, now_us: u64) {
+    pub fn record_edge(edge_us: &AtomicU64, seq: &AtomicU32, now_us: u64) {
+        seq.fetch_add(1, Ordering::AcqRel);
         edge_us.store(now_us, Ordering::Relaxed);
-        count.fetch_add(1, Ordering::Relaxed);
+        seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// Seqlock reader side: return a consistent `(pulse_count, edge_us)` pair.
+    ///
+    /// Retries while the ISR is mid-update (odd `seq`) or if `seq` changed
+    /// across the timestamp load.  On target the ISR cannot be pre-empted by
+    /// the polling task, so a retry costs at most one ISR duration.
+    fn snapshot(&self) -> (u32, u64) {
+        loop {
+            let s1 = self.seq.load(Ordering::Acquire);
+            if s1 & 1 == 1 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let edge = self.edge_us.load(Ordering::Relaxed);
+            // Order the timestamp load before the confirming sequence load.
+            fence(Ordering::Acquire);
+            let s2 = self.seq.load(Ordering::Relaxed);
+            if s1 == s2 {
+                return (s1 >> 1, edge);
+            }
+        }
     }
 
     /// Poll for a new pulse and compute the interval since the previous edge.
@@ -128,12 +163,10 @@ impl PpsMonitor {
     /// the clock again to avoid task-scheduling latency (~10–100 ms) inflating
     /// the apparent offset.
     pub fn poll(&self, state: &mut PpsPollState) -> Option<PpsEvent> {
-        let current_count = self.count.load(Ordering::Relaxed);
+        let (current_count, now_us) = self.snapshot();
         if current_count <= state.last_count {
             return None;
         }
-
-        let now_us = self.edge_us.load(Ordering::Relaxed);
         let edge_us = now_us as i64;
         let event = if state.last_edge_us > 0 {
             PpsEvent::Delta {
@@ -160,14 +193,20 @@ where
     P: gpio::InputPin,
 {
     let edge_us = monitor.edge_us();
-    let count = monitor.count();
-    unsafe {
-        pin.subscribe_nonstatic(move || {
-            let now_us = esp_idf_svc::sys::esp_timer_get_time() as u64;
-            PpsMonitor::record_edge(&edge_us, &count, now_us);
-        })
-        .context("failed to subscribe PPS ISR callback")?;
-    }
+    let seq = monitor.seq();
+    let on_edge = move || {
+        // SAFETY: argument-free, ISR-safe read of the esp_timer counter; this
+        // is the same timebase the NTP task samples via `monotonic_us_now`.
+        let now_us = unsafe { esp_idf_svc::sys::esp_timer_get_time() } as u64;
+        PpsMonitor::record_edge(&edge_us, &seq, now_us);
+    };
+    // SAFETY: `subscribe_nonstatic` requires the closure to outlive the
+    // interrupt subscription.  The closure owns `Arc` clones of the shared
+    // atomics (no borrowed data), and the `PinDriver` it is attached to is
+    // stored in `PpsDevice` for the life of the program, so the subscription
+    // is never outlived.  The closure body only performs atomic stores and an
+    // FFI timer read, both of which are ISR-safe.
+    unsafe { pin.subscribe_nonstatic(on_edge) }.context("failed to subscribe PPS ISR callback")?;
     pin.set_interrupt_type(InterruptType::PosEdge)
         .context("failed to set PPS interrupt type")?;
     pin.enable_interrupt()
@@ -239,48 +278,4 @@ pub fn pps_delta_us(current_us: u64, previous_us: u64) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use core::sync::atomic::Ordering;
-
-    #[test]
-    fn pps_monitor_default_matches_new() {
-        assert_eq!(PpsMonitor::default().count().load(Ordering::Relaxed), 0);
-    }
-
-    #[test]
-    fn pps_delta_one_second_apart() {
-        assert_eq!(pps_delta_us(2_000_000, 1_000_000), 1_000_000);
-    }
-
-    #[test]
-    fn pps_delta_survives_u64_wraparound() {
-        let prev = u64::MAX - 999_999;
-        let curr = 0;
-        assert_eq!(pps_delta_us(curr, prev), 1_000_000);
-    }
-
-    #[test]
-    fn poll_emits_first_then_delta() {
-        let monitor = PpsMonitor::new();
-        let edge = monitor.edge_us();
-        let count = monitor.count();
-        let mut state = PpsPollState::default();
-
-        PpsMonitor::record_edge(&edge, &count, 1_000_000);
-        assert_eq!(
-            monitor.poll(&mut state),
-            Some(PpsEvent::First { edge_us: 1_000_000 })
-        );
-
-        PpsMonitor::record_edge(&edge, &count, 2_001_000);
-        assert_eq!(
-            monitor.poll(&mut state),
-            Some(PpsEvent::Delta {
-                interval_us: 1_001_000,
-                edge_us: 2_001_000
-            })
-        );
-        assert_eq!(state.pulse_count(), 2);
-    }
-}
+mod tests;

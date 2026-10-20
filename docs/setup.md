@@ -99,6 +99,33 @@ sudo usermod -aG dialout "$USER"
 
 ## 5) Build / flash / monitor
 
+### Build memory
+
+A firmware compile can peak above 4 GB of RAM. Cargo's default is one `rustc` per core, and the ESP-IDF C build defaults to the same, so a 4-core Pi runs several compilers at once. That total is what crosses 4 GB. One release compile of `chrono-tz` (the IANA timezone database) is about 600 MB; it is not the whole spike by itself.
+
+On a 4 GB Pi with no swap, the kernel's OOM killer has nowhere to page memory out, so the board locks instead of slowing down.
+
+The project keeps the compile inside physical RAM in two places:
+
+- `.cargo/config.toml` sets `jobs = 1`, plus `NUM_JOBS` and `CMAKE_BUILD_PARALLEL_LEVEL` for the ESP-IDF C build. A plain `cargo` invocation stays at one compiler. On a Pi, ESP-IDF uses Makefiles and shares Cargo's job count; `NUM_JOBS` covers the Ninja path.
+- `just` reads `MemTotal` and raises that floor when the machine can take it: 1 job on a 4 GB Pi, 3 on an 8 GB Pi, otherwise the core count. The same value is exported as `CARGO_BUILD_JOBS`, `NUM_JOBS`, and `CMAKE_BUILD_PARALLEL_LEVEL`.
+
+To use every core when you know you have the RAM and swap:
+
+```bash
+CARGO_BUILD_JOBS=4 NUM_JOBS=4 just flash
+```
+
+A swap file is still worth having on a 4 GB Pi. One compiler plus a desktop session can spike, and with no swap the board locks instead of paging:
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
 Set Wi-Fi station credentials in your shell before flashing:
 
 ```bash
@@ -233,6 +260,26 @@ just flash-monitor
 
 These are compile-time inputs (same pattern as `WIFI_SSID`/`WIFI_PASS`), so
 re-flash after changing them.
+
+### microSD log mirror
+
+When a card is mounted, every `info`/`warn`/`error` line also lands in
+`/sdcard/gps-ntp.log` (rotating to `gps-ntp.1.log` at 8 MiB), prefixed with the
+same boot-relative millisecond stamp the serial console shows. This is the way
+to capture overnight or unattended runs without a serial cable: let the device
+run, power it down, and read the card on a PC, or fetch it over the LAN:
+
+```bash
+curl -o gps-ntp.log  http://gps-ntp/log      # current file
+curl -o gps-ntp.1.log http://gps-ntp/log/1   # rotated file, if any
+```
+
+The HTTP endpoint is read-only and unauthenticated (it only exists when a card
+is mounted); treat it as having the same trust boundary as the NTP service,
+since the log includes the STA SSID and client IP addresses. Flushes happen
+every 5 s, so at most the last few seconds are lost on a power pull.
+Debug/trace lines are never written to the card even when a module is raised
+to `debug`; use the serial console for those.
 
 Example (`sdkconfig.defaults`):
 

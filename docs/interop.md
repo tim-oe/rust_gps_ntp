@@ -31,10 +31,10 @@ interval above the server's 2-second rate-limit floor.
 | Area | Detail |
 |------|--------|
 | **iburst** | `ntpd` sends 8 back-to-back requests on startup, each ~1 s apart.  This trips the server's 2-second `MIN_POLL_INTERVAL_US` rate limiter and results in the first 7 requests receiving KoD `RATE` responses.  `ntpd` handles KoD correctly and backs off; synchronisation still converges, but initial lock-on takes ~30 s longer.  Workaround: omit `iburst`, or add `minpoll 4` so ntpd only fires two rapid probes. |
-| **maxdistance** | Default `maxdist 1.5` (seconds).  Our root dispersion stays well below this during normal GPS-locked operation (< 1 ms).  During holdover, dispersion grows at `HOLDOVER_DISP_RATE_US_PER_SEC = 500 µs/s`; maxdistance is exceeded after ~50 minutes of holdover, at which point ntpd correctly stops using this server. |
+| **maxdistance** | Default `maxdist 1.5` (seconds).  Our root dispersion stays well below this during normal GPS-locked operation (< 1 ms).  During holdover, dispersion grows at `HOLDOVER_DISP_RATE_US_PER_SEC = 500 µs/s`.  `maxdist 1.5` would be exceeded after ~50 minutes, but the server demotes itself first: at 1 s of root dispersion (~33 min after the last PPS pulse) it reports stratum 0 / LI=3 and ntpd stops using it. |
 | **Mode-6 (`ntpq`)** | `ntpq -pnu` and `ntpq -c rv` work correctly.  `READSTAT` returns association ID `1` with `sel=6` (system peer) when locked.  `READVAR` returns all standard system and peer variables.  The `frequency` field sign prefix (`+`/`-`) may differ from ntpd's canonical output but parses correctly. |
 | **Root delay** | Reported as `0.000 ms` (hardware reference).  ntpd accepts zero root delay without issue. |
-| **Stratum** | Server reports stratum 1 when locked; stratum 16 (unsynchronised) during holdover timeout or before first GPS fix.  ntpd discards stratum-16 responses as expected. |
+| **Stratum** | Server reports stratum 1 when locked and throughout the ~33 min holdover window; when unsynchronised (holdover expired, or before the first PPS lock) it sends stratum 0 with LI=3 and refid `INIT`, per RFC 5905 §7.3.  ntpd treats stratum 0 as unsynchronised and discards it as expected. |
 | **NTPv3 clients** | Server mirrors the client's VN field.  NTPv3-configured ntpd peers work correctly. |
 
 ### Recommended `ntp.conf` snippet
@@ -59,7 +59,7 @@ server 192.168.1.100 prefer iburst
 | Area | Detail |
 |------|--------|
 | **iburst** | Chrony's iburst sends 4 rapid probes ~2 s apart at startup.  The 2-second rate-limit threshold means the first probe from each burst window is allowed and subsequent ones may receive KoD `RATE`.  Chrony respects KoD and backs off to its normal polling interval.  Synchronisation converges normally within 1-2 poll cycles. |
-| **maxdistance** | Default `maxdistance 3.0` seconds.  More permissive than ntpd; holdover is tolerated for up to ~100 minutes before chrony stops selecting this server. |
+| **maxdistance** | Default `maxdistance 3.0` seconds.  More permissive than ntpd, but moot here: the server's own ~33 min holdover limit (1 s root dispersion → stratum 0 / LI=3) is reached long before chrony's distance threshold. |
 | **Reference timestamp** | Chrony checks that the reference timestamp advances between successive responses.  This server updates `last_sync_ntp_ts` on every successful PPS discipline event (once per second), so the reference timestamp advances normally. |
 | **Mode-6 (`chronyc`)** | Chrony uses its own control socket rather than NTP mode-6, so `ntpq` diagnostics are not relevant here.  Use `chronyc tracking` and `chronyc sources -v` for monitoring. |
 | **Leap second** | Chrony relies on the leap indicator in the NTP response.  Use `server.set_leap_indicator(1)` (warning: +1 s) the day before a positive leap second and reset to `0` the day after.  Advance notice comes from IERS Bulletin C (<https://www.iers.org/IERS/EN/Publications/Bulletins/bulletins.html>). |
@@ -141,10 +141,11 @@ Before deploying in a production environment, validate the following:
    `leap=00`, and that `reftime` and `clock` fields show recent NTP timestamps.
 4. **Hold the GPS antenna stationary** for at least 5 minutes and confirm that
    `offset` in `ntpq` output is less than 1 ms and `jitter` is below 500 µs.
-5. **Simulate holdover** by disconnecting the GPS fix input; verify that
-   responding clients observe stratum rising toward 16 as dispersion grows, and
-   that ntpd/chronyd drops the server from the selection set within the expected
-   holdover window (~50–100 min depending on client `maxdistance`).
+5. **Simulate holdover** by disconnecting the PPS/GPS input; verify that
+   clients observe root dispersion growing at 0.5 ms/s while the stratum stays
+   at 1, and that after ~33 min the server reports stratum 0 / LI=3 and
+   ntpd/chronyd drops it from the selection set.  Reconnecting PPS must
+   restore stratum 1 on the next pulse.
 6. **Rate-limit test** — `ntpdate -q gps-ntp.local` (single query) should
    succeed; rapid repeated calls within 2 s should receive KoD `RATE`.
 7. **Leap second test (optional)** — use `server.set_leap_indicator(1)` to

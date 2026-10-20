@@ -138,13 +138,6 @@ pub fn run() -> anyhow::Result<()> {
         );
 
         let mut now_us = monotonic_us();
-        maybe_writeback_rtc(
-            &ui_feed,
-            &ntp_server,
-            gps.fix,
-            now_us,
-            &mut last_rtc_write_us,
-        );
 
         if ui_feed.storage().mounted
             && (last_storage_refresh_us == 0
@@ -183,6 +176,16 @@ pub fn run() -> anyhow::Result<()> {
             // Publish fresh discipline metrics whenever PPS fires (every ~1 s when locked).
             ui_feed.publish_ntp(ntp_server.ntp_snapshot(gps.fix));
             last_ntp_publish_us = monotonic_us();
+            // Write the RTC only on a PPS edge: the PCF8523 takes whole
+            // seconds, so writing here (a few ms after the top of the second)
+            // keeps its sub-second phase error small instead of random.
+            maybe_writeback_rtc(
+                &ui_feed,
+                &ntp_server,
+                gps.fix,
+                last_ntp_publish_us,
+                &mut last_rtc_write_us,
+            );
             if let Err(err) = pps.reenable_interrupt() {
                 log::warn!("PPS: failed to re-enable interrupt: {}", err);
             }
@@ -323,6 +326,9 @@ fn maybe_apply_rtc_fallback(
 }
 
 /// Queue a PCF8523 write when GPS is locked and discipline has a valid anchor.
+///
+/// Called from the PPS event branch so the write lands just after a second
+/// boundary (see the call site); `now_us` is the time of that branch.
 fn maybe_writeback_rtc(
     ui_feed: &UiFeed,
     ntp_server: &ntp::NtpServer,
@@ -356,6 +362,8 @@ fn maybe_writeback_rtc(
 /// # Returns
 /// - Monotonic timestamp in microseconds since boot.
 fn monotonic_us() -> i64 {
+    // SAFETY: plain FFI read of the 64-bit high-resolution timer; no
+    // preconditions and safe from any task context.
     unsafe { esp_idf_svc::sys::esp_timer_get_time() }
 }
 

@@ -37,6 +37,9 @@ fn parse_level(value: &str) -> Option<EspLogLevel> {
 /// - No return value.
 fn set_level(tag: &str, level: EspLogLevel) {
     if let Ok(c_tag) = CString::new(tag) {
+        // SAFETY: `c_tag` is a valid NUL-terminated string that outlives the
+        // call; ESP-IDF copies the tag internally and does not retain the
+        // pointer.
         unsafe {
             esp_idf_svc::sys::esp_log_level_set(c_tag.as_ptr(), level);
         }
@@ -57,7 +60,11 @@ fn level_from_sdkconfig_defaults(key: &str) -> Option<&'static str> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (lhs, rhs) = line.split_once('=')?;
+        // Skip malformed lines instead of aborting the scan: a stray line
+        // without `=` must not hide keys that appear later in the file.
+        let Some((lhs, rhs)) = line.split_once('=') else {
+            continue;
+        };
         if lhs.trim() == key {
             return Some(rhs.trim().trim_matches('"'));
         }
@@ -158,7 +165,8 @@ pub fn display_boot_test_enabled() -> bool {
     )
 }
 
-/// Initialize ESP logger backend and apply optional per-module level overrides.
+/// Initialize the logger backend (console plus microSD mirror, see
+/// [`crate::sdlog`]) and apply optional per-module level overrides.
 ///
 /// Build-time overrides (set before `cargo`/`just flash-monitor`) are:
 /// - LOG_WIFI_LEVEL
@@ -174,7 +182,7 @@ pub fn display_boot_test_enabled() -> bool {
 /// # Returns
 /// - No return value.
 pub fn init() {
-    esp_idf_svc::log::EspLogger::initialize_default();
+    crate::sdlog::install();
 
     set_level_from_key(
         "rust_gps_ntp::wifi",

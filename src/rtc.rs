@@ -48,6 +48,10 @@ pub fn dec_to_bcd(value: u8) -> u8 {
 }
 
 /// Decode seven PCF8523 time registers starting at `0x03` (seconds).
+///
+/// Register order (PCF8523 datasheet §8.4): `0x03` seconds, `0x04` minutes,
+/// `0x05` hours, `0x06` days, `0x07` weekdays, `0x08` months, `0x09` years.
+/// The weekday register (`regs[4]`) is not needed for the Unix conversion.
 pub fn decode_datetime_regs(regs: [u8; 7]) -> Option<RtcDateTime> {
     if regs[0] & 0x80 != 0 {
         return None;
@@ -57,7 +61,7 @@ pub fn decode_datetime_regs(regs: [u8; 7]) -> Option<RtcDateTime> {
     let minute = bcd_to_dec(regs[1] & 0x7F);
     let hour = bcd_to_dec(regs[2] & 0x3F);
     let day = bcd_to_dec(regs[3] & 0x3F);
-    let month = bcd_to_dec(regs[4] & 0x1F);
+    let month = bcd_to_dec(regs[5] & 0x1F);
     let year = 2000 + bcd_to_dec(regs[6]) as i32;
 
     if !(1..=12).contains(&month)
@@ -285,69 +289,4 @@ pub fn write_datetime(bus: &mut FeatherI2cBus, dt: RtcDateTime) -> anyhow::Resul
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bcd_round_trip() {
-        assert_eq!(bcd_to_dec(0x59), 59);
-        assert_eq!(dec_to_bcd(59), 0x59);
-    }
-
-    #[test]
-    fn decode_valid_rtc_regs() {
-        // 2024-06-07 14:30:45 — OS stopped bit clear
-        let regs = [0x45, 0x30, 0x14, 0x07, 0x06, 0x05, 0x24];
-        let dt = decode_datetime_regs(regs).expect("valid regs");
-        assert_eq!(dt.year, 2024);
-        assert_eq!(dt.month, 6);
-        assert_eq!(dt.day, 7);
-        assert_eq!(dt.hour, 14);
-        assert_eq!(dt.minute, 30);
-        assert_eq!(dt.second, 45);
-    }
-
-    #[test]
-    fn decode_rejects_os_stop_bit() {
-        let regs = [0xC5, 0x30, 0x14, 0x07, 0x06, 0x05, 0x24];
-        assert!(decode_datetime_regs(regs).is_none());
-    }
-
-    #[test]
-    fn decode_rejects_pre_2020() {
-        let regs = [0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x19];
-        assert!(decode_datetime_regs(regs).is_none());
-    }
-
-    #[test]
-    fn unix_round_trip() {
-        let dt = RtcDateTime {
-            year: 2024,
-            month: 6,
-            day: 7,
-            hour: 14,
-            minute: 30,
-            second: 45,
-        };
-        let unix = datetime_to_unix_seconds(dt).expect("valid datetime");
-        let back = unix_seconds_to_datetime(unix).expect("valid unix");
-        assert_eq!(back, dt);
-    }
-
-    #[test]
-    fn local_date_time_applies_tz_offset() {
-        // 2024-06-07 14:30:45 UTC -> 09:30:45 at UTC-5
-        let unix = datetime_to_unix_seconds(RtcDateTime {
-            year: 2024,
-            month: 6,
-            day: 7,
-            hour: 14,
-            minute: 30,
-            second: 45,
-        })
-        .expect("valid datetime");
-        let (date, time) = local_date_time_from_utc(unix, -5).expect("valid offset");
-        assert_eq!(date, "2024-06-07");
-        assert_eq!(time, "09:30:45");
-    }
-}
+mod tests;

@@ -14,6 +14,7 @@ for your connected board at `/dev/ttyACM0`.
 ## Requirements
 
 - Follow [setup doc](docs/setup.md) for Rust + Espressif toolchain installation and flashing tools.
+- A 4 GB Pi can lock up while compiling if it has no swap. Builds are capped at one compiler unless `just` sees enough RAM; details are in [Build memory](docs/setup.md#build-memory).
 
 ## Architecture
 

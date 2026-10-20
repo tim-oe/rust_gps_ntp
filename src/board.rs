@@ -16,6 +16,7 @@ use crate::ntp::NtpServer;
 use crate::pins::PinPool;
 use crate::pps::PpsDevice;
 use crate::rtc::{self, RtcDevice};
+use crate::sdlog;
 use crate::storage::StorageDevice;
 use crate::timezone::{self, TimezoneStore};
 use crate::ui_task::{UiFeed, UiTaskHandle};
@@ -54,13 +55,17 @@ pub struct BoardBoot {
 
 /// Wi-Fi, display bus, storage mount, and UI task — held for the firmware lifetime.
 pub struct BoardKeepalive {
-    _wifi: esp_idf_svc::wifi::BlockingWifi<esp_idf_svc::wifi::EspWifi<'static>>,
+    _wifi: wifi::SharedWifi,
     // Drives automatic Wi-Fi reconnect; dropping it disables recovery.
     _wifi_reconnect: esp_idf_svc::eventloop::EspSystemSubscription<'static>,
     #[cfg(esp_idf_comp_mdns_enabled)]
     _mdns: Option<EspMdns<'static>>,
     _display: DisplayDevice,
     _storage: StorageDevice<'static>,
+    // Drains the log mirror to the card; `None` when no card is mounted.
+    _sd_log: Option<std::thread::JoinHandle<()>>,
+    // Serves the card log over HTTP; `None` when no card is mounted.
+    _log_http: Option<esp_idf_svc::http::server::EspHttpServer<'static>>,
     _ui_task: UiTaskHandle,
 }
 
@@ -95,6 +100,15 @@ impl BoardBoot {
 
         let storage = StorageDevice::init(&mut pin_pool, display.spi_driver());
         let storage_status = storage.status;
+        let (sd_log, log_http) = if storage_status.mounted {
+            (
+                Some(sdlog::start_writer()?),
+                Some(sdlog::start_http_server()?),
+            )
+        } else {
+            log::info!("SD log: disabled (no card mounted)");
+            (None, None)
+        };
 
         let panel = display.init_panel(&mut pin_pool)?;
 
@@ -118,6 +132,7 @@ impl BoardBoot {
             battery,
             rtc,
             panel.backlight_on_state,
+            Arc::clone(&wifi),
         )?;
 
         log::info!("System: booted; Wi-Fi + GPS UART diagnostics mode");
@@ -136,6 +151,8 @@ impl BoardBoot {
                 _mdns: register_mdns(),
                 _display: display,
                 _storage: storage,
+                _sd_log: sd_log,
+                _log_http: log_http,
                 _ui_task: ui_task,
             },
         })
@@ -144,7 +161,7 @@ impl BoardBoot {
     /// Bind NTP, apply compile-time ACL, and seed from boot-time RTC when available.
     pub fn init_ntp_server(&self) -> anyhow::Result<NtpServer> {
         let mut server = NtpServer::bind()?;
-        NtpServer::apply_boot_acl(&mut server);
+        server.apply_boot_acl();
         if let Some(secs) = self.boot_rtc_unix {
             server.seed_utc_seconds(secs);
             log::info!("RTC: seeded NTP anchor from cached time (UTC {secs})");

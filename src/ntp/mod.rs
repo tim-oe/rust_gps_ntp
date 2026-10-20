@@ -42,8 +42,35 @@ const NMEA_PPS_FUDGE_S: i64 = match env!("NMEA_PPS_FUDGE_S").as_bytes() {
 // --- Discipline servo parameters ---
 /// Proportional gain: fraction of phase error applied to the anchor per pulse.
 const SERVO_KP: f64 = 0.1;
-/// Integral gain: fraction of phase error fed into frequency learning per pulse.
+/// Frequency-estimate smoothing weight.  Each PPS interval error (µs over 1 s,
+/// i.e. ppm) is blended into `freq_ppm` as an exponentially weighted moving
+/// average with this weight, giving a ~100-pulse time constant.  The estimate
+/// converges to the measured offset rather than integrating it without bound.
 const SERVO_KI: f64 = 0.01;
+/// Client-mode request (RFC 5905 §7.3 mode 3); answered with mode 4.
+const MODE_CLIENT: u8 = 3;
+/// Symmetric-active request (mode 1); answered with mode 2 without mobilising
+/// an association, matching ntpd's `nopeer` behaviour (RFC 5905 §9.2).
+const MODE_SYMMETRIC_ACTIVE: u8 = 1;
+/// Symmetric-passive reply mode for mode-1 requests.
+const MODE_SYMMETRIC_PASSIVE: u8 = 2;
+/// Server reply mode for mode-3 requests.
+const MODE_SERVER: u8 = 4;
+/// Control (ntpq) mode.
+const MODE_CONTROL: u8 = 6;
+/// Internal stratum value meaning "unsynchronised" (RFC 5905 §7.3 MAXSTRAT).
+/// Transmitted packets map this to 0 per the same section.
+const STRATUM_UNSYNC: u8 = 16;
+
+// --- Mode-6 (RFC 1305 Appendix B) framing constants ---
+/// Response bit in the second header byte.
+const MODE6_RESPONSE_BIT: u8 = 0x80;
+/// Error bit in the second header byte.
+const MODE6_ERROR_BIT: u8 = 0x40;
+/// Error status code: invalid opcode (RFC 1305 B.2.4).
+const MODE6_ERR_BAD_OPCODE: u16 = 3;
+/// Error status code: unknown association identifier (RFC 1305 B.2.4).
+const MODE6_ERR_BAD_ASSOC: u16 = 4;
 /// Clamp on estimated frequency offset to prevent runaway corrections (ppm).
 const SERVO_MAX_FREQ_PPM: f64 = 500.0;
 
@@ -57,6 +84,10 @@ const BASE_DISP_US: i64 = 1_000;
 /// Maximum root dispersion cap, in microseconds (2 s).
 const MAX_DISP_US: i64 = 2_000_000;
 /// Dispersion threshold above which stratum=16 and leap=unsync are declared (1 s).
+///
+/// With [`BASE_DISP_US`] + [`HOLDOVER_DISP_RATE_US_PER_SEC`] this is reached
+/// (1 s − 1 ms) / 0.5 ms/s ≈ 1998 s after holdover entry, i.e. ≈ 33 min
+/// after the last PPS pulse.
 const HOLDOVER_UNSYNC_US: i64 = 1_000_000;
 
 // --- RFC 5905 §11.1 correctness-field constants ---
@@ -88,7 +119,7 @@ const GPS_STALE_THRESHOLD_US: i64 = 2_000_000; // 2 s
 /// Kiss-o'-Death kiss code for rate limiting (RFC 5905 §7.4).
 const KOD_KISS_RATE: &[u8; 4] = b"RATE";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ClockAnchor {
     /// Unix epoch seconds at the anchor instant.
     unix_seconds: i64,
@@ -108,7 +139,7 @@ pub enum DisciplineState {
 }
 
 /// Snapshot of NTP discipline metrics for the display and UI task.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct NtpSnapshot {
     pub stratum: u8,
     pub state: DisciplineState,
@@ -128,6 +159,9 @@ pub struct NtpSnapshot {
     pub acl_blocked: u64,
     /// Total PPS phase outliers rejected since boot (large single-pulse errors).
     pub pps_glitch_count: u32,
+    /// Total integer-second corrections applied from GPS UTC when the PPS
+    /// pulse count disagreed with the NMEA time (missed pulses, leap seconds).
+    pub anchor_step_count: u32,
     /// Current leap indicator value being broadcast in NTP responses.
     /// 0 = no warning, 1 = +1 s at end of day, 2 = −1 s at end of day.
     pub leap_indicator: u8,
@@ -150,6 +184,7 @@ impl Default for NtpSnapshot {
             rate_limited: 0,
             acl_blocked: 0,
             pps_glitch_count: 0,
+            anchor_step_count: 0,
             leap_indicator: 0,
             proc_delay_us: 0.0,
             proc_delay_has_sample: false,
@@ -161,8 +196,12 @@ impl Default for NtpSnapshot {
 ///
 /// Used to populate stratum, leap indicator, and root dispersion fields in
 /// both standard NTP responses and mode-6 control responses.
+#[derive(Clone, Copy, Debug)]
 struct DisciplineParams {
+    /// Internal stratum: 1 when serving, [`STRATUM_UNSYNC`] otherwise.
     stratum: u8,
+    /// Locked / Holdover / Unsync classification matching `stratum`.
+    state: DisciplineState,
     leap: u8,
     /// Root dispersion in NTP short format (16.16 fixed-point seconds).
     root_disp_short: u32,
@@ -176,6 +215,19 @@ struct DisciplineParams {
     current_ts: u64,
     /// RFC 5905 precision field: log2(seconds) of estimated worst-case error.
     precision: i8,
+}
+
+/// Servo diagnostics reported through mode-6 READVAR.
+#[derive(Clone, Copy, Debug, Default)]
+struct ServoStats {
+    /// Latest PPS-derived phase offset in microseconds.
+    pps_offset_us: i32,
+    /// Smoothed PPS jitter estimate in microseconds.
+    pps_jitter_us: f32,
+    /// Smoothed per-packet processing delay in microseconds.
+    proc_delay_us: f32,
+    /// Current oscillator frequency offset estimate in ppm.
+    freq_ppm: f64,
 }
 
 /// Stateful NTP server engine and discipline metrics.
@@ -212,6 +264,11 @@ pub struct NtpServer {
     pending_leap: u8,
     /// Count of PPS intervals rejected as phase outliers since boot.
     pps_glitch_count: u32,
+    /// Count of integer-second anchor corrections taken from GPS UTC.
+    anchor_step_count: u32,
+    /// GPS−predicted second disagreement seen on the previous accepted pulse,
+    /// awaiting confirmation by the next one before the anchor is stepped.
+    pending_gps_step: Option<i64>,
     /// Monotonic timestamp of the most recent `update_gps_utc_seconds` call.
     /// Used to guard against anchoring the phase to stale GPS data on the first
     /// PPS pulse after a device restart or GPS module reset.
@@ -236,7 +293,12 @@ impl NtpServer {
 
         log::info!("NTP: listening on UDP/123");
 
-        Ok(Self {
+        Ok(Self::from_socket(socket))
+    }
+
+    /// Wrap an already-bound nonblocking socket in a fresh, unsynchronised server.
+    fn from_socket(socket: UdpSocket) -> Self {
+        Self {
             socket,
             served: 0,
             clock_anchor: None,
@@ -256,8 +318,10 @@ impl NtpServer {
             acl_blocked_total: 0,
             pending_leap: 0,
             pps_glitch_count: 0,
+            anchor_step_count: 0,
+            pending_gps_step: None,
             last_gps_utc_update_us: None,
-        })
+        }
     }
 
     /// Replace the ACL used by this server.
@@ -276,9 +340,9 @@ impl NtpServer {
     }
 
     /// Apply compile-time `NTP_ACL_CIDR` and log the effective restriction.
-    pub fn apply_boot_acl(server: &mut NtpServer) {
+    pub fn apply_boot_acl(&mut self) {
         let acl_cidr = env!("NTP_ACL_CIDR");
-        server.set_acl(Acl::from_config(acl_cidr));
+        self.set_acl(Acl::from_config(acl_cidr));
         if acl_cidr.is_empty() {
             log::info!("NTP: ACL restricted to RFC 1918 private networks");
         } else {
@@ -336,10 +400,14 @@ impl NtpServer {
 
     /// Update the latest GPS NMEA UTC second and anchor the clock pre-PPS.
     ///
-    /// Applies [`NMEA_PPS_FUDGE_S`] because NMEA typically lags the PPS edge by
-    /// one second, and always overwrites any RTC bootstrap anchor.  Once PPS
-    /// discipline is active, only freshness is updated so lagged NMEA cannot pull
-    /// the anchor backward.
+    /// Before PPS lock the anchor is the NMEA second at its parse time.  The
+    /// sentence arrives a few hundred milliseconds after the second it names,
+    /// so this is a sub-second estimate (served at stratum 16); the exact
+    /// edge alignment, including [`NMEA_PPS_FUDGE_S`], happens on the first PPS
+    /// pulse.  Always overwrites any RTC bootstrap anchor.  Once PPS discipline
+    /// is active only the NMEA record is refreshed; the anchor is then
+    /// maintained by [`Self::observe_pps_pulse`], which cross-checks it against
+    /// this record on every pulse.
     pub fn update_gps_utc_seconds(&mut self, utc_unix_seconds: i64) {
         self.last_gps_utc_seconds = Some(utc_unix_seconds);
         let now_us = monotonic_us_now();
@@ -348,7 +416,7 @@ impl NtpServer {
             return;
         }
         self.clock_anchor = Some(ClockAnchor {
-            unix_seconds: utc_unix_seconds.saturating_add(NMEA_PPS_FUDGE_S),
+            unix_seconds: utc_unix_seconds,
             monotonic_us: now_us,
         });
     }
@@ -357,6 +425,57 @@ impl NtpServer {
         self.last_gps_utc_update_us
             .map(|t| edge_us.saturating_sub(t) < GPS_STALE_THRESHOLD_US)
             .unwrap_or(false)
+    }
+
+    /// GPS-derived UTC second marked by a PPS edge at `edge_us`, when GPS is fresh.
+    ///
+    /// The NMEA sentence carrying UTC second `N` is parsed at `t_nmea`, which on
+    /// most modules is 100–900 ms *after* the PPS edge that marks `N`.  An edge
+    /// at `edge_us` is therefore `floor((edge_us − t_nmea) / 1 s)` whole seconds
+    /// past that reference edge, plus [`NMEA_PPS_FUDGE_S`] to account for which
+    /// side of the sentence the edge lies on.  Anchoring on the parse time rather
+    /// than assuming "latest NMEA = previous second" keeps the mapping correct
+    /// when the main loop processes an edge late, after a newer sentence has
+    /// already been parsed, and when the sentence for one second was dropped.
+    fn gps_second_at_edge(&self, edge_us: i64) -> Option<i64> {
+        if !self.gps_time_fresh(edge_us) {
+            return None;
+        }
+        let gps_utc = self.last_gps_utc_seconds?;
+        let t_nmea = self.last_gps_utc_update_us?;
+        let whole_secs = edge_us.saturating_sub(t_nmea).div_euclid(MICROS_PER_SEC);
+        Some(
+            gps_utc
+                .saturating_add(whole_secs)
+                .saturating_add(NMEA_PPS_FUDGE_S),
+        )
+    }
+
+    /// Establish (or re-establish) PPS lock with the anchor at `edge_us`.
+    fn lock_anchor(&mut self, unix_seconds: i64, edge_us: i64) {
+        self.clock_anchor = Some(ClockAnchor {
+            unix_seconds,
+            monotonic_us: edge_us,
+        });
+        self.pps_locked = true;
+        self.pending_gps_step = None;
+        self.last_pps_monotonic_us = Some(edge_us);
+        // Reference timestamp (RFC 5905 §7.3): the disciplined time of this
+        // edge, i.e. exactly the top of `unix_seconds`.
+        self.last_sync_ntp_ts = ntp_timestamp_from_unix(unix_seconds, 0);
+    }
+
+    /// Scale raw monotonic elapsed microseconds by the frequency estimate.
+    ///
+    /// Positive `freq_ppm` means the monotonic clock runs fast, so the elapsed
+    /// interval is shrunk to recover true elapsed microseconds.
+    fn corrected_elapsed_us(&self, raw_elapsed_us: i64) -> i64 {
+        if self.freq_ppm == 0.0 {
+            raw_elapsed_us
+        } else {
+            ((raw_elapsed_us as f64) * (1.0 - self.freq_ppm / 1_000_000.0)) as i64
+        }
+        .max(0)
     }
 
     /// Feed a PPS pulse event into the discipline servo.
@@ -385,36 +504,24 @@ impl NtpServer {
                 // fed us a UTC value recently.  Stale GPS data (from before a
                 // module reset or cold-start) must not be used to initialise the
                 // clock anchor.
-                let gps_fresh = self.gps_time_fresh(now_us);
-
-                if !gps_fresh {
+                let Some(unix_seconds) = self.gps_second_at_edge(now_us) else {
                     log::debug!(
                         "NTP: PPS first pulse skipped — GPS time not fresh (age > {}s)",
                         GPS_STALE_THRESHOLD_US / MICROS_PER_SEC
                     );
                     return;
-                }
-
-                if let Some(gps_utc) = self.last_gps_utc_seconds {
-                    self.clock_anchor = Some(ClockAnchor {
-                        // The GPS module sends NMEA ~100-200 ms AFTER the PPS
-                        // edge.  When PPS fires for second N, last_gps_utc_seconds
-                        // still holds N-1 (from the previous NMEA cycle).  Adding
-                        // NMEA_PPS_FUDGE_S (from sdkconfig.defaults) aligns the
-                        // anchor to the second the PPS pulse is actually marking.
-                        unix_seconds: gps_utc + NMEA_PPS_FUDGE_S,
-                        monotonic_us: now_us,
-                    });
-                    self.pps_locked = true;
-                    self.last_pps_monotonic_us = Some(now_us);
-                    // Record the NTP timestamp of this discipline event as the
-                    // reference timestamp returned to NTP clients (RFC 5905 §7.3).
-                    self.last_sync_ntp_ts = self.current_ntp_timestamp();
-                    log::debug!("NTP: PPS first pulse, aligned to GPS UTC {}", gps_utc);
-                }
+                };
+                self.lock_anchor(unix_seconds, now_us);
+                log::debug!("NTP: PPS first pulse, aligned to GPS UTC {unix_seconds}");
             }
             Some(interval) => {
                 if !(800_000..=1_200_000).contains(&interval) {
+                    // Two or more ISR edges coalesced into one event: the main
+                    // loop did not run for over a second.  Not an error for the
+                    // clock (the next pulse re-derives the second from elapsed
+                    // time) but worth surfacing, since the same stall delays
+                    // NMEA parsing and can mis-pair a sentence with an edge.
+                    log::warn!("NTP: PPS interval {interval}us out of range; pulse(s) missed");
                     return;
                 }
 
@@ -422,23 +529,14 @@ impl NtpServer {
                 // was skipped (no GPS fix yet) or when pulses accumulated during
                 // boot before the main loop ran.  Align to GPS+PPS fudge — do not
                 // increment an RTC bootstrap anchor, which lacks NMEA_PPS_FUDGE_S.
-                if !self.pps_locked {
-                    if !self.gps_time_fresh(now_us) {
-                        return;
-                    }
-                    let Some(gps_utc) = self.last_gps_utc_seconds else {
+                let Some(anchor) = self.clock_anchor.filter(|_| self.pps_locked) else {
+                    let Some(unix_seconds) = self.gps_second_at_edge(now_us) else {
                         return;
                     };
-                    self.clock_anchor = Some(ClockAnchor {
-                        unix_seconds: gps_utc + NMEA_PPS_FUDGE_S,
-                        monotonic_us: now_us,
-                    });
-                    self.pps_locked = true;
-                    self.last_pps_monotonic_us = Some(now_us);
-                    self.last_sync_ntp_ts = self.current_ntp_timestamp();
-                    log::debug!("NTP: PPS delta first lock, aligned to GPS UTC {gps_utc}");
+                    self.lock_anchor(unix_seconds, now_us);
+                    log::debug!("NTP: PPS delta first lock, aligned to GPS UTC {unix_seconds}");
                     return;
-                }
+                };
 
                 // Phase error in microseconds: positive means our clock runs fast
                 // (the measured interval exceeded the ideal 1 000 000 us).
@@ -462,25 +560,73 @@ impl NtpServer {
                     return;
                 }
 
-                // Integral path: accumulate frequency estimate.
-                // A phase error of +1 us/s equals +1 ppm.
-                self.freq_ppm = (self.freq_ppm + phase_error_us as f64 * SERVO_KI)
+                // Frequency estimate: the interval error over one second *is* the
+                // oscillator offset in ppm, so blend each sample into an EWMA.
+                // (A plain integrator would have no feedback term and diverge.)
+                self.freq_ppm = (self.freq_ppm
+                    + (phase_error_us as f64 - self.freq_ppm) * SERVO_KI)
                     .clamp(-SERVO_MAX_FREQ_PPM, SERVO_MAX_FREQ_PPM);
+
+                // Integer-second accounting.  Never assume exactly one second has
+                // passed since the previous accepted pulse: pulses are missed when
+                // the main loop stalls (two ISR edges collapse into one ~2 s
+                // interval that the range filter rejects) or when the outlier
+                // guard drops them.  Count whole seconds from the frequency-
+                // corrected monotonic elapsed time, then cross-check against the
+                // GPS UTC second for this edge when NMEA is fresh.  GPS wins on
+                // *persistent* disagreement (leap seconds, GPS time steps): a
+                // single disagreeing pulse is not acted on, because the
+                // sentence↔edge pairing is ambiguous when the main loop stalled
+                // and parsed a backlog sentence after the next edge had already
+                // fired (the pairing then reads one second low for exactly one
+                // pulse).  Requiring the same delta on two consecutive accepted
+                // pulses rejects that transient while still following a real
+                // step within two seconds.
+                let raw_elapsed_us = now_us.saturating_sub(anchor.monotonic_us);
+                let elapsed_secs = (self.corrected_elapsed_us(raw_elapsed_us) + MICROS_PER_SEC / 2)
+                    .div_euclid(MICROS_PER_SEC);
+                let predicted = anchor.unix_seconds.saturating_add(elapsed_secs);
+                let unix_seconds = match self.gps_second_at_edge(now_us) {
+                    Some(gps) if gps != predicted => {
+                        let delta = gps - predicted;
+                        if self.pending_gps_step == Some(delta) {
+                            self.pending_gps_step = None;
+                            self.anchor_step_count = self.anchor_step_count.saturating_add(1);
+                            log::warn!(
+                                "NTP: PPS second corrected from GPS: predicted {predicted}, GPS {gps} ({delta:+}s, step #{})",
+                                self.anchor_step_count
+                            );
+                            gps
+                        } else {
+                            self.pending_gps_step = Some(delta);
+                            // Negative "NMEA lead" means the latest sentence was
+                            // parsed after this edge fired: the signature of a
+                            // late-parsed backlog sentence rather than a real step.
+                            let nmea_lead_ms = self
+                                .last_gps_utc_update_us
+                                .map(|t| (now_us - t) / 1_000)
+                                .unwrap_or(0);
+                            log::info!(
+                                "NTP: GPS/PPS second disagree (predicted {predicted}, GPS {gps}, {delta:+}s, NMEA lead {nmea_lead_ms} ms); awaiting confirmation"
+                            );
+                            predicted
+                        }
+                    }
+                    _ => {
+                        self.pending_gps_step = None;
+                        predicted
+                    }
+                };
 
                 // Proportional path: nudge the anchor's monotonic reference to
                 // correct the phase by a fraction of the observed error.
-                if let Some(anchor) = &mut self.clock_anchor {
-                    let phase_correction_us = (phase_error_us as f64 * SERVO_KP) as i64;
-                    anchor.unix_seconds = anchor.unix_seconds.saturating_add(1);
-                    // Subtracting the correction shifts the apparent second boundary
-                    // earlier when the clock is fast, and later when it is slow.
-                    anchor.monotonic_us = now_us.saturating_sub(phase_correction_us);
-                } else if let Some(gps_utc) = self.last_gps_utc_seconds {
-                    self.clock_anchor = Some(ClockAnchor {
-                        unix_seconds: gps_utc + NMEA_PPS_FUDGE_S,
-                        monotonic_us: now_us,
-                    });
-                }
+                // Subtracting the correction shifts the apparent second boundary
+                // earlier when the clock is fast, and later when it is slow.
+                let phase_correction_us = (phase_error_us as f64 * SERVO_KP) as i64;
+                self.clock_anchor = Some(ClockAnchor {
+                    unix_seconds,
+                    monotonic_us: now_us.saturating_sub(phase_correction_us),
+                });
 
                 // Update PPS diagnostics used by mode-6 and ntpq display.
                 let sample_jitter = phase_error_us.unsigned_abs() as f32;
@@ -492,11 +638,10 @@ impl NtpServer {
                     self.pps_has_sample = true;
                 }
 
-                self.pps_locked = true;
                 self.last_pps_monotonic_us = Some(now_us);
-                // Record the NTP timestamp of this discipline event so clients
-                // can observe reference timestamp aging (RFC 5905 §7.3).
-                self.last_sync_ntp_ts = self.current_ntp_timestamp();
+                // Reference timestamp = disciplined time of this edge, so clients
+                // can observe reference aging between pulses (RFC 5905 §7.3).
+                self.last_sync_ntp_ts = ntp_timestamp_from_unix(unix_seconds, 0);
                 log::debug!(
                     "NTP: PPS servo phase_err={}us freq={:.3}ppm",
                     phase_error_us,
@@ -559,14 +704,24 @@ impl NtpServer {
             MAX_DISP_US
         };
 
-        // Stratum 1 requires live GPS+PPS or a PPS-locked holdover anchor.
-        // RTC/GPS bootstrap alone must stay at stratum 16 until PPS discipline.
-        let stratum = if fully_synced
-            || (self.pps_locked && has_anchor && pps_fresh && disp_us < HOLDOVER_UNSYNC_US)
-        {
+        // Stratum 1 requires live GPS+PPS, or holdover from a PPS-disciplined
+        // anchor while the modelled root dispersion stays below
+        // HOLDOVER_UNSYNC_US (≈33 min at HOLDOVER_DISP_RATE_US_PER_SEC).
+        // Clients apply their own `maxdistance` policy to the growing
+        // dispersion.  An RTC/GPS bootstrap anchor that was never PPS-locked
+        // stays at stratum 16.
+        let holdover_ok = self.pps_locked && has_anchor && disp_us < HOLDOVER_UNSYNC_US;
+        let stratum = if fully_synced || holdover_ok {
             1_u8
         } else {
-            16_u8
+            STRATUM_UNSYNC
+        };
+        let state = if fully_synced {
+            DisciplineState::Locked
+        } else if stratum == 1 {
+            DisciplineState::Holdover
+        } else {
+            DisciplineState::Unsync
         };
         // Use the application-supplied leap indicator when synced.
         // When unsynced (stratum 16) always force LI=3 (alarm) per RFC 5905 §7.3.
@@ -599,12 +754,23 @@ impl NtpServer {
 
         DisciplineParams {
             stratum,
+            state,
             leap,
             root_disp_short,
             root_disp_ms,
             ref_ts: self.last_sync_ntp_ts,
             current_ts: self.current_ntp_timestamp(),
             precision,
+        }
+    }
+
+    /// Servo diagnostics for mode-6 READVAR output.
+    fn servo_stats(&self) -> ServoStats {
+        ServoStats {
+            pps_offset_us: self.pps_offset_us,
+            pps_jitter_us: self.pps_jitter_us,
+            proc_delay_us: self.proc_delay_us,
+            freq_ppm: self.freq_ppm,
         }
     }
 
@@ -615,13 +781,9 @@ impl NtpServer {
         let anchor = self.clock_anchor?;
         let now_us = monotonic_us_now();
         let raw_elapsed_us = now_us.saturating_sub(anchor.monotonic_us);
-        let corrected_elapsed_us = if self.freq_ppm == 0.0 {
-            raw_elapsed_us
-        } else {
-            ((raw_elapsed_us as f64) * (1.0 - self.freq_ppm / 1_000_000.0)) as i64
-        }
-        .max(0);
-        let elapsed_seconds = corrected_elapsed_us.div_euclid(MICROS_PER_SEC);
+        let elapsed_seconds = self
+            .corrected_elapsed_us(raw_elapsed_us)
+            .div_euclid(MICROS_PER_SEC);
         Some(anchor.unix_seconds.saturating_add(elapsed_seconds))
     }
 
@@ -634,26 +796,10 @@ impl NtpServer {
     /// - `NtpSnapshot` with current servo state, frequency, and dispersion.
     pub fn ntp_snapshot(&self, gps_fix: bool) -> NtpSnapshot {
         let dp = self.discipline_params(gps_fix);
-        let now_us = monotonic_us_now();
-        let pps_age_us = self
-            .last_pps_monotonic_us
-            .map(|t| now_us.saturating_sub(t))
-            .unwrap_or(i64::MAX);
-        let pps_fresh = pps_age_us < HOLDOVER_ENTRY_US;
-        let has_anchor = self.clock_anchor.is_some();
-        let fully_synced = gps_fix && pps_fresh && has_anchor;
-
-        let state = if fully_synced {
-            DisciplineState::Locked
-        } else if has_anchor {
-            DisciplineState::Holdover
-        } else {
-            DisciplineState::Unsync
-        };
 
         NtpSnapshot {
             stratum: dp.stratum,
-            state,
+            state: dp.state,
             freq_ppm: self.freq_ppm,
             pps_offset_us: self.pps_offset_us,
             pps_jitter_us: self.pps_jitter_us,
@@ -662,6 +808,7 @@ impl NtpServer {
             rate_limited: self.rate_limited_total,
             acl_blocked: self.acl_blocked_total,
             pps_glitch_count: self.pps_glitch_count,
+            anchor_step_count: self.anchor_step_count,
             leap_indicator: dp.leap,
             proc_delay_us: if self.proc_delay_has_sample {
                 self.proc_delay_us
@@ -744,7 +891,7 @@ impl NtpServer {
                     let mode = req[0] & 0x07;
                     let version = (req[0] >> 3) & 0x07;
                     match mode {
-                        6 => {
+                        MODE_CONTROL => {
                             if len < NTP_CONTROL_HEADER_LEN {
                                 log::debug!(
                                     "NTP: ignoring short mode-6 request ({} bytes) from {}",
@@ -753,27 +900,27 @@ impl NtpServer {
                                 );
                                 continue;
                             }
+                            // A set response bit marks a reply, not a request
+                            // (RFC 1305 B.1).  Answering it would let a spoofed
+                            // packet bounce traffic between two servers.
+                            if req[1] & MODE6_RESPONSE_BIT != 0 {
+                                log::debug!("NTP: ignoring mode-6 response packet from {}", peer);
+                                continue;
+                            }
                             if !self.try_rate_limit(src_ip_v4) {
                                 log::debug!("NTP: mode-6 rate limited from {}", peer);
                                 continue;
                             }
                             let dp = self.discipline_params(gps_fix);
+                            let stats = self.servo_stats();
                             let started_us = monotonic_us_now();
-                            let resp = build_mode6_response(
-                                &req[..len],
-                                version,
-                                &dp,
-                                self.pps_offset_us,
-                                self.pps_jitter_us,
-                                self.proc_delay_us,
-                                self.freq_ppm,
-                            );
+                            let resp = build_mode6_response(&req[..len], version, &dp, &stats);
                             self.socket.send_to(&resp, peer).with_context(|| {
                                 format!("failed to send mode-6 response to {}", peer)
                             })?;
                             self.record_proc_delay(started_us);
                         }
-                        _ => {
+                        MODE_CLIENT | MODE_SYMMETRIC_ACTIVE => {
                             if len < NTP_PACKET_LEN {
                                 log::debug!(
                                     "NTP: ignoring short time request ({} bytes) from {}",
@@ -783,23 +930,31 @@ impl NtpServer {
                                 continue;
                             }
 
-                            // Rate limit all 48-byte time requests (modes 0–5, 7).
-                            // Mode-6 uses the same limiter but drops silently.
+                            // RFC 5905 §9.2: a client (mode 3) request is answered
+                            // in server mode (4); a symmetric-active (mode 1) request
+                            // is answered in symmetric-passive mode (2).
+                            let reply_mode = if mode == MODE_CLIENT {
+                                MODE_SERVER
+                            } else {
+                                MODE_SYMMETRIC_PASSIVE
+                            };
+
+                            let req48: &[u8; NTP_PACKET_LEN] = req[..NTP_PACKET_LEN]
+                                .try_into()
+                                .expect("slice is exactly NTP_PACKET_LEN bytes");
+
+                            // Rate limit time requests; mode-6 uses the same limiter
+                            // but drops silently.
                             if !self.try_rate_limit(src_ip_v4) {
-                                let mut req48 = [0_u8; NTP_PACKET_LEN];
-                                req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
-                                let resp = build_kod_response(&req48, version);
+                                let resp = build_kod_response(req48, version, reply_mode);
                                 let _ = self.socket.send_to(&resp, peer);
                                 log::debug!("NTP: KoD RATE sent to {} (rate limited)", peer);
                                 continue;
                             }
 
-                            let mut req48 = [0_u8; NTP_PACKET_LEN];
-                            req48.copy_from_slice(&req[..NTP_PACKET_LEN]);
-
                             let dp = self.discipline_params(gps_fix);
                             let started_us = monotonic_us_now();
-                            let mut resp = build_response(&req48, &dp, receive_ntp_ts);
+                            let mut resp = build_response(req48, &dp, receive_ntp_ts, reply_mode);
                             let transmit_ts = self.current_ntp_timestamp();
                             write_u64_be(&mut resp[40..48], transmit_ts);
 
@@ -807,6 +962,15 @@ impl NtpServer {
                                 format!("failed to send NTP response to {}", peer)
                             })?;
                             self.record_proc_delay(started_us);
+                        }
+                        _ => {
+                            // RFC 5905 §9.2 Table 10: server (4), symmetric-passive
+                            // (2), broadcast (5), reserved (0) and private (7)
+                            // packets with no association are discarded.  Answering
+                            // them would let a spoofed mode-4 packet bounce replies
+                            // between two servers indefinitely.
+                            log::debug!("NTP: discarding mode-{} packet from {}", mode, peer);
+                            continue;
                         }
                     }
 
@@ -825,8 +989,8 @@ impl NtpServer {
 
 /// Format an NTP 64-bit timestamp as a mode-6 text value: `0xSSSSSSSS.FFFFFFFF`.
 ///
-/// RFC 1305 §3.2 convention for NTP timestamps in control-message text is
-/// the hex representation of the 32-bit seconds field followed by the 32-bit
+/// RFC 1305 Appendix B convention for NTP timestamps in control-message text
+/// is the hex representation of the 32-bit seconds field followed by the 32-bit
 /// fraction field, separated by `.`.  ntpq parses and displays this form.
 ///
 /// # Parameters
@@ -840,14 +1004,17 @@ fn ntp_ts_to_mode6(ts: u64) -> String {
 
 /// Build a mode-6 control response for a request packet.
 ///
+/// Framing follows RFC 1305 Appendix B (and the ntpq implementation that
+/// remains the de-facto reference): the response bit is set, the opcode and
+/// sequence are echoed, and errors are signalled with the error bit plus an
+/// error status word (`code << 8`, RFC 1305 B.2.4) in place of the system
+/// status word.
+///
 /// # Parameters
-/// - `req`: Raw mode-6 request bytes.
+/// - `req`: Raw mode-6 request bytes (at least `NTP_CONTROL_HEADER_LEN`).
 /// - `version`: NTP version extracted from request header.
 /// - `dp`: Discipline parameters (stratum, leap, dispersion, timestamps).
-/// - `pps_offset_us`: Latest PPS-derived phase offset in microseconds.
-/// - `pps_jitter_us`: Smoothed jitter estimate in microseconds.
-/// - `proc_delay_us`: Smoothed processing delay estimate in microseconds.
-/// - `freq_ppm`: Current oscillator frequency offset estimate in ppm.
+/// - `stats`: Servo diagnostics (offset, jitter, processing delay, frequency).
 ///
 /// # Returns
 /// - Serialized mode-6 response bytes ready to send.
@@ -855,40 +1022,43 @@ fn build_mode6_response(
     req: &[u8],
     version: u8,
     dp: &DisciplineParams,
-    pps_offset_us: i32,
-    pps_jitter_us: f32,
-    proc_delay_us: f32,
-    freq_ppm: f64,
+    stats: &ServoStats,
 ) -> Vec<u8> {
     let mut resp = vec![0_u8; NTP_CONTROL_HEADER_LEN];
-    let vn = if (1..=4).contains(&version) {
-        version
-    } else {
-        4
-    };
+    let vn = reply_version(version);
     let opcode = req[1] & 0x1f;
     let associd = u16::from_be_bytes([req[6], req[7]]);
     let mut payload: Vec<u8> = Vec::new();
-    let mut error = false;
+    // `Some(code)` selects an error response with that RFC 1305 B.2.4 code.
+    let mut error: Option<u16> = None;
 
     let synced = dp.stratum == 1;
-    // NTP mode-6 displays leap as its 2-bit binary value written as two digits.
-    let leap_str = if dp.leap == 0 { "00" } else { "11" };
+    // Mode-6 text renders the leap indicator as its 2-bit binary value.
+    let leap_str = format!("{:02b}", dp.leap & 0x03);
+
+    // RFC 1305 B.2.2 peer status word:
+    // [Sel:3][Cfg:1][Auth:1][AuthOK:1][Reach:1][Bcast:1][EvtCode:4][EvtCnt:4]
+    // sel=6 (system peer, shown as '*' by ntpq), cfg=1, reach=1 when synced;
+    // sel=0 (rejected), cfg=1 when unsynced.
+    let peer_status: u16 = if synced {
+        (6_u16 << 13) | (1 << 12) | (1 << 9) // 0xD200
+    } else {
+        1 << 12 // 0x1000: configured but not selected
+    };
 
     // LI=0, VN from request, Mode=6 (control)
-    resp[0] = (vn << 3) | 6;
+    resp[0] = (vn << 3) | MODE_CONTROL;
     match opcode {
         MODE6_OPCODE_READSTAT => {
-            // RFC 1305 §3.2.2 peer status word: [Sel:3][Cfg:1][Auth:1][AuthOK:1][Reach:1][Bcast:1][EvtCode:4][EvtCnt:4]
-            // sel=6 (system peer, shown as '*' by ntpq), cfg=1, reach=1.
-            // sel=0 (rejected) when unsynced.
-            let peer_status: u16 = if synced {
-                (6_u16 << 13) | (1 << 12) | (1 << 9) // 0xD200
-            } else {
-                1 << 12 // 0x1000: configured but not selected
-            };
-            payload.extend_from_slice(&MODE6_ASSOC_ID.to_be_bytes());
-            payload.extend_from_slice(&peer_status.to_be_bytes());
+            if associd == 0 {
+                // Summary: one (assoc id, peer status) pair per association.
+                payload.extend_from_slice(&MODE6_ASSOC_ID.to_be_bytes());
+                payload.extend_from_slice(&peer_status.to_be_bytes());
+            } else if associd != MODE6_ASSOC_ID {
+                error = Some(MODE6_ERR_BAD_ASSOC);
+            }
+            // For our single association the peer status word is returned in
+            // the header status field (see below) with no payload.
         }
         MODE6_OPCODE_READVAR => {
             let vars = if associd == 0 {
@@ -896,8 +1066,9 @@ fn build_mode6_response(
                 // Expanded with frequency, reference timestamp, clock, jitter,
                 // and wander so ntpq -c rv gives a complete diagnostic picture.
                 if synced {
-                    let offset_ms = pps_offset_us as f64 / 1_000.0;
-                    let jitter_ms = (pps_jitter_us.max(1.0)) as f64 / 1_000.0;
+                    let offset_ms = stats.pps_offset_us as f64 / 1_000.0;
+                    let jitter_ms = (stats.pps_jitter_us.max(1.0)) as f64 / 1_000.0;
+                    let freq_ppm = stats.freq_ppm;
                     let freq_sign = if freq_ppm >= 0.0 { "+" } else { "" };
                     format!(
                         "stratum={},leap={},precision={},\
@@ -940,9 +1111,9 @@ fn build_mode6_response(
                 // filtdelay / filtoffset / filtdisp echo the last measured values;
                 // we do not maintain a full 8-sample filter register.
                 if synced {
-                    let offset_ms = pps_offset_us as f64 / 1_000.0;
-                    let jitter_ms = (pps_jitter_us.max(1.0)) as f64 / 1_000.0;
-                    let delay_ms = (proc_delay_us.max(1.0)) as f64 / 1_000.0;
+                    let offset_ms = stats.pps_offset_us as f64 / 1_000.0;
+                    let jitter_ms = (stats.pps_jitter_us.max(1.0)) as f64 / 1_000.0;
+                    let delay_ms = (stats.proc_delay_us.max(1.0)) as f64 / 1_000.0;
                     format!(
                         "srcadr=GPS,srcport=123,refid=GPS,\
                          stratum={},leap={},hmode=3,pmode=4,\
@@ -963,27 +1134,38 @@ fn build_mode6_response(
                     )
                 }
             } else {
+                error = Some(MODE6_ERR_BAD_ASSOC);
                 String::new()
             };
             payload.extend_from_slice(vars.as_bytes());
         }
         _ => {
             // Unsupported opcode: reply with a mode-6 error response.
-            error = true;
+            error = Some(MODE6_ERR_BAD_OPCODE);
         }
     }
 
-    // Response bit set, keep opcode from request.
-    resp[1] = 0x80 | ((error as u8) << 6) | opcode;
+    // Response bit set, error bit on failure, opcode echoed from request.
+    let error_bit = if error.is_some() { MODE6_ERROR_BIT } else { 0 };
+    resp[1] = MODE6_RESPONSE_BIT | error_bit | opcode;
     // Sequence from request.
     resp[2] = req[2];
     resp[3] = req[3];
 
-    // RFC 1305 §3.2.1 system status: [LI:2][ClkSrc:6][EvtCode:4][EvtCnt:4]
-    // ClkSrc = 4 = UHF/GPS per RFC 1305 Table F-2.
-    let clksrc: u16 = if synced { 4 } else { 0 };
-    let sys_status: u16 = ((dp.leap as u16) << 14) | (clksrc << 8);
-    resp[4..6].copy_from_slice(&sys_status.to_be_bytes());
+    // Status word (RFC 1305 B.2):
+    // - error response:            error status word  [Code:8][Reserved:8]
+    // - READSTAT for one assoc:    that peer's status word
+    // - otherwise, system status:  [LI:2][ClkSrc:6][EvtCode:4][EvtCnt:4]
+    //   ClkSrc = 4 = UHF (satellite) radio per RFC 1305 B.2.1.
+    let status: u16 = if let Some(code) = error {
+        code << 8
+    } else if opcode == MODE6_OPCODE_READSTAT && associd != 0 {
+        peer_status
+    } else {
+        let clksrc: u16 = if synced { 4 } else { 0 };
+        ((dp.leap as u16) << 14) | (clksrc << 8)
+    };
+    resp[4..6].copy_from_slice(&status.to_be_bytes());
     // associd (echo request association)
     resp[6..8].copy_from_slice(&associd.to_be_bytes());
     // offset=0 (single-fragment response)
@@ -1014,7 +1196,8 @@ fn ntp_precision_from_uncertainty_us(uncertainty_us: f64) -> i8 {
 /// too frequently.
 ///
 /// Per RFC 5905 §7.4 the response has:
-/// - LI = 3 (alarm), VN mirrored, Mode = 4 (server)
+/// - LI = 3 (alarm), VN mirrored, Mode = reply mode for the request (4 for a
+///   client request, 2 for symmetric active)
 /// - Stratum = 0 (kiss packet)
 /// - Reference ID = "RATE" (RFC 5905 Table 6)
 /// - Originate Timestamp = client's Transmit Timestamp (bytes 40–47),
@@ -1027,13 +1210,18 @@ fn ntp_precision_from_uncertainty_us(uncertainty_us: f64) -> i8 {
 /// # Parameters
 /// - `req`: Client's 48-byte NTP request packet.
 /// - `version`: NTP version extracted from the request header.
+/// - `reply_mode`: Mode field for the reply (`MODE_SERVER` or `MODE_SYMMETRIC_PASSIVE`).
 ///
 /// # Returns
 /// - 48-byte KoD response packet.
-fn build_kod_response(req: &[u8; NTP_PACKET_LEN], version: u8) -> [u8; NTP_PACKET_LEN] {
+fn build_kod_response(
+    req: &[u8; NTP_PACKET_LEN],
+    version: u8,
+    reply_mode: u8,
+) -> [u8; NTP_PACKET_LEN] {
     let mut resp = [0_u8; NTP_PACKET_LEN];
-    // LI=3 (alarm), VN mirrored from client, Mode=4 (server)
-    resp[0] = (3 << 6) | (version << 3) | 4;
+    // LI=3 (alarm), VN mirrored from client, Mode per request type
+    resp[0] = (3 << 6) | (reply_version(version) << 3) | (reply_mode & 0x07);
     // Stratum 0 = kiss packet (Reference ID carries kiss code, not a clock refid)
     resp[1] = 0;
     // Reference ID = "RATE" kiss code (RFC 5905 Table 6)
@@ -1043,12 +1231,27 @@ fn build_kod_response(req: &[u8; NTP_PACKET_LEN], version: u8) -> [u8; NTP_PACKE
     resp
 }
 
+/// Version number to place in a reply to a request carrying `request_vn`.
+///
+/// RFC 5905 §7.3 defines versions 1–4; those are mirrored so the client can
+/// match the reply.  Anything else (0, or 5–7 from a future or corrupt
+/// packet) is answered as version 4.
+fn reply_version(request_vn: u8) -> u8 {
+    if (1..=4).contains(&request_vn) {
+        request_vn
+    } else {
+        4
+    }
+}
+
 /// Build a standard 48-byte NTP server response template.
 ///
 /// # Parameters
 /// - `req`: Parsed 48-byte client request.
 /// - `dp`: Discipline parameters (stratum, leap, dispersion).
 /// - `receive_ts`: Server receive timestamp in NTP 64-bit format.
+/// - `reply_mode`: Mode field for the reply (`MODE_SERVER` for mode-3 requests,
+///   `MODE_SYMMETRIC_PASSIVE` for mode-1 requests).
 ///
 /// # Returns
 /// - 48-byte response packet with originate/receive/reference fields populated.
@@ -1056,16 +1259,19 @@ fn build_response(
     req: &[u8; NTP_PACKET_LEN],
     dp: &DisciplineParams,
     receive_ts: u64,
+    reply_mode: u8,
 ) -> [u8; NTP_PACKET_LEN] {
     let mut resp = [0_u8; NTP_PACKET_LEN];
-    let client_vn = (req[0] >> 3) & 0x07;
-    let version = if (1..=4).contains(&client_vn) {
-        client_vn
+    let version = reply_version((req[0] >> 3) & 0x07);
+    resp[0] = (dp.leap << 6) | (version << 3) | (reply_mode & 0x07);
+    // RFC 5905 §7.3: the internal "unsynchronised" stratum (16) is transmitted
+    // as 0.  Clients treat 0 and 16 alike (both invalid), but 0 is the value
+    // the spec puts on the wire.
+    resp[1] = if dp.stratum >= STRATUM_UNSYNC {
+        0
     } else {
-        4
+        dp.stratum
     };
-    resp[0] = (dp.leap << 6) | (version << 3) | 4; // server mode
-    resp[1] = dp.stratum;
     resp[2] = req[2]; // copy poll interval from client
     resp[3] = dp.precision as u8;
 
@@ -1127,47 +1333,100 @@ impl NtpServer {
         if let Some(anchor) = self.clock_anchor {
             let now_us = monotonic_us_now();
             let raw_elapsed_us = now_us.saturating_sub(anchor.monotonic_us);
-
-            // Scale elapsed time by (1 - freq_ppm/1e6) to compensate for oscillator
-            // drift. Positive freq_ppm means the monotonic clock runs fast, so we
-            // shrink the elapsed interval to recover real-time microseconds.
-            let corrected_elapsed_us = if self.freq_ppm == 0.0 {
-                raw_elapsed_us
-            } else {
-                ((raw_elapsed_us as f64) * (1.0 - self.freq_ppm / 1_000_000.0)) as i64
-            }
-            .max(0);
+            let corrected_elapsed_us = self.corrected_elapsed_us(raw_elapsed_us);
 
             let elapsed_seconds = corrected_elapsed_us.div_euclid(MICROS_PER_SEC);
             let rem_us = corrected_elapsed_us.rem_euclid(MICROS_PER_SEC) as u64;
 
             let unix_seconds = anchor.unix_seconds.saturating_add(elapsed_seconds);
-            let ntp_seconds = if unix_seconds >= 0 {
-                (unix_seconds as u64).saturating_add(NTP_UNIX_EPOCH_OFFSET_SECS)
-            } else {
-                NTP_UNIX_EPOCH_OFFSET_SECS
-            };
-            let ntp_fraction = ((rem_us as u128) * NTP_FRAC_SCALE / 1_000_000u128) as u64;
-            (ntp_seconds << 32) | ntp_fraction
+            ntp_timestamp_from_unix(unix_seconds, rem_us)
         } else {
             ntp_timestamp_now()
         }
     }
 }
 
-/// Return monotonic microseconds from ESP-IDF high-resolution timer.
+/// Pack Unix seconds plus a sub-second microsecond remainder into an NTP
+/// 64-bit timestamp (RFC 5905 §6).  Pre-1970 instants clamp to the Unix epoch.
+fn ntp_timestamp_from_unix(unix_seconds: i64, rem_us: u64) -> u64 {
+    let ntp_seconds = if unix_seconds >= 0 {
+        (unix_seconds as u64).saturating_add(NTP_UNIX_EPOCH_OFFSET_SECS)
+    } else {
+        NTP_UNIX_EPOCH_OFFSET_SECS
+    };
+    let ntp_fraction = ((rem_us as u128) * NTP_FRAC_SCALE / 1_000_000u128) as u64;
+    (ntp_seconds << 32) | ntp_fraction
+}
+
+/// Return monotonic microseconds since an arbitrary boot-time origin.
+///
+/// On ESP-IDF this is `esp_timer_get_time()`.  On the host it is a
+/// process-local [`std::time::Instant`] origin so the value is monotonic and
+/// unaffected by wall-clock steps (which would otherwise corrupt the
+/// PPS-interval and holdover arithmetic that depends on this clock).
 fn monotonic_us_now() -> i64 {
     #[cfg(target_os = "espidf")]
     {
+        // SAFETY: `esp_timer_get_time` is a plain FFI read of the 64-bit
+        // high-resolution timer with no preconditions; it is safe to call from
+        // any task context.
         return unsafe { sys::esp_timer_get_time() };
     }
     #[cfg(not(target_os = "espidf"))]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as i64
+        #[cfg(test)]
+        if let Some(fixed) = test_clock::override_us() {
+            return fixed;
+        }
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static ORIGIN: OnceLock<Instant> = OnceLock::new();
+        let origin = *ORIGIN.get_or_init(Instant::now);
+        // Offset so the clock never reads near zero: several helpers subtract
+        // multi-second intervals from "now" and must stay in positive range.
+        const HOST_CLOCK_OFFSET_US: i64 = 1_000 * MICROS_PER_SEC;
+        HOST_CLOCK_OFFSET_US + origin.elapsed().as_micros() as i64
+    }
+}
+
+/// Test-only override of [`monotonic_us_now`] so timing arithmetic can be
+/// checked exactly instead of within a tolerance window.
+///
+/// The override is thread-local because `cargo test` runs tests concurrently.
+#[cfg(all(test, not(target_os = "espidf")))]
+mod test_clock {
+    use std::cell::Cell;
+
+    thread_local! {
+        static OVERRIDE_US: Cell<Option<i64>> = const { Cell::new(None) };
+    }
+
+    /// Current override for this thread, if any.
+    pub(super) fn override_us() -> Option<i64> {
+        OVERRIDE_US.with(Cell::get)
+    }
+
+    /// Pin the monotonic clock to `now_us` for the calling thread until the
+    /// returned guard is dropped.
+    pub(super) fn freeze(now_us: i64) -> FrozenClock {
+        OVERRIDE_US.with(|c| c.set(Some(now_us)));
+        FrozenClock
+    }
+
+    /// Guard that restores the real clock when dropped.
+    pub(super) struct FrozenClock;
+
+    impl FrozenClock {
+        /// Move the frozen clock to a new instant.
+        pub(super) fn set(&self, now_us: i64) {
+            OVERRIDE_US.with(|c| c.set(Some(now_us)));
+        }
+    }
+
+    impl Drop for FrozenClock {
+        fn drop(&mut self) {
+            OVERRIDE_US.with(|c| c.set(None));
+        }
     }
 }
 
@@ -1210,1895 +1469,7 @@ impl NtpServer {
             .local_addr()
             .expect("loopback NTP socket address")
     }
-
-    fn from_socket(socket: UdpSocket) -> Self {
-        Self {
-            socket,
-            served: 0,
-            clock_anchor: None,
-            last_gps_utc_seconds: None,
-            pps_locked: false,
-            pps_offset_us: 0,
-            pps_jitter_us: 0.0,
-            pps_has_sample: false,
-            proc_delay_us: 0.0,
-            proc_delay_has_sample: false,
-            freq_ppm: 0.0,
-            last_pps_monotonic_us: None,
-            last_sync_ntp_ts: 0,
-            rate_limiter: RateLimiter::new(),
-            acl: Acl::allow_all(),
-            rate_limited_total: 0,
-            acl_blocked_total: 0,
-            pending_leap: 0,
-            pps_glitch_count: 0,
-            last_gps_utc_update_us: None,
-        }
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn build_response_sets_server_mode_and_stratum_when_synced() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 1.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0_u8; NTP_PACKET_LEN];
-        let resp = build_response(&req, &dp, 0x0123_0000_0000_0000);
-        assert_eq!(resp[0] & 0x07, 4);
-        assert_eq!(resp[1], 1);
-        assert_eq!(&resp[12..16], b"GPS\0");
-    }
-
-    #[test]
-    fn build_response_marks_unsynced_with_init_refid() {
-        let dp = DisciplineParams {
-            stratum: 16,
-            leap: 3,
-            root_disp_short: 5 << 16,
-            root_disp_ms: 5000.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0_u8; NTP_PACKET_LEN];
-        let resp = build_response(&req, &dp, 0);
-        assert_eq!(resp[1], 16);
-        assert_eq!(&resp[12..16], b"INIT");
-    }
-
-    #[test]
-    fn build_mode6_readvar_includes_gps_peer_when_synced() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 1.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [
-            0,
-            MODE6_OPCODE_READVAR,
-            0,
-            0,
-            0,
-            0,
-            0,
-            MODE6_ASSOC_ID as u8,
-            0,
-            0,
-            0,
-            0,
-        ];
-        let resp = build_mode6_response(&req, 4, &dp, 250, 500.0, 1200.0, 0.0);
-        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
-        assert!(payload.contains("refid=GPS"));
-        assert!(payload.contains("stratum=1"));
-    }
-
-    #[test]
-    fn write_u64_be_roundtrip() {
-        let mut buf = [0_u8; 8];
-        write_u64_be(&mut buf, 0x0123_4567_89ab_cdef);
-        assert_eq!(buf, 0x0123_4567_89ab_cdef_u64.to_be_bytes());
-    }
-
-    #[test]
-    fn write_u32_be_roundtrip() {
-        let mut buf = [0_u8; 4];
-        write_u32_be(&mut buf, 0x0123_4567);
-        assert_eq!(buf, 0x0123_4567_u32.to_be_bytes());
-    }
-
-    #[test]
-    fn ntp_timestamp_now_is_nonzero() {
-        assert_ne!(ntp_timestamp_now(), 0);
-    }
-
-    #[test]
-    fn build_mode6_readstat_returns_association_row() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 1.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
-        assert_eq!(resp.len(), NTP_CONTROL_HEADER_LEN + 4);
-    }
-
-    #[test]
-    fn build_mode6_readvar_unsynced_system_vars() {
-        let dp = DisciplineParams {
-            stratum: 16,
-            leap: 3,
-            root_disp_short: 5 << 16,
-            root_disp_ms: 5000.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
-        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
-        assert!(payload.contains("stratum=16"));
-        assert!(payload.contains("refid=INIT"));
-    }
-
-    #[test]
-    fn build_mode6_readvar_unsynced_peer_vars() {
-        let dp = DisciplineParams {
-            stratum: 16,
-            leap: 3,
-            root_disp_short: 5 << 16,
-            root_disp_ms: 5000.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [
-            0,
-            MODE6_OPCODE_READVAR,
-            0,
-            0,
-            0,
-            0,
-            0,
-            MODE6_ASSOC_ID as u8,
-            0,
-            0,
-            0,
-            0,
-        ];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
-        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
-        assert!(payload.contains("srcadr=INIT"));
-    }
-
-    #[test]
-    fn build_mode6_unsupported_opcode_sets_error_bit() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 1.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
-        assert_ne!(resp[1] & 0x40, 0);
-    }
-
-    #[test]
-    fn build_mode6_invalid_version_defaults_to_v4() {
-        let dp = DisciplineParams {
-            stratum: 16,
-            leap: 3,
-            root_disp_short: 5 << 16,
-            root_disp_ms: 5000.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 0, &dp, 0, 0.0, 0.0, 0.0);
-        assert_eq!((resp[0] >> 3) & 0x07, 4);
-    }
-
-    impl NtpServer {
-        fn new_for_test() -> anyhow::Result<Self> {
-            Self::new_loopback()
-        }
-
-        /// Test helper: call `observe_pps_pulse` using the current monotonic clock
-        /// as the edge timestamp.  Production code should always pass the ISR-captured
-        /// edge time; this wrapper exists only to keep test call sites concise.
-        fn pps_now(&mut self, pps_interval_us: Option<u32>) {
-            self.observe_pps_pulse(pps_interval_us, monotonic_us_now());
-        }
-
-        /// Test helper: simulate a PPS edge at an explicit monotonic timestamp.
-        fn pps_at(&mut self, pps_interval_us: Option<u32>, edge_us: i64) {
-            self.observe_pps_pulse(pps_interval_us, edge_us);
-        }
-
-        /// Test helper: simulate a PPS edge that occurred `ago_us` before now.
-        fn pps_stale_ago(&mut self, pps_interval_us: Option<u32>, ago_us: i64) {
-            self.pps_at(pps_interval_us, monotonic_us_now().saturating_sub(ago_us));
-        }
-    }
-
-    /// Decode an NTP 64-bit timestamp to Unix epoch microseconds.
-    fn ntp_timestamp_to_unix_us(ts: u64) -> i64 {
-        let ntp_seconds = (ts >> 32) as i64;
-        let unix_seconds = ntp_seconds - NTP_UNIX_EPOCH_OFFSET_SECS as i64;
-        let fraction = ts & 0xFFFF_FFFF;
-        let micros = (fraction as i128 * 1_000_000 / (1i128 << 32)) as i64;
-        unix_seconds * MICROS_PER_SEC + micros
-    }
-
-    fn client_ntp_request() -> [u8; NTP_PACKET_LEN] {
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (4 << 3) | 3;
-        req
-    }
-
-    #[test]
-    fn update_gps_utc_seconds_establishes_anchor_with_nmea_fudge() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        assert!(server.clock_anchor.is_some());
-        assert_eq!(server.last_gps_utc_seconds, Some(1_700_000_000));
-        assert_eq!(
-            server.clock_anchor.expect("anchor").unix_seconds,
-            1_700_000_000 + NMEA_PPS_FUDGE_S
-        );
-    }
-
-    #[test]
-    fn update_gps_utc_seconds_tracks_latest_nmea_before_pps() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.update_gps_utc_seconds(1_700_000_010);
-        let anchor = server.clock_anchor.expect("anchor");
-        assert_eq!(anchor.unix_seconds, 1_700_000_010 + NMEA_PPS_FUDGE_S);
-    }
-
-    #[test]
-    fn update_gps_utc_seconds_overwrites_rtc_bootstrap_anchor() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.seed_utc_seconds(1_699_999_000);
-        server.update_gps_utc_seconds(1_700_000_000);
-        let anchor = server.clock_anchor.expect("anchor");
-        assert_eq!(
-            anchor.unix_seconds,
-            1_700_000_000 + NMEA_PPS_FUDGE_S,
-            "GPS+fudge must replace a 1 s-stale RTC bootstrap anchor"
-        );
-    }
-
-    #[test]
-    fn seed_utc_seconds_does_not_satisfy_pps_gps_fresh_guard() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.seed_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        assert!(
-            !server.pps_locked,
-            "PPS must not lock on RTC seed alone; wait for real GPS NMEA"
-        );
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        assert!(server.pps_locked);
-    }
-
-    #[test]
-    fn observe_pps_pulse_delta_does_not_lock_on_rtc_seed_without_gps() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.seed_utc_seconds(1_700_000_000);
-        server.pps_now(Some(1_000_000));
-        assert!(
-            !server.pps_locked,
-            "Delta path must not lock on RTC bootstrap without GPS UTC"
-        );
-        assert_eq!(
-            server.clock_anchor.expect("anchor").unix_seconds,
-            1_700_000_000,
-            "RTC anchor must not be incremented without GPS lock"
-        );
-    }
-
-    #[test]
-    fn observe_pps_pulse_delta_first_lock_applies_nmea_pps_fudge() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.seed_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(Some(1_000_000));
-        assert!(server.pps_locked);
-        assert_eq!(
-            server.clock_anchor.expect("anchor").unix_seconds,
-            1_700_000_000 + NMEA_PPS_FUDGE_S
-        );
-    }
-
-    #[test]
-    fn update_gps_utc_seconds_does_not_reanchor_when_pps_locked() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        let before = server.clock_anchor.expect("anchor").unix_seconds;
-        server.update_gps_utc_seconds(1_699_999_000);
-        assert_eq!(
-            server.clock_anchor.expect("anchor").unix_seconds,
-            before,
-            "lagged NMEA must not pull the PPS anchor backward"
-        );
-        assert_eq!(
-            server.last_gps_utc_seconds,
-            Some(1_699_999_000),
-            "freshness is still updated while PPS-locked"
-        );
-    }
-
-    #[test]
-    fn seed_utc_seconds_does_not_apply_nmea_fudge() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.seed_utc_seconds(1_700_000_000);
-        assert_eq!(
-            server.clock_anchor.expect("anchor").unix_seconds,
-            1_700_000_000
-        );
-    }
-
-    #[test]
-    fn seed_utc_seconds_does_not_overwrite_existing_anchor() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        let before = server.clock_anchor.expect("anchor").unix_seconds;
-        server.seed_utc_seconds(1_699_999_000);
-        assert_eq!(server.clock_anchor.expect("anchor").unix_seconds, before);
-    }
-
-    #[test]
-    fn observe_pps_pulse_first_pulse_locks_to_gps() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        assert!(server.pps_locked);
-        assert!(server.last_pps_monotonic_us.is_some());
-    }
-
-    #[test]
-    fn first_pps_pulse_applies_nmea_pps_fudge_to_anchor() {
-        let gps_utc = 1_700_000_000_i64;
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(gps_utc);
-        server.pps_now(None);
-        let anchor = server.clock_anchor.expect("anchor");
-        assert_eq!(anchor.unix_seconds, gps_utc + NMEA_PPS_FUDGE_S);
-    }
-
-    #[test]
-    fn observe_pps_pulse_valid_interval_advances_anchor() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        let before = server.clock_anchor.expect("anchor").unix_seconds;
-        server.pps_now(Some(1_000_000));
-        assert_eq!(
-            server.clock_anchor.expect("anchor").unix_seconds,
-            before + 1
-        );
-        assert!(server.pps_has_sample);
-    }
-
-    #[test]
-    fn observe_pps_pulse_ignores_invalid_interval() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(Some(2_000_000));
-        assert!(!server.pps_has_sample);
-    }
-
-    #[test]
-    fn poll_serves_client_time_request() {
-        let gps_utc = 1_700_000_000_i64;
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let addr = server.socket.local_addr().expect("local addr");
-        server.update_gps_utc_seconds(gps_utc);
-        server.pps_now(None);
-
-        let expected_us = ntp_timestamp_to_unix_us(server.current_ntp_timestamp());
-
-        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        client
-            .send_to(&client_ntp_request(), addr)
-            .expect("send request");
-
-        server.poll(true).expect("poll");
-        let mut resp = [0_u8; NTP_PACKET_LEN];
-        let (len, _) = client.recv_from(&mut resp).expect("response");
-        assert_eq!(len, NTP_PACKET_LEN);
-        assert_eq!(resp[0] & 0x07, 4);
-        assert_eq!(resp[1], 1);
-
-        let transmit_ts = u64::from_be_bytes(resp[40..48].try_into().unwrap());
-        let transmit_us = ntp_timestamp_to_unix_us(transmit_ts);
-        let anchor_unix = gps_utc + NMEA_PPS_FUDGE_S;
-        assert!(
-            (transmit_us - anchor_unix * MICROS_PER_SEC).abs() < 5_000_000,
-            "transmit time should track anchored GPS second {anchor_unix}"
-        );
-        assert!(
-            (transmit_us - expected_us).abs() < 5_000,
-            "transmit timestamp should be within 5 ms of server clock"
-        );
-    }
-
-    #[test]
-    fn poll_response_receive_timestamp_precedes_transmit() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let addr = server.socket.local_addr().expect("local addr");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-
-        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        client
-            .send_to(&client_ntp_request(), addr)
-            .expect("send request");
-        server.poll(true).expect("poll");
-
-        let mut resp = [0_u8; NTP_PACKET_LEN];
-        client.recv_from(&mut resp).expect("response");
-        let receive_ts = u64::from_be_bytes(resp[32..40].try_into().unwrap());
-        let transmit_ts = u64::from_be_bytes(resp[40..48].try_into().unwrap());
-        assert_ne!(receive_ts, 0, "receive timestamp should be populated");
-        assert!(
-            receive_ts <= transmit_ts,
-            "T2 (receive) must not follow T3 (transmit)"
-        );
-    }
-
-    #[test]
-    fn poll_serves_mode6_readvar() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let addr = server.socket.local_addr().expect("local addr");
-        let mut req = [0_u8; NTP_CONTROL_HEADER_LEN];
-        req[0] = (4 << 3) | 6;
-        req[1] = MODE6_OPCODE_READVAR;
-        req[7] = MODE6_ASSOC_ID as u8;
-
-        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        client.send_to(&req, addr).expect("send mode-6");
-
-        server.poll(false).expect("poll");
-        let mut resp = vec![0_u8; 512];
-        let (len, _) = client.recv_from(&mut resp).expect("mode-6 response");
-        assert!(len >= NTP_CONTROL_HEADER_LEN);
-    }
-
-    #[test]
-    fn poll_serves_unsynced_time_request_without_anchor() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let addr = server.socket.local_addr().expect("local addr");
-
-        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        client
-            .send_to(&client_ntp_request(), addr)
-            .expect("send request");
-
-        server.poll(false).expect("poll");
-        let mut resp = [0_u8; NTP_PACKET_LEN];
-        let (len, _) = client.recv_from(&mut resp).expect("response");
-        assert_eq!(len, NTP_PACKET_LEN);
-        assert_eq!(resp[1], 16);
-    }
-
-    #[test]
-    fn poll_smoothes_processing_delay_after_second_request() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let addr = server.socket.local_addr().expect("local addr");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-
-        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        for _ in 0..2 {
-            client
-                .send_to(&client_ntp_request(), addr)
-                .expect("send request");
-            server.poll(true).expect("poll");
-            let mut resp = [0_u8; NTP_PACKET_LEN];
-            client.recv_from(&mut resp).expect("response");
-        }
-        assert!(server.proc_delay_has_sample);
-        assert!(server.proc_delay_us >= 1.0);
-        let snap = server.ntp_snapshot(true);
-        assert!(snap.proc_delay_has_sample);
-        assert!(snap.proc_delay_us >= 1.0);
-    }
-
-    #[test]
-    fn observe_pps_pulse_smoothes_jitter_on_second_valid_interval() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        server.pps_now(Some(1_000_250));
-        server.pps_now(Some(1_000_500));
-        assert!(server.pps_has_sample);
-        assert_eq!(server.pps_offset_us, 500);
-        assert!(server.pps_jitter_us > 0.0);
-    }
-
-    #[test]
-    fn poll_ignores_short_client_packet() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let addr = server.socket.local_addr().expect("local addr");
-        let client = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        client.send_to(&[0_u8; 8], addr).expect("send short");
-        server.poll(false).expect("poll");
-        client
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .expect("timeout");
-        let mut resp = [0_u8; 64];
-        assert!(client.recv_from(&mut resp).is_err());
-    }
-
-    // --- Servo and holdover tests ---
-
-    #[test]
-    fn servo_updates_freq_ppm_positive_for_fast_clock() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Interval longer than 1s: monotonic is fast relative to GPS.
-        server.pps_now(Some(1_000_500));
-        assert!(
-            server.freq_ppm > 0.0,
-            "freq_ppm should be positive when interval > 1s (fast clock)"
-        );
-        // Expected: 0.0 + 500 * 0.01 = 5.0 ppm
-        assert!(
-            (server.freq_ppm - 5.0).abs() < 0.001,
-            "expected ~5.0 ppm, got {}",
-            server.freq_ppm
-        );
-    }
-
-    #[test]
-    fn servo_updates_freq_ppm_negative_for_slow_clock() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Interval shorter than 1s: monotonic is slow relative to GPS.
-        server.pps_now(Some(999_500));
-        assert!(
-            server.freq_ppm < 0.0,
-            "freq_ppm should be negative when interval < 1s (slow clock)"
-        );
-        // Expected: 0.0 + (-500) * 0.01 = -5.0 ppm
-        assert!(
-            (server.freq_ppm + 5.0).abs() < 0.001,
-            "expected ~-5.0 ppm, got {}",
-            server.freq_ppm
-        );
-    }
-
-    #[test]
-    fn servo_accumulates_freq_over_multiple_pulses() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Apply ten identical intervals with +100 us error each.
-        for _ in 0..10 {
-            server.pps_now(Some(1_000_100));
-        }
-        // Expected after 10 pulses: 10 * 100 * 0.01 = 10.0 ppm
-        assert!(
-            (server.freq_ppm - 10.0).abs() < 0.01,
-            "expected ~10.0 ppm, got {}",
-            server.freq_ppm
-        );
-    }
-
-    #[test]
-    fn servo_clamps_freq_ppm_at_max() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Extreme interval: should saturate at SERVO_MAX_FREQ_PPM.
-        for _ in 0..10_000 {
-            server.pps_now(Some(1_200_000));
-        }
-        assert_eq!(server.freq_ppm, SERVO_MAX_FREQ_PPM);
-    }
-
-    #[test]
-    fn ntp_precision_exponent_scales_with_uncertainty() {
-        assert_eq!(super::ntp_precision_from_uncertainty_us(1.0), -20);
-        assert_eq!(super::ntp_precision_from_uncertainty_us(100.0), -14);
-        assert_eq!(super::ntp_precision_from_uncertainty_us(500.0), -11);
-        assert_eq!(super::ntp_precision_from_uncertainty_us(2_000_000.0), -4);
-    }
-
-    #[test]
-    fn discipline_params_precision_reflects_jitter_and_loop_floor() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        server.pps_jitter_us = 200.0;
-        server.pps_has_sample = true;
-        let dp = server.discipline_params(true);
-        assert_eq!(
-            dp.precision, -11,
-            "500 µs loop floor dominates 200 µs jitter → 2^-11 s"
-        );
-    }
-
-    #[test]
-    fn discipline_params_precision_poor_when_unsynced() {
-        let server = NtpServer::new_for_test().expect("test socket");
-        let dp = server.discipline_params(false);
-        assert_eq!(dp.precision, -4);
-    }
-
-    #[test]
-    fn build_response_precision_matches_discipline_params() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 1.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -11,
-        };
-        let resp = build_response(&[0_u8; NTP_PACKET_LEN], &dp, 0);
-        assert_eq!(resp[3], (-11_i8) as u8);
-    }
-
-    #[test]
-    fn discipline_params_fully_synced_gives_stratum_1_and_base_dispersion() {
-        // With the PHI model, locked dispersion is max(jitter, MIN_HW_ACCURACY_US) +
-        // PHI × age_since_last_pulse. After the first pulse with no jitter sample
-        // yet, this equals MIN_HW_ACCURACY_US (0.1 ms) — well below the old fixed
-        // 1 ms — and stratum must be 1.
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        let dp = server.discipline_params(true);
-        assert_eq!(dp.stratum, 1);
-        assert_eq!(dp.leap, 0);
-        // Dispersion should be in the hardware-floor range (0.1 ms + up to PHI×1s = 0.115 ms).
-        assert!(
-            dp.root_disp_ms >= 0.09 && dp.root_disp_ms < 0.5,
-            "locked dispersion should be in [0.09, 0.5) ms, got {:.3}",
-            dp.root_disp_ms
-        );
-    }
-
-    #[test]
-    fn discipline_params_fresh_pps_holds_stratum_1_without_gps_fix() {
-        // Holdover design: with fresh PPS and a valid anchor, remain stratum 1
-        // even when GPS fix is temporarily lost, so clients keep using us while
-        // dispersion is still low.
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        let dp = server.discipline_params(false);
-        assert_eq!(
-            dp.stratum, 1,
-            "should hold stratum 1 with fresh PPS in holdover"
-        );
-    }
-
-    #[test]
-    fn discipline_params_stale_pps_and_no_gps_fix_gives_stratum_16() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
-        let dp = server.discipline_params(false);
-        assert_eq!(dp.stratum, 16);
-        assert_eq!(dp.leap, 3);
-    }
-
-    #[test]
-    fn discipline_params_no_pps_no_anchor_gives_stratum_16() {
-        let server = NtpServer::new_for_test().expect("test socket");
-        let dp = server.discipline_params(true);
-        assert_eq!(dp.stratum, 16);
-    }
-
-    #[test]
-    fn holdover_dispersion_grows_after_pps_loss() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 60 * MICROS_PER_SEC);
-        let dp = server.discipline_params(true);
-        // Expected disp = BASE_DISP_US + 60 * RATE = 1000 + 30000 = 31000 us = 31 ms.
-        assert!(
-            dp.root_disp_ms > 1.0,
-            "dispersion should exceed base 1 ms in holdover"
-        );
-        assert!(
-            dp.root_disp_ms > 29.0,
-            "expected ~31 ms, got {:.1} ms",
-            dp.root_disp_ms
-        );
-        // PPS is stale (>10 s), so stratum 16 even though dispersion is still low.
-        assert_eq!(dp.stratum, 16, "stale PPS must drop to stratum 16");
-    }
-
-    #[test]
-    fn holdover_declares_stratum_16_when_dispersion_exceeds_1s() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        let holdover_secs = 2_010_i64;
-        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + holdover_secs * MICROS_PER_SEC);
-        let dp = server.discipline_params(true);
-        assert_eq!(
-            dp.stratum, 16,
-            "should be stratum 16 when dispersion >= 1 s"
-        );
-        assert_eq!(dp.leap, 3);
-    }
-
-    #[test]
-    fn holdover_stratum_1_restored_after_pps_returns() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 3_000 * MICROS_PER_SEC);
-        assert_eq!(server.discipline_params(true).stratum, 16);
-        server.pps_now(Some(1_000_000));
-        let dp = server.discipline_params(true);
-        assert_eq!(
-            dp.stratum, 1,
-            "stratum should recover to 1 after PPS returns"
-        );
-    }
-
-    #[test]
-    fn freq_correction_does_not_affect_zero_freq_ppm() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        assert_eq!(server.freq_ppm, 0.0);
-        // current_ntp_timestamp should not panic or produce obviously wrong output.
-        let ts = server.current_ntp_timestamp();
-        assert_ne!(ts, 0);
-    }
-
-    // --- Item 2: NTP correctness field tests ---
-
-    #[test]
-    fn last_sync_ntp_ts_set_on_first_pulse() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        assert_eq!(server.last_sync_ntp_ts, 0);
-        server.pps_now(None);
-        assert_ne!(
-            server.last_sync_ntp_ts, 0,
-            "ref ts should be set after first pulse"
-        );
-    }
-
-    #[test]
-    fn last_sync_ntp_ts_updated_on_subsequent_pulse() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        let first_ref = server.last_sync_ntp_ts;
-        server.pps_now(Some(1_000_000));
-        // After the second pulse, ref_ts should advance by approximately 1 NTP second.
-        let delta_secs = ((server.last_sync_ntp_ts >> 32) as i64) - ((first_ref >> 32) as i64);
-        assert_eq!(delta_secs, 1, "ref_ts should advance by 1 s per PPS pulse");
-    }
-
-    #[test]
-    fn build_response_uses_last_sync_ts_as_reference_timestamp() {
-        // When synced, the reference timestamp in the NTP response should be the
-        // last discipline event time (ref_ts), NOT the current receive time.
-        let fixed_ref_ts = 0xE9D1_E7B4_0000_0000_u64;
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 0.1,
-            ref_ts: fixed_ref_ts,
-            current_ts: fixed_ref_ts + 0x1_0000_0000,
-            precision: -10,
-        };
-        let req = [0_u8; NTP_PACKET_LEN];
-        // Pass a different receive_ts so we can distinguish ref_ts from it.
-        let receive_ts = fixed_ref_ts + 0x5_0000_0000;
-        let resp = build_response(&req, &dp, receive_ts);
-        let ref_ts_in_resp = u64::from_be_bytes(resp[16..24].try_into().unwrap());
-        assert_eq!(
-            ref_ts_in_resp, fixed_ref_ts,
-            "reference timestamp should be last_sync_ntp_ts, not receive_ts"
-        );
-    }
-
-    #[test]
-    fn build_response_reference_timestamp_zero_when_unsynced() {
-        let dp = DisciplineParams {
-            stratum: 16,
-            leap: 3,
-            root_disp_short: 5 << 16,
-            root_disp_ms: 5000.0,
-            ref_ts: 0xDEAD_BEEF_0000_0000,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0_u8; NTP_PACKET_LEN];
-        let resp = build_response(&req, &dp, 0x1234);
-        let ref_ts_in_resp = u64::from_be_bytes(resp[16..24].try_into().unwrap());
-        assert_eq!(
-            ref_ts_in_resp, 0,
-            "reference timestamp must be 0 when stratum=16"
-        );
-    }
-
-    #[test]
-    fn discipline_params_locked_dispersion_uses_phi_model() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Simulate jitter = 200 µs (above MIN_HW_ACCURACY_US = 100 µs).
-        server.pps_jitter_us = 200.0;
-        server.pps_has_sample = true;
-        let dp = server.discipline_params(true);
-        // Expected: max(200, 100) + PHI×0 ≈ 0.2 ms (PPS just fired, age≈0).
-        // Dispersion should be well below the old fixed 1 ms.
-        assert!(
-            dp.root_disp_ms < 1.0,
-            "locked dispersion should be < 1 ms with PHI model, got {:.3} ms",
-            dp.root_disp_ms
-        );
-        assert!(
-            dp.root_disp_ms >= 0.1,
-            "locked dispersion should be >= MIN_HW_ACCURACY (0.1 ms), got {:.3} ms",
-            dp.root_disp_ms
-        );
-    }
-
-    #[test]
-    fn discipline_params_locked_dispersion_minimum_is_hw_floor() {
-        // With no PPS sample yet, dispersion should equal the hardware floor.
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // pps_has_sample is still false after first pulse.
-        server.pps_has_sample = false;
-        let dp = server.discipline_params(true);
-        assert!(
-            (dp.root_disp_ms - (MIN_HW_ACCURACY_US as f64 / 1_000.0)).abs() < 0.02,
-            "dispersion should be ~MIN_HW_ACCURACY when no jitter sample yet"
-        );
-    }
-
-    // --- Item 3: mode-6 correctness field tests ---
-
-    #[test]
-    fn build_mode6_system_status_clksrc_is_gps_when_synced() {
-        // RFC 1305 §3.2.1: ClkSrc field must be 4 (UHF/GPS) for a GPS reference.
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 0.1,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
-        let sys_status = u16::from_be_bytes([resp[4], resp[5]]);
-        let clksrc = (sys_status >> 8) & 0x3f;
-        assert_eq!(
-            clksrc, 4,
-            "ClkSrc should be 4 (UHF/GPS) per RFC 1305 Table F-2"
-        );
-        let li = sys_status >> 14;
-        assert_eq!(li, 0, "LI should be 0 (no warning) when synced");
-    }
-
-    #[test]
-    fn build_mode6_system_status_unsynced_has_li_alarm() {
-        let dp = DisciplineParams {
-            stratum: 16,
-            leap: 3,
-            root_disp_short: 5 << 16,
-            root_disp_ms: 5000.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
-        let sys_status = u16::from_be_bytes([resp[4], resp[5]]);
-        let li = sys_status >> 14;
-        assert_eq!(li, 3, "LI should be 3 (alarm) when unsynced");
-    }
-
-    #[test]
-    fn build_mode6_readstat_peer_status_sel_is_system_peer_when_synced() {
-        // sel=6 in the peer status word causes ntpq to display '*' (system peer).
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 0.1,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0, MODE6_OPCODE_READSTAT, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 0, 0.0, 0.0, 0.0);
-        // READSTAT payload: 2-byte assoc ID + 2-byte peer status.
-        let peer_status = u16::from_be_bytes([
-            resp[NTP_CONTROL_HEADER_LEN + 2],
-            resp[NTP_CONTROL_HEADER_LEN + 3],
-        ]);
-        let sel = peer_status >> 13;
-        assert_eq!(sel, 6, "peer sel should be 6 (system peer) when synced");
-    }
-
-    #[test]
-    fn build_mode6_readvar_system_includes_reftime_and_frequency() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 0.1,
-            ref_ts: 0xE9D1_E7B4_8A3D_71A0,
-            current_ts: 0xE9D1_E7B5_0000_0000,
-            precision: -10,
-        };
-        let req = [0, MODE6_OPCODE_READVAR, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let resp = build_mode6_response(&req, 4, &dp, 500, 200.0, 1000.0, 5.321);
-        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
-        assert!(
-            payload.contains("reftime=0x"),
-            "should include reftime in hex"
-        );
-        assert!(payload.contains("clock=0x"), "should include clock in hex");
-        assert!(payload.contains("frequency="), "should include frequency");
-        assert!(payload.contains("sys_jitter="), "should include sys_jitter");
-        assert!(
-            payload.contains("rootdelay=0.000"),
-            "root delay should be 0"
-        );
-    }
-
-    #[test]
-    fn build_mode6_readvar_peer_includes_dispersion_and_filter_vars() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 16,
-            root_disp_ms: 0.5,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [
-            0,
-            MODE6_OPCODE_READVAR,
-            0,
-            0,
-            0,
-            0,
-            0,
-            MODE6_ASSOC_ID as u8,
-            0,
-            0,
-            0,
-            0,
-        ];
-        let resp = build_mode6_response(&req, 4, &dp, 250, 100.0, 800.0, 3.0);
-        let payload = String::from_utf8_lossy(&resp[NTP_CONTROL_HEADER_LEN..]);
-        assert!(payload.contains("dispersion="), "should include dispersion");
-        assert!(payload.contains("xleave="), "should include xleave");
-        assert!(payload.contains("filtdelay="), "should include filtdelay");
-        assert!(payload.contains("filtoffset="), "should include filtoffset");
-        assert!(payload.contains("filtdisp="), "should include filtdisp");
-    }
-
-    #[test]
-    fn ntp_ts_to_mode6_formats_correctly() {
-        // 0xE9D1E7B48A3D71A0 → "0xE9D1E7B4.8A3D71A0"
-        let ts: u64 = 0xE9D1_E7B4_8A3D_71A0;
-        let s = ntp_ts_to_mode6(ts);
-        assert_eq!(s, "0xE9D1E7B4.8A3D71A0");
-    }
-
-    #[test]
-    fn ntp_ts_to_mode6_zero_is_epoch() {
-        assert_eq!(ntp_ts_to_mode6(0), "0x00000000.00000000");
-    }
-
-    // --- Item 4: service protection tests (integration) ---
-    // Unit tests for Acl and RateLimiter live in ntp::protection.
-    // The tests below cover end-to-end behavior through NtpServer::poll().    // -- KoD packet tests --
-
-    #[test]
-    fn build_kod_response_has_stratum_0_and_rate_refid() {
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        // Simulate client transmit timestamp in bytes 40-47.
-        req[40..48].copy_from_slice(&0x1234_5678_ABCD_EF00_u64.to_be_bytes());
-        let resp = build_kod_response(&req, 4);
-        // Stratum must be 0 (kiss packet).
-        assert_eq!(resp[1], 0, "stratum should be 0");
-        // Reference ID must be "RATE".
-        assert_eq!(&resp[12..16], b"RATE", "refid should be RATE");
-        // LI = 3 (alarm).
-        assert_eq!((resp[0] >> 6) & 0x03, 3, "LI should be 3 (alarm)");
-        // Mode = 4 (server).
-        assert_eq!(resp[0] & 0x07, 4, "mode should be 4");
-        // Originate = client's transmit timestamp.
-        assert_eq!(
-            &resp[24..32],
-            &req[40..48],
-            "originate should echo client transmit ts"
-        );
-    }
-
-    // -- poll() integration tests for service protections --
-
-    #[test]
-    fn poll_sends_kod_when_client_polls_too_fast() {
-        // Bind a server socket and configure a client that will poll twice in
-        // rapid succession. The second poll should receive a KoD RATE response.
-        let mut server = NtpServer::new_for_test().expect("server");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        // Build a minimal mode-3 NTP request packet.
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (4 << 3) | 3; // VN=4, Mode=3
-
-        // First request — should be served normally.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let mut buf = [0_u8; 64];
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_ne!(buf[1], 0, "first response should not be a kiss packet");
-
-        // Second request immediately after (no delay) — should get KoD.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_eq!(buf[1], 0, "second response should be stratum-0 KoD");
-        assert_eq!(&buf[12..16], b"RATE", "KoD refid should be RATE");
-        assert_eq!(
-            server.rate_limited_total, 1,
-            "rate_limited counter should increment"
-        );
-    }
-
-    #[test]
-    fn poll_sends_kod_when_symmetric_active_polls_too_fast() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (4 << 3) | 1; // VN=4, Mode=1 (symmetric active)
-
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let mut buf = [0_u8; 64];
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_ne!(buf[1], 0, "first response should not be a kiss packet");
-
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_eq!(buf[1], 0, "second response should be stratum-0 KoD");
-        assert_eq!(&buf[12..16], b"RATE", "KoD refid should be RATE");
-        assert_eq!(server.rate_limited_total, 1);
-    }
-
-    #[test]
-    fn poll_rate_limits_across_time_request_modes() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut mode3 = [0_u8; NTP_PACKET_LEN];
-        mode3[0] = (4 << 3) | 3;
-        let mut mode1 = [0_u8; NTP_PACKET_LEN];
-        mode1[0] = (4 << 3) | 1;
-
-        client.send_to(&mode3, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let mut buf = [0_u8; 64];
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_ne!(buf[1], 0);
-
-        client.send_to(&mode1, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_eq!(
-            buf[1], 0,
-            "mode-1 after mode-3 should share limiter and get KoD"
-        );
-        assert_eq!(&buf[12..16], b"RATE");
-        assert_eq!(server.rate_limited_total, 1);
-    }
-
-    #[test]
-    fn poll_drops_packet_from_acl_blocked_source() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        // Configure a deny-all ACL so even loopback is blocked.
-        server.set_acl(Acl::deny_all());
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (4 << 3) | 3; // VN=4, Mode=3
-
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-
-        // The packet should be silently dropped — no response.
-        let mut buf = [0_u8; 64];
-        let result = client.recv_from(&mut buf);
-        assert!(
-            result.is_err(),
-            "ACL-blocked packet should not receive a response"
-        );
-        assert_eq!(
-            server.acl_blocked_total, 1,
-            "acl_blocked counter should increment"
-        );
-    }
-
-    #[test]
-    fn poll_allows_loopback_with_private_lan_acl() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        server.set_acl(Acl::private_lan());
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        client.send_to(&client_ntp_request(), server_addr).unwrap();
-        server.poll(true).unwrap();
-
-        let mut buf = [0_u8; NTP_PACKET_LEN];
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_eq!(server.acl_blocked_total, 0);
-    }
-
-    #[test]
-    fn poll_blocks_loopback_outside_configured_cidr() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        server.set_acl(Acl::from_config("192.168.1.0/24"));
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        client.send_to(&client_ntp_request(), server_addr).unwrap();
-        server.poll(true).unwrap();
-
-        let mut buf = [0_u8; NTP_PACKET_LEN];
-        assert!(
-            client.recv_from(&mut buf).is_err(),
-            "127.0.0.1 should be blocked by 192.168.1.0/24 ACL"
-        );
-        assert_eq!(server.acl_blocked_total, 1);
-    }
-
-    #[test]
-    fn poll_mode6_rate_limited_on_rapid_poll() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut req = [0_u8; NTP_CONTROL_HEADER_LEN];
-        req[0] = (4 << 3) | 6; // VN=4, Mode=6
-        req[1] = MODE6_OPCODE_READVAR;
-
-        let mut buf = [0_u8; 256];
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(false).unwrap();
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert!(
-            n >= NTP_CONTROL_HEADER_LEN,
-            "first mode-6 request should get a response"
-        );
-
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(false).unwrap();
-        assert!(
-            client.recv_from(&mut buf).is_err(),
-            "rapid mode-6 poll should be silently dropped"
-        );
-        assert_eq!(
-            server.rate_limited_total, 1,
-            "mode-6 should increment rate_limited counter"
-        );
-    }
-
-    #[test]
-    fn poll_mode6_allowed_again_after_rate_limit_window() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut req = [0_u8; NTP_CONTROL_HEADER_LEN];
-        req[0] = (4 << 3) | 6;
-        req[1] = MODE6_OPCODE_READVAR;
-
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(false).unwrap();
-        let mut buf = [0_u8; 256];
-        let _ = client.recv_from(&mut buf).unwrap();
-
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(false).unwrap();
-        assert!(client.recv_from(&mut buf).is_err());
-
-        server
-            .rate_limiter
-            .subtract_time(protection::MIN_POLL_INTERVAL_US + 1);
-
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(false).unwrap();
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert!(
-            n >= NTP_CONTROL_HEADER_LEN,
-            "mode-6 should be served again after rate-limit window"
-        );
-    }
-
-    /// KoD response must echo the client's transmit timestamp in the originate
-    /// field (bytes 24-31 = client bytes 40-47) per RFC 5905 §7.4.
-    #[test]
-    fn poll_kod_response_echoes_client_transmit_timestamp() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (4 << 3) | 3;
-        // Write a distinct transmit timestamp into the request.
-        let client_xmit: u64 = 0xDEAD_BEEF_CAFE_1234;
-        req[40..48].copy_from_slice(&client_xmit.to_be_bytes());
-        let mut buf = [0_u8; 64];
-
-        // First request — accepted normally (consume the slot so next is KoD).
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        client.recv_from(&mut buf).unwrap();
-
-        // Second immediate request — should receive KoD RATE.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_eq!(buf[1], 0, "KoD stratum must be 0");
-        assert_eq!(&buf[12..16], b"RATE", "KoD refid must be RATE");
-        let originate = u64::from_be_bytes(buf[24..32].try_into().unwrap());
-        assert_eq!(
-            originate, client_xmit,
-            "KoD originate must echo client transmit timestamp (RFC 5905 §7.4)"
-        );
-    }
-
-    /// After a client is rate-limited, the rate-limited counter must be visible
-    /// through `ntp_snapshot` so the UI and operator can observe it.
-    #[test]
-    fn poll_rate_limited_counter_visible_in_snapshot() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (4 << 3) | 3;
-        let mut buf = [0_u8; 64];
-
-        // First request — allowed.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        client.recv_from(&mut buf).unwrap();
-
-        // Second request immediately — triggers KoD + increments counter.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        client.recv_from(&mut buf).unwrap();
-
-        let snap = server.ntp_snapshot(true);
-        assert_eq!(
-            snap.rate_limited, 1,
-            "rate_limited must be 1 in NtpSnapshot"
-        );
-        // KoD responses do not increment served; only the first (allowed) request does.
-        assert_eq!(
-            snap.served, 1,
-            "served should count only the allowed response"
-        );
-    }
-
-    /// After a KoD is sent the rate limiter must NOT update `last_us`, so the
-    /// client is allowed again once `MIN_POLL_INTERVAL_US` has elapsed since the
-    /// original accepted request.
-    #[test]
-    fn poll_client_allowed_again_after_rate_limit_window() {
-        let mut server = NtpServer::new_for_test().expect("server");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-
-        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
-        client
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .unwrap();
-        let server_addr = server.socket.local_addr().unwrap();
-
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (4 << 3) | 3;
-        let mut buf = [0_u8; 64];
-
-        // First request — allowed.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        client.recv_from(&mut buf).unwrap();
-
-        // Second request immediately — KoD.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        client.recv_from(&mut buf).unwrap();
-        assert_eq!(buf[1], 0, "second response should be KoD");
-
-        // Advance the rate limiter's clock past the min poll interval by
-        // winding back every entry's last_us without real sleeps.
-        server
-            .rate_limiter
-            .subtract_time(protection::MIN_POLL_INTERVAL_US + 1);
-
-        // Third request after the window — should be served normally again.
-        client.send_to(&req, server_addr).unwrap();
-        server.poll(true).unwrap();
-        let (n, _) = client.recv_from(&mut buf).unwrap();
-        assert_eq!(n, NTP_PACKET_LEN);
-        assert_ne!(buf[1], 0, "third response should be a normal NTP reply");
-        assert_eq!(
-            server.rate_limited_total, 1,
-            "only one KoD should have been sent"
-        );
-    }
-
-    // -- Leap indicator tests --
-
-    #[test]
-    fn set_leap_indicator_propagates_to_ntp_response() {
-        // LI=1 set by the application must appear in NTP response byte 0 bits 7-6.
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 1, // simulating pending_leap=1 flowing through discipline_params
-            root_disp_short: 1 << 16,
-            root_disp_ms: 0.1,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let req = [0_u8; NTP_PACKET_LEN];
-        let resp = build_response(&req, &dp, 0);
-        let li = (resp[0] >> 6) & 0x03;
-        assert_eq!(li, 1, "LI=1 should propagate to response byte 0 bits 7-6");
-    }
-
-    #[test]
-    fn set_leap_indicator_clamped_to_2() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.set_leap_indicator(5);
-        assert_eq!(server.pending_leap, 2, "values > 2 should be clamped to 2");
-    }
-
-    #[test]
-    fn set_leap_indicator_0_clears_warning() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.set_leap_indicator(1);
-        assert_eq!(server.pending_leap, 1);
-        server.set_leap_indicator(0);
-        assert_eq!(server.pending_leap, 0);
-    }
-
-    #[test]
-    fn discipline_params_uses_pending_leap_when_synced() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        server.set_leap_indicator(1);
-        let dp = server.discipline_params(true);
-        assert_eq!(
-            dp.leap, 1,
-            "pending_leap should flow into DisciplineParams.leap"
-        );
-    }
-
-    #[test]
-    fn discipline_params_overrides_pending_leap_with_alarm_when_unsynced() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.set_leap_indicator(1); // would be active if synced
-        let dp = server.discipline_params(false); // no anchor → stratum 16
-        assert_eq!(
-            dp.leap, 3,
-            "unsynced server must emit LI=3 regardless of pending_leap"
-        );
-    }
-
-    #[test]
-    fn ntp_snapshot_exposes_leap_indicator() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        server.set_leap_indicator(2);
-        let snap = server.ntp_snapshot(true);
-        assert_eq!(snap.leap_indicator, 2);
-    }
-
-    // -- PPS outlier filter tests --
-
-    #[test]
-    fn pps_outlier_rejected_after_servo_converged() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // Give the servo a good first sample to establish pps_has_sample=true.
-        server.pps_now(Some(1_000_100)); // +100 µs error — OK
-
-        let freq_before = server.freq_ppm;
-        // Now send a huge phase error that exceeds PPS_OUTLIER_THRESHOLD_US (50 ms).
-        server.pps_now(Some(1_100_000)); // +100_000 µs = 100 ms — outlier
-        assert_eq!(
-            server.pps_glitch_count, 1,
-            "outlier should increment pps_glitch_count"
-        );
-        assert!(
-            (server.freq_ppm - freq_before).abs() < 0.001,
-            "freq_ppm should not change on outlier rejection"
-        );
-    }
-
-    #[test]
-    fn pps_outlier_not_applied_before_first_sample() {
-        // Before pps_has_sample is true (first disciplined pulse), large phase
-        // errors are allowed through so the servo can make an initial correction.
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        // pps_has_sample is still false; a large interval is still gated by the
-        // ±20% interval filter (800k–1200k µs).  Use a mid-range value.
-        server.pps_now(Some(1_049_999)); // 49_999 µs error — just under threshold
-        assert_eq!(
-            server.pps_glitch_count, 0,
-            "should not be counted as outlier"
-        );
-        assert!(
-            server.pps_has_sample,
-            "servo should accept the first large-ish error"
-        );
-    }
-
-    #[test]
-    fn pps_outlier_does_not_update_last_pps_monotonic() {
-        // A rejected outlier must not advance last_pps_monotonic_us; otherwise
-        // the holdover timer would be reset by bad pulses.
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        server.pps_now(Some(1_000_100)); // good → sets last_pps_monotonic_us
-        let last_good = server.last_pps_monotonic_us;
-        server.pps_now(Some(1_100_000)); // outlier
-        assert_eq!(
-            server.last_pps_monotonic_us, last_good,
-            "outlier must not update last_pps_monotonic_us"
-        );
-    }
-
-    // -- Stale GPS anchor guard tests --
-
-    #[test]
-    fn first_pps_pulse_skipped_when_gps_time_is_stale() {
-        // If update_gps_utc_seconds was not called recently, the first PPS pulse
-        // must not anchor the clock to old GPS data.
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        // Set GPS UTC seconds but do NOT call update_gps_utc_seconds via the
-        // normal path — instead manipulate internal state to make GPS appear stale.
-        server.last_gps_utc_seconds = Some(1_700_000_000);
-        server.last_gps_utc_update_us = Some(monotonic_us_now() - 2 * GPS_STALE_THRESHOLD_US);
-        server.pps_now(None);
-        assert!(
-            server.clock_anchor.is_none(),
-            "stale GPS should prevent phase anchor on first PPS pulse"
-        );
-    }
-
-    #[test]
-    fn first_pps_pulse_anchors_with_fresh_gps() {
-        // With a recent GPS update the first PPS pulse should establish the anchor.
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000); // fresh
-        server.pps_now(None);
-        assert!(
-            server.clock_anchor.is_some(),
-            "fresh GPS should allow phase anchor on first PPS pulse"
-        );
-    }
-
-    #[test]
-    fn glitch_count_exposed_in_ntp_snapshot() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        server.pps_now(Some(1_000_100)); // good
-        server.pps_now(Some(1_100_000)); // outlier
-        let snap = server.ntp_snapshot(true);
-        assert_eq!(snap.pps_glitch_count, 1);
-    }
-
-    // --- Item 6: Timestamp math ---
-
-    /// The NTP–Unix epoch offset is exactly the number of seconds from
-    /// 1900-01-01T00:00:00Z to 1970-01-01T00:00:00Z as specified in RFC 868.
-    #[test]
-    fn ntp_epoch_offset_matches_rfc868_definition() {
-        // 70 years * 365.25 days/year * 86400 s/day = 2_208_988_800 s
-        assert_eq!(NTP_UNIX_EPOCH_OFFSET_SECS, 2_208_988_800_u64);
-    }
-
-    /// 500 000 µs of elapsed time must produce an NTP fraction near
-    /// 0x8000_0000 (half the 32-bit range = half a second).
-    /// Real elapsed when `current_ntp_timestamp` runs is ≥ 500 000 µs (time
-    /// only moves forward), so we accept the range [500 ms, 600 ms).
-    #[test]
-    fn ntp_fraction_half_second_encodes_correctly() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let now_us = monotonic_us_now();
-        server.clock_anchor = Some(ClockAnchor {
-            unix_seconds: 1_700_000_000,
-            monotonic_us: now_us - 500_000,
-        });
-        server.freq_ppm = 0.0;
-        let ts = server.current_ntp_timestamp();
-        // Convert the sub-second NTP fraction back to microseconds.
-        let frac_us = (ts & 0xFFFF_FFFF) * 1_000_000 / (1u64 << 32);
-        assert!(
-            (500_000..600_000).contains(&frac_us),
-            "expected sub-second in 500–600 ms range, got {frac_us} µs"
-        );
-    }
-
-    /// 250 000 µs of elapsed time must produce an NTP fraction near
-    /// 0x4000_0000 (one quarter of the 32-bit range).
-    /// Same timing argument as above: accept [250 ms, 350 ms).
-    #[test]
-    fn ntp_fraction_quarter_second_encodes_correctly() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let now_us = monotonic_us_now();
-        server.clock_anchor = Some(ClockAnchor {
-            unix_seconds: 1_700_000_000,
-            monotonic_us: now_us - 250_000,
-        });
-        server.freq_ppm = 0.0;
-        let ts = server.current_ntp_timestamp();
-        let frac_us = (ts & 0xFFFF_FFFF) * 1_000_000 / (1u64 << 32);
-        assert!(
-            (250_000..350_000).contains(&frac_us),
-            "expected sub-second in 250–350 ms range, got {frac_us} µs"
-        );
-    }
-
-    /// With a positive `freq_ppm` the disciplined clock should report a
-    /// smaller elapsed interval than the raw monotonic elapsed.  A large
-    /// correction (50 000 ppm = 5%) creates a 25 ms difference over 500 ms,
-    /// which dwarfs any test-executor scheduling overhead.
-    #[test]
-    fn ntp_frequency_correction_compensates_fast_clock() {
-        let elapsed_us: i64 = 500_000;
-        let now_us = monotonic_us_now();
-        let anchor = ClockAnchor {
-            unix_seconds: 1_700_000_000,
-            monotonic_us: now_us - elapsed_us,
-        };
-
-        let mut server_uncorrected = NtpServer::new_for_test().expect("test socket");
-        server_uncorrected.clock_anchor = Some(anchor);
-        server_uncorrected.freq_ppm = 0.0;
-        let ts_uncorrected = server_uncorrected.current_ntp_timestamp();
-
-        // Use a large correction so the effect (25 ms) overwhelms any jitter.
-        let mut server_fast = NtpServer::new_for_test().expect("test socket");
-        server_fast.clock_anchor = Some(anchor);
-        server_fast.freq_ppm = 50_000.0; // 5% fast: corrected elapsed ≈ 475 ms
-        let ts_fast = server_fast.current_ntp_timestamp();
-
-        assert!(
-            ts_fast < ts_uncorrected,
-            "positive freq_ppm should reduce elapsed: ts_fast=0x{ts_fast:016X} ts_uncorrected=0x{ts_uncorrected:016X}"
-        );
-    }
-
-    /// The NTP seconds field extracted from a disciplined timestamp must match
-    /// the anchor's Unix epoch plus the NTP–Unix offset for zero elapsed time.
-    #[test]
-    fn ntp_timestamp_seconds_field_reflects_anchor_unix_epoch() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        let unix_sec: i64 = 1_700_000_100;
-        let now_us = monotonic_us_now();
-        // Set anchor to exactly now so elapsed ≈ 0.
-        server.clock_anchor = Some(ClockAnchor {
-            unix_seconds: unix_sec,
-            monotonic_us: now_us,
-        });
-        server.freq_ppm = 0.0;
-        let ts = server.current_ntp_timestamp();
-        let ntp_sec = ts >> 32;
-        let expected = unix_sec as u64 + NTP_UNIX_EPOCH_OFFSET_SECS;
-        assert_eq!(
-            ntp_sec, expected,
-            "NTP seconds should be unix_seconds + epoch offset"
-        );
-    }
-
-    // --- Item 6: Sync state transitions ---
-
-    #[test]
-    fn ntp_snapshot_state_locked_with_gps_fix_and_fresh_pps() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        let snap = server.ntp_snapshot(true);
-        assert_eq!(snap.state, DisciplineState::Locked);
-        assert_eq!(snap.stratum, 1);
-    }
-
-    #[test]
-    fn ntp_snapshot_state_holdover_when_gps_fix_lost() {
-        // Anchor + fresh PPS, but gps_fix = false → Holdover (not fully_synced).
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        let snap = server.ntp_snapshot(false); // GPS fix gone
-        assert_eq!(snap.state, DisciplineState::Holdover);
-    }
-
-    #[test]
-    fn ntp_snapshot_state_holdover_when_pps_becomes_stale() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 1_000_000);
-        let snap = server.ntp_snapshot(true);
-        assert_eq!(snap.state, DisciplineState::Holdover);
-    }
-
-    #[test]
-    fn ntp_snapshot_state_unsync_without_any_anchor() {
-        let server = NtpServer::new_for_test().expect("test socket");
-        let snap = server.ntp_snapshot(false);
-        assert_eq!(snap.state, DisciplineState::Unsync);
-    }
-
-    /// Full state-machine cycle: Unsync → Locked → Holdover (GPS lost) →
-    /// Holdover (PPS stale) → Locked again (PPS + GPS return).
-    #[test]
-    fn sync_state_full_cycle() {
-        let mut server = NtpServer::new_for_test().expect("test socket");
-
-        // Initially unsync.
-        assert_eq!(server.ntp_snapshot(false).state, DisciplineState::Unsync);
-
-        // Establish GPS + PPS → Locked.
-        server.update_gps_utc_seconds(1_700_000_000);
-        server.pps_now(None);
-        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
-
-        // GPS fix lost → Holdover (anchor still valid).
-        assert_eq!(server.ntp_snapshot(false).state, DisciplineState::Holdover);
-
-        // GPS fix returns; still has anchor → Locked again.
-        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
-
-        // PPS becomes stale → Holdover even with GPS fix.
-        server.pps_stale_ago(None, HOLDOVER_ENTRY_US + 1_000_000);
-        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Holdover);
-
-        // PPS returns (new pulse) → Locked.
-        server.pps_now(Some(1_000_000));
-        assert_eq!(server.ntp_snapshot(true).state, DisciplineState::Locked);
-    }
-
-    // --- Item 6: Mode-6 framing and padding ---
-
-    fn make_mode6_req(opcode: u8, assoc: u16) -> Vec<u8> {
-        let mut req = vec![0_u8; NTP_CONTROL_HEADER_LEN];
-        req[0] = (4 << 3) | 6; // VN=4, mode=6
-        req[1] = opcode;
-        req[6..8].copy_from_slice(&assoc.to_be_bytes());
-        req
-    }
-
-    fn synced_dp() -> DisciplineParams {
-        DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 1 << 14,
-            root_disp_ms: 0.1,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        }
-    }
-
-    /// All mode-6 responses must be padded to a multiple of 4 bytes.
-    #[test]
-    fn build_mode6_response_length_is_multiple_of_4() {
-        let req = make_mode6_req(MODE6_OPCODE_READVAR, 0);
-        let dp = synced_dp();
-        let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
-        assert_eq!(
-            resp.len() % 4,
-            0,
-            "mode-6 response length {} is not 32-bit aligned",
-            resp.len()
-        );
-    }
-
-    /// Padding bytes appended for 32-bit alignment must all be zero.
-    #[test]
-    fn build_mode6_padding_bytes_are_zero() {
-        let req = make_mode6_req(MODE6_OPCODE_READVAR, 0);
-        let dp = synced_dp();
-        let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
-        // The count field (bytes 10-11) tells us how many payload bytes precede padding.
-        let count = u16::from_be_bytes([resp[10], resp[11]]) as usize;
-        let payload_end = NTP_CONTROL_HEADER_LEN + count;
-        for (i, &b) in resp[payload_end..].iter().enumerate() {
-            assert_eq!(b, 0, "padding byte at index {i} should be zero");
-        }
-    }
-
-    /// Byte 1 of every mode-6 response must have the response bit (0x80) set.
-    #[test]
-    fn build_mode6_response_bit_set_in_byte_1() {
-        for opcode in [MODE6_OPCODE_READSTAT, MODE6_OPCODE_READVAR] {
-            let req = make_mode6_req(opcode, 0);
-            let dp = synced_dp();
-            let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
-            assert_ne!(
-                resp[1] & 0x80,
-                0,
-                "response bit not set for opcode {opcode}"
-            );
-        }
-    }
-
-    /// An unknown association ID must produce a 12-byte header-only response
-    /// (no payload, no padding).
-    #[test]
-    fn build_mode6_unknown_assoc_id_returns_header_only() {
-        let req = make_mode6_req(MODE6_OPCODE_READVAR, 99); // assoc 99 not registered
-        let dp = synced_dp();
-        let resp = build_mode6_response(&req, 4, &dp, 0, 1.0, 1.0, 0.0);
-        // count field must be zero (bytes 10-11)
-        let count = u16::from_be_bytes([resp[10], resp[11]]);
-        assert_eq!(count, 0, "unknown assoc should return zero count");
-        assert_eq!(
-            resp.len(),
-            NTP_CONTROL_HEADER_LEN,
-            "unknown assoc should return header-only response"
-        );
-    }
-
-    /// The Originate Timestamp field (bytes 24-31) of a mode-3/4 response must
-    /// be a verbatim copy of the Transmit Timestamp field (bytes 40-47) from
-    /// the client request, as required by RFC 5905 §7.3.
-    #[test]
-    fn build_response_originate_echoes_client_transmit() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 0,
-            root_disp_ms: 0.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        // Write a known transmit timestamp into bytes 40-47 of the request.
-        let client_xmit: u64 = 0xDEAD_BEEF_1234_5678;
-        req[40..48].copy_from_slice(&client_xmit.to_be_bytes());
-        let resp = build_response(&req, &dp, 0);
-        let originate = u64::from_be_bytes(resp[24..32].try_into().unwrap());
-        assert_eq!(
-            originate, client_xmit,
-            "originate timestamp must echo client transmit timestamp"
-        );
-    }
-
-    /// When a client uses NTPv3 the server must mirror VN=3 in the response.
-    #[test]
-    fn build_response_version_mirrors_client_v3() {
-        let dp = DisciplineParams {
-            stratum: 1,
-            leap: 0,
-            root_disp_short: 0,
-            root_disp_ms: 0.0,
-            ref_ts: 0,
-            current_ts: 0,
-            precision: -10,
-        };
-        let mut req = [0_u8; NTP_PACKET_LEN];
-        req[0] = (3 << 3) | 3; // VN=3, mode=3 (client)
-        let resp = build_response(&req, &dp, 0);
-        let vn = (resp[0] >> 3) & 0x07;
-        assert_eq!(vn, 3, "server should mirror client VN=3");
-    }
-}
+mod tests;

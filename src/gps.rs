@@ -169,7 +169,8 @@ impl std::ops::Deref for GpsUart {
     }
 }
 
-static RUNTIME_TZ: OnceLock<RwLock<Option<Tz>>> = OnceLock::new();
+/// Runtime timezone override resolved from the GPS position (IANA zone).
+static RUNTIME_TZ: RwLock<Option<Tz>> = RwLock::new(None);
 
 /// Current GPS-derived values used by UI and NTP logic.
 #[derive(Debug, Clone, Default)]
@@ -203,6 +204,12 @@ pub struct GpsSnapshot {
 /// - `true` when the checksum field matches the XOR of bytes between `$` and `*`.
 /// - `false` when the sentence format is invalid or the checksum does not match.
 pub fn nmea_checksum_valid(sentence: &str) -> bool {
+    // NMEA 0183 is a 7-bit ASCII protocol.  Rejecting non-ASCII up front also
+    // guarantees every byte index below is a char boundary, so the checksum
+    // slice cannot panic on a UART glitch that produced a multibyte sequence.
+    if !sentence.is_ascii() {
+        return false;
+    }
     let bytes = sentence.as_bytes();
     if bytes.first() != Some(&b'$') {
         return false;
@@ -210,16 +217,13 @@ pub fn nmea_checksum_valid(sentence: &str) -> bool {
     let Some(star_idx) = sentence.rfind('*') else {
         return false;
     };
-    if star_idx + 3 > sentence.len() {
-        return false;
-    }
-    let Ok(expected) = u8::from_str_radix(&sentence[star_idx + 1..star_idx + 3], 16) else {
+    let Some(hex) = sentence.get(star_idx + 1..star_idx + 3) else {
         return false;
     };
-    let mut computed = 0_u8;
-    for &byte in &bytes[1..star_idx] {
-        computed ^= byte;
-    }
+    let Ok(expected) = u8::from_str_radix(hex, 16) else {
+        return false;
+    };
+    let computed = bytes[1..star_idx].iter().fold(0_u8, |acc, &b| acc ^ b);
     computed == expected
 }
 
@@ -295,34 +299,18 @@ fn nmea_to_decimal(value: &str, dir: &str) -> Option<f32> {
     Some(decimal)
 }
 
-/// Estimate local datetime from UTC fields and longitude-derived timezone.
+/// Render a UTC instant as local date/time using the configured IANA zone or,
+/// failing that, a longitude-derived whole-hour offset (`round(lon/15)`).
 ///
 /// # Parameters
-/// - `utc_date`: Date field in `ddmmyy` format.
-/// - `utc_time`: Time field in `hhmmss` format.
-/// - `lon`: Longitude used to estimate timezone offset (`round(lon/15)`).
+/// - `utc`: UTC calendar time (from [`utc_datetime_from_fields`]).
+/// - `lon`: Longitude used to estimate the offset when no IANA zone is set.
 ///
 /// # Returns
-/// - `Some((local_date, local_time, tz_offset_hours))` when conversion succeeds.
-/// - `None` when UTC date/time parsing fails.
-fn local_datetime_from_utc(
-    utc_date: &str,
-    utc_time: &str,
-    lon: f32,
-) -> Option<(String, String, i8)> {
-    let ddmmyy = parse_ddmmyy(utc_date)?;
-    let hhmmss = parse_hhmmss(utc_time)?;
-
-    let day: u32 = ddmmyy[0..2].parse().ok()?;
-    let month: u32 = ddmmyy[2..4].parse().ok()?;
-    let year: i32 = 2000 + ddmmyy[4..6].parse::<i32>().ok()?;
-    let hour: u32 = hhmmss[0..2].parse().ok()?;
-    let minute: u32 = hhmmss[2..4].parse().ok()?;
-    let second: u32 = hhmmss[4..6].parse().ok()?;
-
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-    let utc_dt = NaiveDateTime::new(date, time).and_utc();
+/// - `Some((local_date, local_time, tz_offset_hours))`; `None` only if the
+///   offset arithmetic leaves the representable date range.
+fn local_datetime_from_naive_utc(utc: NaiveDateTime, lon: f32) -> Option<(String, String, i8)> {
+    let utc_dt = utc.and_utc();
 
     if let Some(tz) = configured_timezone() {
         let local = utc_dt.with_timezone(&tz);
@@ -351,8 +339,7 @@ fn configured_timezone() -> Option<Tz> {
 }
 
 fn runtime_timezone() -> Option<Tz> {
-    let lock = RUNTIME_TZ.get_or_init(|| RwLock::new(None));
-    lock.read().ok().and_then(|guard| *guard)
+    RUNTIME_TZ.read().ok().and_then(|guard| *guard)
 }
 
 /// Set the runtime timezone from an IANA timezone name.
@@ -367,8 +354,7 @@ pub fn set_runtime_timezone(tz_name: &str) -> bool {
     let Some(tz) = Tz::from_str(tz_name).ok() else {
         return false;
     };
-    let lock = RUNTIME_TZ.get_or_init(|| RwLock::new(None));
-    if let Ok(mut guard) = lock.write() {
+    if let Ok(mut guard) = RUNTIME_TZ.write() {
         *guard = Some(tz);
         true
     } else {
@@ -437,8 +423,14 @@ fn utc_datetime_from_fields(utc_date: &str, utc_time: &str) -> Option<NaiveDateT
 /// - `gps`: Mutable snapshot updated in place on successful parse.
 ///
 /// # Returns
-/// - `Some(())` when required RMC fields parse successfully.
-/// - `None` when required fields are missing or malformed.
+/// - `Some(())` when the time, status and date fields parse successfully.
+/// - `None` when those required fields are missing or malformed.
+///
+/// The fix flag is taken from the status field (`A`/`V`) *before* position is
+/// considered.  A receiver that loses its fix emits `V` with empty latitude
+/// and longitude; the status must still be applied so the snapshot does not
+/// keep advertising a stale fix (which gates PPS discipline and stratum 1).
+/// Position fields are optional: when absent the previous coordinates are kept.
 pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     if !nmea_checksum_valid(sentence) {
         log::trace!("GPS RMC rejected: checksum invalid");
@@ -453,18 +445,27 @@ pub fn parse_rmc(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
     let time = parse_hhmmss(fields[1])?;
     let status = fields[2];
     let date = parse_ddmmyy(fields[9])?;
-    let lat = nmea_to_decimal(fields[3], fields[4])?;
-    let lon = nmea_to_decimal(fields[5], fields[6])?;
+    // Status is authoritative: apply it before anything that can fail.
+    gps.fix = status == "A";
 
-    let (local_date, local_time, tz_offset_hours) = local_datetime_from_utc(date, time, lon)
+    if let (Some(lat), Some(lon)) = (
+        nmea_to_decimal(fields[3], fields[4]),
+        nmea_to_decimal(fields[5], fields[6]),
+    ) {
+        gps.lat = lat;
+        gps.lon = lon;
+    }
+
+    // Parse the calendar fields once; both the local rendering and the Unix
+    // epoch derive from the same `NaiveDateTime`.
+    let utc_dt = utc_datetime_from_fields(date, time);
+    let (local_date, local_time, tz_offset_hours) = utc_dt
+        .and_then(|dt| local_datetime_from_naive_utc(dt, gps.lon))
         .unwrap_or_else(|| (format_ddmmyy(date), format_hhmmss(time), 0));
     gps.local_date = local_date;
     gps.local_time = local_time;
     gps.tz_offset_hours = tz_offset_hours;
-    gps.utc_unix_seconds = utc_datetime_from_fields(date, time).map(|dt| dt.and_utc().timestamp());
-    gps.lat = lat;
-    gps.lon = lon;
-    gps.fix = status == "A";
+    gps.utc_unix_seconds = utc_dt.map(|dt| dt.and_utc().timestamp());
     log::trace!(
         "GPS RMC parsed: local={} {} tz={:+}h fix={} lat={:.6} lon={:.6}",
         gps.local_date,
@@ -506,166 +507,4 @@ pub fn parse_gga(sentence: &str, gps: &mut GpsSnapshot) -> Option<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serial_test::serial;
-
-    fn reset_runtime_timezone() {
-        let lock = RUNTIME_TZ.get_or_init(|| RwLock::new(None));
-        if let Ok(mut guard) = lock.write() {
-            *guard = None;
-        }
-    }
-
-    #[test]
-    fn nmea_checksum_rejects_missing_dollar_prefix() {
-        assert!(!nmea_checksum_valid("GPRMC,123519,A*00"));
-    }
-
-    #[test]
-    fn nmea_checksum_rejects_truncated_checksum_field() {
-        assert!(!nmea_checksum_valid("$GPRMC,123519,A*0"));
-    }
-
-    #[test]
-    #[serial]
-    fn parse_rmc_falls_back_to_raw_date_time_on_invalid_calendar() {
-        reset_runtime_timezone();
-        let mut gps = GpsSnapshot::default();
-        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,320266,003.1,W*66";
-
-        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
-        assert_eq!(gps.local_date, "2066-02-32");
-        assert_eq!(gps.local_time, "12:35:19");
-        assert_eq!(gps.tz_offset_hours, 0);
-        assert!(gps.utc_unix_seconds.is_none());
-    }
-
-    #[test]
-    fn parse_gga_rejects_malformed_satellite_field() {
-        let mut gps = GpsSnapshot::default();
-        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08*7D";
-        assert_eq!(parse_gga(gga, &mut gps), None);
-    }
-
-    #[test]
-    fn nmea_checksum_rejects_missing_star() {
-        assert!(!nmea_checksum_valid("$GPRMC,123519,A"));
-    }
-
-    #[test]
-    fn nmea_checksum_rejects_non_hex_suffix() {
-        assert!(!nmea_checksum_valid("$GPRMC,123519,A*GH"));
-    }
-
-    #[test]
-    fn set_runtime_timezone_rejects_invalid_name() {
-        assert!(!set_runtime_timezone("Not/A/Timezone"));
-    }
-
-    #[test]
-    #[serial]
-    fn parse_rmc_rejects_short_sentence() {
-        reset_runtime_timezone();
-        let mut gps = GpsSnapshot::default();
-        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4*32";
-        assert_eq!(parse_rmc(rmc, &mut gps), None);
-    }
-
-    #[test]
-    fn parse_gga_rejects_invalid_checksum() {
-        let mut gps = GpsSnapshot::default();
-        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08,1.0,545.4,M,46.9,M,,*00";
-        assert_eq!(parse_gga(gga, &mut gps), None);
-    }
-
-    #[test]
-    fn nmea_checksum_valid_accepts_known_sentence() {
-        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
-        assert!(nmea_checksum_valid(rmc));
-    }
-
-    #[test]
-    fn nmea_checksum_invalid_rejects_parse() {
-        let mut gps = GpsSnapshot::default();
-        let bad = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*00";
-        assert!(!nmea_checksum_valid(bad));
-        assert_eq!(parse_rmc(bad, &mut gps), None);
-    }
-
-    #[test]
-    #[serial]
-    fn parse_rmc_populates_local_fields_and_coords() {
-        reset_runtime_timezone();
-        let mut gps = GpsSnapshot::default();
-        let rmc = "$GPRMC,123519,A,4807.038,N,01131.000,E,022.4,084.4,230394,003.1,W*6A";
-
-        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
-        assert_eq!(gps.local_date, "2094-03-23");
-        assert_eq!(gps.local_time, "13:35:19");
-        assert_eq!(gps.tz_offset_hours, 1);
-        assert!(gps.fix);
-        assert!((gps.lat - 48.1173).abs() < 0.0001);
-        assert!((gps.lon - 11.516667).abs() < 0.0001);
-    }
-
-    #[test]
-    #[serial]
-    fn parse_rmc_marks_invalid_fix_status() {
-        reset_runtime_timezone();
-        let mut gps = GpsSnapshot::default();
-        let rmc = "$GPRMC,225446,V,4916.45,N,12311.12,W,000.5,054.7,191194,020.3,E*7F";
-
-        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
-        assert!(!gps.fix);
-        assert!(gps.lon < 0.0);
-    }
-
-    #[test]
-    fn parse_gga_updates_satellite_count() {
-        let mut gps = GpsSnapshot::default();
-        let gga = "$GPGGA,123520,4807.038,N,01131.000,E,1,08,1.0,545.4,M,46.9,M,,*45";
-
-        assert_eq!(parse_gga(gga, &mut gps), Some(()));
-        assert_eq!(gps.sats, 8);
-        assert_eq!(gps.altitude_m, Some(545.4));
-    }
-
-    #[test]
-    #[serial]
-    fn runtime_timezone_override_applies_dst_rules_for_summer() {
-        assert!(set_runtime_timezone("America/Chicago"));
-        let mut gps = GpsSnapshot::default();
-        // 2026-06-01 12:00:00 UTC should be 07:00:00 CDT (UTC-5).
-        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010626,0.0,E*67";
-
-        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
-        assert_eq!(gps.local_date, "2026-06-01");
-        assert_eq!(gps.local_time, "07:00:00");
-        assert_eq!(gps.tz_offset_hours, -5);
-    }
-
-    #[test]
-    #[serial]
-    fn local_from_utc_unix_uses_runtime_timezone() {
-        assert!(set_runtime_timezone("America/Chicago"));
-        // 2026-06-01 18:00:00 UTC -> 13:00:00 CDT.
-        let (date, time) = local_from_utc_unix(1_780_336_800).expect("local time");
-        assert_eq!(date, "2026-06-01");
-        assert_eq!(time, "13:00:00");
-        assert_eq!(tz_offset_hours_at_unix(1_780_336_800), -5);
-    }
-
-    #[test]
-    fn runtime_timezone_override_applies_dst_rules_for_winter() {
-        assert!(set_runtime_timezone("America/Chicago"));
-        let mut gps = GpsSnapshot::default();
-        // 2026-01-01 12:00:00 UTC should be 06:00:00 CST (UTC-6).
-        let rmc = "$GPRMC,120000,A,3853.647,N,09011.516,W,0.0,0.0,010126,0.0,E*60";
-
-        assert_eq!(parse_rmc(rmc, &mut gps), Some(()));
-        assert_eq!(gps.local_date, "2026-01-01");
-        assert_eq!(gps.local_time, "06:00:00");
-        assert_eq!(gps.tz_offset_hours, -6);
-    }
-}
+mod tests;

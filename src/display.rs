@@ -64,8 +64,15 @@ pub const PANEL_HEIGHT: u16 = DISPLAY_HEIGHT;
 pub struct DisplayDevice {
     driver: &'static SpiDriver<'static>,
     _power: PinDriver<'static, gpio::Gpio21, Output>,
+    /// TFT SPI device, created at bus bring-up so its hardware CS line idles
+    /// high while the microSD socket is probed; moved into the panel driver by
+    /// [`Self::init_panel`].
+    tft_spi: Option<TftSpiDevice>,
     panel_claimed: bool,
 }
+
+/// SPI device handle for the ST7789 on the shared Feather bus (hardware CS on GPIO7).
+type TftSpiDevice = spi::SpiDeviceDriver<'static, &'static SpiDriver<'static>>;
 
 impl DisplayDevice {
     const MODULE: &'static str = "display";
@@ -106,10 +113,22 @@ impl DisplayDevice {
             FEATHER_SPI_MISO_PIN
         );
         FreeRtos::delay_ms(50);
-        deselect_spi_cs().context("failed to deselect TFT before SD init")?;
+        // Attach the TFT as an SPI device now rather than in `init_panel`:
+        // `spi_bus_add_device` configures GPIO7 as the device's CS and holds it
+        // inactive (high), which is exactly the "deselect TFT" state the
+        // microSD probe needs on the shared bus, without touching GPIO
+        // registers directly.
+        let cs = pool.take_gpio7(Self::MODULE).map_err(anyhow::Error::from)?;
+        let tft_spi = spi::SpiDeviceDriver::new(
+            driver,
+            Some(cs),
+            &spi::config::Config::new().baudrate(SPI_BAUD_MHZ.MHz().into()),
+        )
+        .context("failed to initialize SPI device for TFT")?;
         Ok(Self {
             driver,
             _power,
+            tft_spi: Some(tft_spi),
             panel_claimed: false,
         })
     }
@@ -125,15 +144,15 @@ impl DisplayDevice {
         pool: &mut PinPool,
     ) -> anyhow::Result<
         InitializedPanel<
-            SPIInterfaceNoCS<
-                spi::SpiDeviceDriver<'static, &'static SpiDriver<'static>>,
-                PinDriver<'static, gpio::Gpio39, Output>,
-            >,
+            SPIInterfaceNoCS<TftSpiDevice, PinDriver<'static, gpio::Gpio39, Output>>,
             PinDriver<'static, gpio::Gpio40, Output>,
             PinDriver<'static, gpio::Gpio45, Output>,
         >,
     > {
-        let cs = pool.take_gpio7(Self::MODULE).map_err(anyhow::Error::from)?;
+        let tft_spi = self
+            .tft_spi
+            .take()
+            .context("TFT SPI device already consumed by a previous init_panel")?;
         let dc = pool
             .take_gpio39(Self::MODULE)
             .map_err(anyhow::Error::from)?;
@@ -145,12 +164,6 @@ impl DisplayDevice {
             .map_err(anyhow::Error::from)?;
         let button_pin = pool.take_gpio0(Self::MODULE).map_err(anyhow::Error::from)?;
 
-        let tft_spi = spi::SpiDeviceDriver::new(
-            self.driver,
-            Some(cs),
-            &spi::config::Config::new().baudrate(SPI_BAUD_MHZ.MHz().into()),
-        )
-        .context("failed to initialize SPI device for TFT")?;
         let dc = PinDriver::output(dc).context("failed to init TFT DC")?;
         let rst = PinDriver::output(rst).context("failed to init TFT RST")?;
         let backlight = PinDriver::output(bl).context("failed to init TFT backlight")?;
@@ -173,11 +186,12 @@ impl DisplayDevice {
     pub fn close(self, pool: &mut PinPool) {
         if self.panel_claimed {
             pool.release(BUTTON_PIN);
-            pool.release(CS_PIN);
             pool.release(DC_PIN);
             pool.release(RST_PIN);
             pool.release(BL_PIN);
         }
+        // CS is claimed in `init` (with the bus), not in `init_panel`.
+        pool.release(CS_PIN);
         pool.release(POWER_PIN);
         pool.release(FEATHER_SPI_SCK_PIN);
         pool.release(FEATHER_SPI_MOSI_PIN);
@@ -216,20 +230,6 @@ fn enable_power(
         .context("failed to enable TFT power rail")?;
     FreeRtos::delay_ms(10);
     Ok(power)
-}
-
-/// Drive the TFT chip-select high before another SPI device uses the shared bus.
-fn deselect_spi_cs() -> anyhow::Result<()> {
-    use esp_idf_svc::sys::{
-        GPIO_MODE_DEF_OUTPUT, gpio_reset_pin, gpio_set_direction, gpio_set_level,
-    };
-
-    esp_idf_svc::sys::esp!(unsafe {
-        gpio_reset_pin(CS_PIN);
-        gpio_set_direction(CS_PIN, GPIO_MODE_DEF_OUTPUT);
-        gpio_set_level(CS_PIN, 1)
-    })
-    .context("failed to deselect TFT SPI CS")
 }
 
 /// Application display pages shown by button rotation.
@@ -730,7 +730,9 @@ pub fn draw_page<D>(
             }
         }
         Page::Resources => {
+            // SAFETY: argument-free, side-effect-free heap statistics read.
             let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            // SAFETY: argument-free, side-effect-free heap statistics read.
             let min_heap = unsafe { esp_idf_svc::sys::esp_get_minimum_free_heap_size() };
             line("Page 3/6  RESOURCES".to_owned());
             if storage.mounted {
@@ -743,9 +745,15 @@ pub fn draw_page<D>(
                     format_human_bytes(storage.total_bytes)
                 ));
             } else {
-                let storage_part_bytes = unsafe {
-                    let p = esp_idf_svc::sys::esp_ota_get_running_partition();
-                    if p.is_null() { 0_u64 } else { (*p).size as u64 }
+                // SAFETY: argument-free lookup; returns a pointer into ESP-IDF's
+                // static partition table (or null), checked below.
+                let part = unsafe { esp_idf_svc::sys::esp_ota_get_running_partition() };
+                let storage_part_bytes = if part.is_null() {
+                    0_u64
+                } else {
+                    // SAFETY: non-null and points at a static table entry owned
+                    // by ESP-IDF for the life of the program.
+                    unsafe { (*part).size as u64 }
                 };
                 line(format!("SD: not mounted",));
                 line(format!(

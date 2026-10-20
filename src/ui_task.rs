@@ -162,6 +162,7 @@ impl UiTaskHandle {
     /// - `battery`: Detected fuel gauge, if any, for periodic sampling.
     /// - `rtc`: Boot-time RTC probe result.
     /// - `backlight_on_state`: Backlight level that represents the panel-on state.
+    /// - `network`: Shared Wi-Fi handle for reading the STA address on the Network page.
     ///
     /// # Returns
     /// - `Ok(UiTaskHandle)` when the UI thread starts successfully.
@@ -175,6 +176,7 @@ impl UiTaskHandle {
         battery: BatteryDevice,
         rtc: rtc::RtcDevice,
         backlight_on_state: BacklightState,
+        network: wifi::SharedWifi,
     ) -> anyhow::Result<Self>
     where
         DI: display_interface::WriteOnlyDataCommand + Send + 'static,
@@ -213,6 +215,7 @@ impl UiTaskHandle {
                     battery,
                     rtc,
                     backlight_on_state,
+                    &network,
                 );
             })
             .context("failed to spawn UI task")?;
@@ -242,9 +245,11 @@ impl UiTaskHandle {
 /// - `battery`: Detected fuel gauge, if any.
 /// - `rtc`: Boot-time RTC probe result.
 /// - `backlight_on_state`: Backlight level representing panel-on.
+/// - `network`: Shared Wi-Fi handle for the Network page's IP/gateway readout.
 ///
 /// # Returns
 /// - Never returns under normal operation (infinite UI loop).
+#[allow(clippy::too_many_arguments)]
 fn ui_task_main<DI, RST, BL, PinE>(
     feed: Arc<UiFeed>,
     display: &mut ST7789<DI, RST, BL>,
@@ -253,6 +258,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
     battery: BatteryDevice,
     rtc: rtc::RtcDevice,
     backlight_on_state: BacklightState,
+    network: &wifi::SharedWifi,
 ) where
     DI: display_interface::WriteOnlyDataCommand,
     RST: embedded_hal_02::digital::v2::OutputPin<Error = PinE>,
@@ -345,7 +351,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
 
         if screen_on && (force_redraw || (now_us - last_draw_us) >= DRAW_INTERVAL_US) {
             let (gps, pps_delta_us, ntp, storage, rtc) = feed.snapshot();
-            let network = wifi::read_network_snapshot();
+            let network = wifi::read_network_snapshot(network);
             let mut panel = display::make_panel(display);
             display::draw_page(
                 &mut panel,
@@ -378,5 +384,7 @@ fn ui_task_main<DI, RST, BL, PinE>(
 /// # Returns
 /// - Monotonic timestamp in microseconds since boot.
 fn monotonic_us() -> i64 {
+    // SAFETY: plain FFI read of the 64-bit high-resolution timer; no
+    // preconditions and safe from any task context.
     unsafe { esp_idf_svc::sys::esp_timer_get_time() }
 }

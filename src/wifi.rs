@@ -1,14 +1,23 @@
 //! Wi-Fi station credential loading and connection helpers.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, anyhow, bail};
 use core::convert::TryInto;
-use embedded_svc::ipv4::Ipv4Addr;
 use esp_idf_svc::eventloop::{EspSystemEventLoop, EspSystemSubscription};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration, EspWifi, WifiEvent,
 };
+
+/// Wi-Fi driver handle shared between the boot keep-alive, the UI task (IP
+/// display) and the reconnect event handler.
+///
+/// Lock discipline: holders must not block on Wi-Fi *events* while holding the
+/// lock (no `BlockingWifi::connect`/`wait_*`), because the reconnect handler
+/// runs on the system event task and takes the same lock.
+pub type SharedWifi = Arc<Mutex<BlockingWifi<EspWifi<'static>>>>;
 
 /// STA IP, gateway, hostname, and SSID for the Network display page.
 #[derive(Debug, Clone)]
@@ -42,28 +51,19 @@ fn compile_time_ssid() -> String {
         .to_owned()
 }
 
-/// Read the current STA interface addresses from the ESP-IDF netif layer.
-pub fn read_network_snapshot() -> NetworkSnapshot {
+/// Read the current STA interface addresses from the Wi-Fi driver's netif.
+///
+/// Falls back to the `"n/a"` defaults when the lock is poisoned or the netif
+/// has no address yet (e.g. mid-reconnect); the display simply shows `n/a`.
+pub fn read_network_snapshot(wifi: &SharedWifi) -> NetworkSnapshot {
     let mut snap = NetworkSnapshot::default();
-
-    #[cfg(target_os = "espidf")]
-    unsafe {
-        use esp_idf_svc::sys::{
-            esp_netif_get_handle_from_ifkey, esp_netif_get_ip_info, esp_netif_ip_info_t,
-        };
-
-        let netif = esp_netif_get_handle_from_ifkey(c"WIFI_STA_DEF".as_ptr());
-        if netif.is_null() {
-            return snap;
-        }
-        let mut ip_info = esp_netif_ip_info_t::default();
-        if esp_netif_get_ip_info(netif, &mut ip_info) != 0 {
-            return snap;
-        }
-        snap.ip = Ipv4Addr::from(ip_info.ip.addr.to_le_bytes()).to_string();
-        snap.gateway = Ipv4Addr::from(ip_info.gw.addr.to_le_bytes()).to_string();
+    let Ok(guard) = wifi.lock() else {
+        return snap;
+    };
+    if let Ok(ip_info) = guard.wifi().sta_netif().get_ip_info() {
+        snap.ip = ip_info.ip.to_string();
+        snap.gateway = ip_info.subnet.gateway.to_string();
     }
-
     snap
 }
 
@@ -111,19 +111,16 @@ pub fn load_wifi_credentials_from_env() -> anyhow::Result<WifiCredentials> {
 /// - `creds`: Wi-Fi credentials to apply.
 ///
 /// # Returns
-/// - `Ok((BlockingWifi<EspWifi<'static>>, EspSystemSubscription))` when the station
-///   link is up with DHCP info. The subscription drives automatic reconnect and
-///   MUST be kept alive for the firmware lifetime.
+/// - `Ok((SharedWifi, EspSystemSubscription))` when the station link is up
+///   with DHCP info. The subscription drives automatic reconnect and MUST be
+///   kept alive for the firmware lifetime.
 /// - `Err` when setup, connect, or netif readiness fails.
 pub fn connect_wifi_sta(
     modem: Modem,
     sys_loop: EspSystemEventLoop,
     nvs: EspDefaultNvsPartition,
     creds: &WifiCredentials,
-) -> anyhow::Result<(
-    BlockingWifi<EspWifi<'static>>,
-    EspSystemSubscription<'static>,
-)> {
+) -> anyhow::Result<(SharedWifi, EspSystemSubscription<'static>)> {
     // Clone the loop before it is moved into the driver so the reconnect handler
     // can subscribe to the same event source after the initial connection is up.
     let reconnect_loop = sys_loop.clone();
@@ -164,6 +161,8 @@ pub fn connect_wifi_sta(
     // The default (WIFI_PS_MIN_MODEM) buffers incoming packets at the AP for
     // up to ~100 ms, which dominates NTP response latency.
     // WIFI_PS_NONE = 0 per esp-idf wifi_ps_type_t enum.
+    // SAFETY: the Wi-Fi driver has been initialised by `EspWifi::new` above;
+    // `esp_wifi_set_ps` takes a plain enum value and has no pointer arguments.
     #[cfg(target_os = "espidf")]
     esp_idf_svc::sys::esp!(unsafe {
         esp_idf_svc::sys::esp_wifi_set_ps(esp_idf_svc::sys::wifi_ps_type_t_WIFI_PS_NONE)
@@ -183,7 +182,8 @@ pub fn connect_wifi_sta(
 
     // Subscribe only after the initial connection succeeds so the handler does
     // not race the blocking connect sequence during boot.
-    let reconnect = subscribe_wifi_reconnect(&reconnect_loop)?;
+    let wifi: SharedWifi = Arc::new(Mutex::new(wifi));
+    let reconnect = subscribe_wifi_reconnect(&reconnect_loop, Arc::clone(&wifi))?;
 
     Ok((wifi, reconnect))
 }
@@ -198,6 +198,7 @@ pub fn connect_wifi_sta(
 ///
 /// # Parameters
 /// - `sys_loop`: System event loop the Wi-Fi driver posts events on.
+/// - `wifi`: Shared driver handle used to re-issue the connect request.
 ///
 /// # Returns
 /// - `Ok(EspSystemSubscription)` that MUST be kept alive for the handler to run;
@@ -205,14 +206,22 @@ pub fn connect_wifi_sta(
 /// - `Err` when the event subscription cannot be registered.
 fn subscribe_wifi_reconnect(
     sys_loop: &EspSystemEventLoop,
+    wifi: SharedWifi,
 ) -> anyhow::Result<EspSystemSubscription<'static>> {
     sys_loop
-        .subscribe::<WifiEvent, _>(|event| {
+        .subscribe::<WifiEvent, _>(move |event| {
             if let WifiEvent::StaDisconnected(_) = event {
                 log::warn!("Wi-Fi: STA disconnected; re-initiating association");
-                let err = unsafe { esp_idf_svc::sys::esp_wifi_connect() };
-                if err != esp_idf_svc::sys::ESP_OK as i32 {
-                    log::warn!("Wi-Fi: esp_wifi_connect() failed (err={err})");
+                // This handler runs on the system event task, so it must use
+                // the non-blocking `EspWifi::connect` (via `wifi_mut()`), never
+                // `BlockingWifi::connect`, which would wait on an event that
+                // this very task has to deliver.
+                let result = match wifi.lock() {
+                    Ok(mut guard) => guard.wifi_mut().connect(),
+                    Err(poisoned) => poisoned.into_inner().wifi_mut().connect(),
+                };
+                if let Err(err) = result {
+                    log::warn!("Wi-Fi: reconnect request failed: {err}");
                 }
             }
         })

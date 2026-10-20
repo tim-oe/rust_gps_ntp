@@ -47,7 +47,7 @@ GPS NMEA + PPS.
 - [x] Model-driven root delay (0, hardware reference) and root dispersion
   (`max(jitter, 100 µs) + PHI×age` — RFC 5905 §11.1, PHI = 15 ppm)
 - [x] Reference timestamp set to last PPS discipline event (RFC 5905 §7.3)
-- [x] Mode-6 correctness: `ClkSrc=4` (GPS/RFC 1305 Table F-2), peer `sel=6`,
+- [x] Mode-6 correctness: `ClkSrc=4` (GPS/RFC 1305 B.2.1), peer `sel=6`,
   expanded `READVAR` system and peer variables
 
 ### M5 — Robustness and service protection

@@ -25,6 +25,8 @@ pub mod logging;
 #[cfg(target_os = "espidf")]
 pub mod pins;
 #[cfg(target_os = "espidf")]
+pub mod sdlog;
+#[cfg(target_os = "espidf")]
 pub mod storage;
 #[cfg(target_os = "espidf")]
 pub mod ui_task;

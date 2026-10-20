@@ -88,6 +88,8 @@ fn vfs_fat_usage(path: &str) -> Option<(u64, u64)> {
     let c_path = CString::new(path).ok()?;
     let mut total_bytes = 0_u64;
     let mut free_bytes = 0_u64;
+    // SAFETY: `c_path` is a valid NUL-terminated path that outlives the call,
+    // and both out-parameters are live `u64`s matching the FFI signature.
     let rc = unsafe {
         esp_idf_svc::sys::esp_vfs_fat_info(c_path.as_ptr(), &mut total_bytes, &mut free_bytes)
     };

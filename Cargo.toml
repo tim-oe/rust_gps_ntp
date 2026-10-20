@@ -37,3 +37,13 @@ harness = false
 name = "ntp_poll"
 harness = false
 required-features = ["bench"]
+
+# Unsafe-code discipline. Every `unsafe` block is an FFI call into ESP-IDF;
+# each must carry a `// SAFETY:` comment stating why the C preconditions hold,
+# and clippy fails the build if one is missing. Applies to all targets.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "warn"

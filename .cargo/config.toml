@@ -1,5 +1,9 @@
 [build]
 target = "xtensa-esp32s3-espidf"
+# Floor for a 4GB Pi with no swap. Bare `cargo` stays at one compiler.
+# `just` raises CARGO_BUILD_JOBS from MemTotal when the machine has the RAM
+# (see scripts/build-jobs.sh), which overrides this.
+jobs = 1
 
 [unstable]
 build-std = ["std", "panic_abort"]
@@ -10,3 +14,9 @@ runner = "espflash flash --monitor /dev/ttyACM0"
 
 [env]
 ESP_IDF_SDKCONFIG_DEFAULTS = "sdkconfig.defaults"
+# Floor for the ESP-IDF C build when cmake does not join Cargo's jobserver
+# (Ninja). On a Pi, ESP-IDF uses Makefiles and shares CARGO_BUILD_JOBS.
+# `just` exports a higher NUM_JOBS on machines that can afford it; Cargo
+# does not override a variable that is already set.
+NUM_JOBS = "1"
+CMAKE_BUILD_PARALLEL_LEVEL = "1"

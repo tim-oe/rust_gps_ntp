@@ -35,27 +35,9 @@ fn main() {
     println!("cargo::rustc-env=NTP_ACL_CIDR={acl_cidr}");
 }
 
-/// Parse `a.b.c.d/prefix` (prefix 0–32). Returns `None` for empty/invalid input.
-fn parse_ipv4_cidr(s: &str) -> Option<(u8, u8, u8, u8, u8)> {
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
-    }
-    let (addr, prefix) = s.split_once('/')?;
-    let prefix: u8 = prefix.parse().ok()?;
-    if prefix > 32 {
-        return None;
-    }
-    let mut octets = addr.split('.');
-    let a: u8 = octets.next()?.parse().ok()?;
-    let b: u8 = octets.next()?.parse().ok()?;
-    let c: u8 = octets.next()?.parse().ok()?;
-    let d: u8 = octets.next()?.parse().ok()?;
-    if octets.next().is_some() {
-        return None;
-    }
-    Some((a, b, c, d, prefix))
-}
+// Same parser the firmware uses at runtime (src/ntp/protection.rs), so the
+// compile-time validation and the runtime ACL agree on what is accepted.
+include!("src/ntp/cidr_parse.rs");
 
 /// Parse a quoted string value from a Kconfig-style `sdkconfig.defaults` file.
 /// Returns `None` if the key is absent or the file cannot be read.

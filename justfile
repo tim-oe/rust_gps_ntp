@@ -1,5 +1,21 @@
 set shell := ["bash", "-cu"]
 
+# Cap compilers from physical RAM so a 4GB Pi without swap is not OOM-killed.
+# .cargo/config.toml floors this at 1; these exports raise it when RAM allows.
+# Override any of them in the environment when you have the headroom.
+build_jobs := env_var_or_default("CARGO_BUILD_JOBS", `bash scripts/build-jobs.sh`)
+export CARGO_BUILD_JOBS := build_jobs
+export NUM_JOBS := env_var_or_default("NUM_JOBS", build_jobs)
+export CMAKE_BUILD_PARALLEL_LEVEL := env_var_or_default("CMAKE_BUILD_PARALLEL_LEVEL", build_jobs)
+
+# Always build into the repo's own target dir. Sandboxed agent shells export
+# CARGO_TARGET_DIR under /tmp, which is a tmpfs on the Pi: that puts every
+# artifact in RAM and, because embuild derives its ESP-IDF cache location from
+# the target dir, re-downloads and rebuilds ESP-IDF (~6GB) per session instead
+# of reusing ./target and ./.embuild on disk. Env vars beat .cargo/config.toml,
+# so this must be set here rather than as `build.target-dir`.
+export CARGO_TARGET_DIR := justfile_directory() + "/target"
+
 port := "/dev/ttyACM0"
 chip := "esp32s3"
 esp_export := "$HOME/.cargo/export-esp.sh"
@@ -14,7 +30,9 @@ coverage_min_functions := "90"
 coverage_min_regions := "90"
 
 coverage_llvm_cov_run := "cargo llvm-cov --target " + host_target + " --no-report"
-coverage_llvm_cov_report := "cargo llvm-cov report --target " + host_target + " --ignore-filename-regex 'src/main\\.rs$'"
+# Exclude the binary entry point and the test modules themselves (src/**/tests.rs)
+# so the gate measures production code exercised by tests, not test code.
+coverage_llvm_cov_report := "cargo llvm-cov report --target " + host_target + " --ignore-filename-regex 'src/main\\.rs$|/tests\\.rs$'"
 coverage_llvm_cov_gate := coverage_llvm_cov_report + " --summary-only --fail-under-lines " + coverage_min_lines + " --fail-under-functions " + coverage_min_functions + " --fail-under-regions " + coverage_min_regions
 
 # List available recipes.

@@ -17,9 +17,9 @@ GPS-disciplined Stratum-1 NTP server firmware written in Rust for the ESP32-S3 p
 | Root delay for primary reference | [RFC 5905 §6 – Data Types (rootdelay = 0 for hardware reference)](https://www.rfc-editor.org/rfc/rfc5905#section-6) |
 | Reference Timestamp semantics | [RFC 5905 §7.3 – Packet Header Variables](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
 | Leap indicator and stratum encoding | [RFC 5905 §7.3 – Packet Header Variables](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
-| NTP mode-6 control protocol | [RFC 1305 §3.2 – Control Messages](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) · [ntpq reference](https://www.ntp.org/documentation/4.2.8-series/ntpq/) |
-| Mode-6 status word and variable encoding | [RFC 1305 §3.2.1-3.2.2 – System/Peer Status Words and Variable Sets](https://www.rfc-editor.org/rfc/rfc1305#section-3.2) |
-| Clock source codes (ClkSrc field) | [RFC 1305 Table F-2 – Clock Source Codes (4 = UHF/GPS)](https://www.rfc-editor.org/rfc/rfc1305#appendix-F) |
+| NTP mode-6 control protocol | [RFC 1305 Appendix B – NTP Control Messages](https://www.rfc-editor.org/rfc/rfc1305#appendix-B) · [ntpq reference](https://www.ntp.org/documentation/4.2.8-series/ntpq/) |
+| Mode-6 status words (system, peer, error) | [RFC 1305 B.2 – Status Words](https://www.rfc-editor.org/rfc/rfc1305#appendix-B) (B.2.1 system incl. clock-source codes, B.2.2 peer, B.2.4 error) |
+| Mode-6 opcodes | [RFC 1305 B.3 – Commands](https://www.rfc-editor.org/rfc/rfc1305#appendix-B) (READSTAT = 1, READVAR = 2) |
 | Kiss-o'-Death (KoD) responses | [RFC 5905 §7.4 – Kiss-o'-Death (KoD) Packet](https://www.rfc-editor.org/rfc/rfc5905#section-7.4) |
 | RFC 1918 private address ranges | [RFC 1918 – Address Allocation for Private Internets](https://www.rfc-editor.org/rfc/rfc1918) |
 | Leap indicator semantics | [RFC 5905 §7.3 – Packet Header Variables (LI field)](https://www.rfc-editor.org/rfc/rfc5905#section-7.3) |
@@ -65,7 +65,9 @@ src/
 ├── pps.rs          # PpsDevice: GPIO ISR capture, PpsEvent polling
 ├── ntp/
 │   ├── mod.rs          # NTPv4 server, clock discipline, mode-6 diagnostics
-│   └── protection.rs   # per-client rate limiter and IP ACL
+│   ├── protection.rs   # per-client rate limiter and IP ACL
+│   └── cidr_parse.rs   # parse_ipv4_cidr, include!d by protection.rs and build.rs
+│   (each host-testable module keeps its tests in <module>/tests.rs)
 ├── display.rs      # DisplayDevice: ST7789 TFT, shared SPI bus, panel init
 ├── storage.rs      # StorageDevice: Adalogger microSD on shared SPI
 ├── rtc.rs          # PCF8523 RTC on Feather I2C
@@ -73,7 +75,8 @@ src/
 ├── timezone.rs     # IANA timezone resolution, NVS cache, HTTP worker
 ├── ui_task.rs      # FreeRTOS task for display, button, battery sampling
 ├── wifi.rs         # Wi-Fi STA connection using esp-idf-svc
-└── logging.rs      # esp-idf logging init, boot-test flag
+├── logging.rs      # esp-idf logging init, boot-test flag
+└── sdlog.rs        # mirrors info+ log records to /sdcard/gps-ntp.log
 ```
 
 ### Data Flow
@@ -191,30 +194,57 @@ A valid interval is defined as `800_000 µs ≤ interval ≤ 1_200_000 µs` (±2
 **Relevant specs:**
 - [RFC 5905 – Network Time Protocol Version 4](https://www.rfc-editor.org/rfc/rfc5905)
 - [RFC 5905 §11 – Clock Discipline Procedures](https://www.rfc-editor.org/rfc/rfc5905#section-11)
-- [RFC 1305 §3.2 – Mode-6 Control Messages](https://www.rfc-editor.org/rfc/rfc1305#section-3.2)
+- [RFC 1305 Appendix B – Mode-6 Control Messages](https://www.rfc-editor.org/rfc/rfc1305#appendix-B)
 - [D. L. Mills, "Internet Time Synchronization: the Network Time Protocol", IEEE Trans. Comm. 1991](https://www.eecis.udel.edu/~mills/database/papers/trans.pdf)
 
 #### Clock Discipline and PLL Servo
 
 The clock discipline is a simplified type-2 PLL/FLL hybrid ([RFC 5905 §11](https://www.rfc-editor.org/rfc/rfc5905#section-11), Mills 1991) operating on two inputs:
 
-1. **GPS UTC seconds** (from RMC, ~1 Hz): Sets or re-anchors the monotonic-to-UTC mapping. Re-anchoring only occurs when the predicted UTC diverges by more than 1 second, avoiding unnecessary jumps.
+1. **GPS UTC seconds** (from RMC, ~1 Hz): Establishes the monotonic-to-UTC mapping before PPS lock and, once locked, supplies the integer second that each PPS edge is cross-checked against (see *Integer-second accounting* below).
 2. **PPS interval** (from GPIO ISR, 1 Hz): Runs the full servo on each valid pulse.
 
 **Servo update on each PPS pulse** (interval `I` in microseconds):
 
 ```
-phase_error_us = I − 1_000_000
+interval_error_us = I − 1_000_000        // µs over one second ≡ ppm
 
-// Proportional path: nudge the anchor's monotonic reference
-anchor.monotonic_us = pulse_edge_us − (phase_error_us × Kp)
+// Frequency estimate: EWMA of the per-second interval error.  The error is a
+// direct measurement of the oscillator offset, so it is blended toward the
+// measurement rather than integrated (an integrator has no feedback term and
+// grows without bound on a constant offset).
+freq_ppm += (interval_error_us − freq_ppm) × Ki
+freq_ppm  = clamp(freq_ppm, −500, +500)
 
-// Integral path: accumulate oscillator frequency estimate
-freq_ppm += phase_error_us × Ki
-freq_ppm = clamp(freq_ppm, −500, +500)
+// Phase: re-anchor at this edge, nudged by a fraction of the interval error
+anchor.monotonic_us = pulse_edge_us − (interval_error_us × Kp)
 ```
 
-Constants: `Kp = 0.1`, `Ki = 0.01`. Positive `freq_ppm` means the monotonic oscillator runs fast relative to GPS.
+Constants: `Kp = 0.1`, `Ki = 0.01` (≈100-pulse time constant). Positive `freq_ppm` means the monotonic oscillator runs fast relative to GPS.
+
+**Integer-second accounting.** The anchor's UTC second is never advanced by a fixed +1 per pulse, because pulses are legitimately skipped: a main-loop stall collapses two ISR edges into one ~2 s interval that the ±20% range filter rejects, and the outlier guard drops single bad edges. On each accepted pulse the servo instead:
+
+```
+elapsed_secs = round(freq_corrected(edge_us − anchor.monotonic_us) / 1 s)
+predicted    = anchor.unix_seconds + elapsed_secs
+
+// GPS second for this edge, derived from the NMEA *parse time* t_nmea of the
+// latest sentence (UTC = N) so the mapping survives late-processed edges and
+// dropped sentences:
+gps_second   = N + floor((edge_us − t_nmea) / 1 s) + NMEA_PPS_FUDGE_S   // if fresh (< 2 s)
+
+// A disagreement is acted on only when the same delta is seen on two
+// consecutive accepted pulses:
+anchor.unix_seconds = gps_second if fresh && gps_second ≠ predicted
+                                    && pending == gps_second − predicted
+                      else predicted
+```
+
+The two-pulse confirmation exists because the sentence↔edge pairing is ambiguous after a main-loop stall: if the sentence for second *N* is only parsed after edge *N+1* has fired, `floor((edge_us − t_nmea) / 1 s)` is −1 and `gps_second` reads one low for exactly that pulse. Without confirmation this produced a −1 step immediately followed by a +1 step (observed in the field roughly every 100 s). The first disagreeing pulse is logged at `info` with the "NMEA lead" (`edge_us − t_nmea`; negative means the sentence was parsed after the edge, the stall signature); a confirmed step is logged at `warn` and counted in `anchor_step_count` (exposed in `NtpSnapshot`). A coalesced PPS interval (outside 0.8–1.2 s, i.e. the loop did not run for over a second) is also logged at `warn`.
+
+This is also how a positive leap second is handled: NMEA `23:59:60` fails to parse, the pulse count runs one ahead, and the post-leap sentences pull the anchor back on the second confirming pulse (served time is one second fast for two seconds after the event; clients were already warned through the LI bits).
+
+Before the first PPS pulse the anchor is simply the NMEA second at its parse time (no fudge). That estimate is a few hundred milliseconds late and is served at stratum 16; the fudge describes the *edge*↔sentence relationship and is only applied once an edge timestamp exists.
 
 **Frequency-corrected timestamps**: elapsed monotonic time is scaled before computing sub-second fractions:
 
@@ -228,17 +258,19 @@ This removes accumulated oscillator drift between PPS pulses, improving timestam
 
 When PPS pulses stop arriving, the server enters holdover and continues serving time from the last known anchor with growing uncertainty ([RFC 5905 §11.1](https://www.rfc-editor.org/rfc/rfc5905#section-11.1)):
 
-| PPS age | State | Stratum | Root dispersion |
+| PPS age | State | Stratum (internal / on wire) | Root dispersion |
 |---|---|---|---|
-| < 10 s | `Locked` | 1 | `max(jitter, 0.1 ms) + PHI × age` |
-| 10 s – ~33 min | `Holdover` | 1 | 1 ms + 0.5 ms/s |
-| > ~33 min (disp ≥ 1 s) | `Unsync` | 16 | capped at 2 s |
+| < 10 s, GPS fix | `Locked` | 1 / 1 | `max(jitter, 0.1 ms) + PHI × age` |
+| < 10 s, GPS fix lost | `Holdover` | 1 / 1 | 1 ms |
+| 10 s – ~33 min | `Holdover` | 1 / 1 | 1 ms + 0.5 ms/s |
+| > ~33 min (disp ≥ 1 s) | `Unsync` | 16 / 0 | capped at 2 s |
 
+- **Entry condition**: holdover requires an anchor that was PPS-disciplined at least once (`pps_locked`). An RTC-seeded or NMEA-only anchor is served at stratum 16 regardless of age.
 - **Dispersion growth rate**: 0.5 ms/s (`HOLDOVER_DISP_RATE_US_PER_SEC = 500 µs/s`). After 60 s in holdover the dispersion is ≈31 ms; clients can decide whether to trust it based on their own `maxdist` policy.
-- **Stratum demotion threshold**: 1 s of root dispersion triggers `stratum=16` and `LI=11` (alarm), consistent with RFC 5905 §11.1.
+- **Stratum demotion threshold**: 1 s of root dispersion (`HOLDOVER_UNSYNC_US`, reached ≈1998 s after holdover entry) triggers `stratum=16` and `LI=11` (alarm), consistent with RFC 5905 §11.1.
 - **Recovery**: stratum returns to 1 immediately upon the next valid PPS pulse.
 
-The `DisciplineState` enum (`Locked` / `Holdover` / `Unsync`) is published via `NtpSnapshot` to the display task.
+`discipline_params` computes stratum and `DisciplineState` together from one rule, so the UI state and the wire stratum cannot disagree. The `DisciplineState` enum (`Locked` / `Holdover` / `Unsync`) is published via `NtpSnapshot` to the display task.
 
 #### NTP Timestamp Format
 
@@ -269,7 +301,18 @@ Where:
 
 This gives a dispersion that shrinks to the jitter floor just after each PPS pulse and grows by at most 15 µs before the next one. A typical locked value is 100–300 µs (vs. the old fixed 1 ms).
 
-**Reference timestamp** ([RFC 5905 §7.3](https://www.rfc-editor.org/rfc/rfc5905#section-7.3)): The NTP timestamp of the most recent PPS discipline event, stored in `last_sync_ntp_ts`. This is the correct value per the RFC ("time when the system clock was last set or corrected"). Between PPS pulses the field stays fixed, so clients can observe reference aging as `current_time − reference_timestamp`. Previously this was incorrectly set to the current receive time on every request.
+**Reference timestamp** ([RFC 5905 §7.3](https://www.rfc-editor.org/rfc/rfc5905#section-7.3)): The disciplined NTP time of the most recent accepted PPS edge (the top of its UTC second), stored in `last_sync_ntp_ts`. This is the value the RFC describes ("time when the system clock was last set or corrected"). Between PPS pulses the field stays fixed, so clients can observe reference aging as `current_time − reference_timestamp`.
+
+#### Mode Dispatch (`poll`)
+
+Per [RFC 5905 §9.2](https://www.rfc-editor.org/rfc/rfc5905#section-9.2) Table 10 only packets that constitute a request are answered:
+
+- **Mode 3 (client)** → reply mode 4 (server).
+- **Mode 1 (symmetric active)** → reply mode 2 (symmetric passive) without mobilising an association, matching ntpd's `nopeer` behaviour.
+- **Mode 6 (control)** → mode-6 response (see *Mode-6 Diagnostics*).
+- **Modes 0, 2, 4, 5, 7** are discarded silently. Answering a mode-4 packet would let a spoofed source bounce replies between two servers indefinitely.
+
+KoD RATE responses carry the same reply mode as a normal reply would.
 
 #### Packet Building (`build_response`)
 
@@ -277,13 +320,13 @@ Standard mode-3 client → mode-4 server exchange per [RFC 5905 §7.3](https://w
 
 | Byte offset | Field | Value (synced) |
 |---|---|---|
-| 0 | LI/VN/Mode | LI=0, VN mirrored from client, Mode=4 |
-| 1 | Stratum | 1 (GPS primary reference) or 16 (unsync) |
+| 0 | LI/VN/Mode | LI=0, VN mirrored from client, Mode=4 (or 2 for a mode-1 request) |
+| 1 | Stratum | 1 (GPS primary reference) or 0 when unsynchronised (RFC 5905 §7.3: internal stratum 16 is transmitted as 0) |
 | 2 | Poll | mirrored from client |
-| 3 | Precision | log2(seconds) from `max(jitter, 100 µs, loop floor, proc delay)` (typically −11…−13 when synced) |
+| 3 | Precision | log2(seconds) from `max(jitter, 100 µs, loop floor, proc delay)` (typically −11…−13 when synced). RFC 5905 §7.3 defines this as the clock's *resolution*; we deliberately report the coarser *effective* precision (timestamp jitter plus the ~1 ms poll-loop quantum), which is what clients use when weighting this server, so advertising the 1 µs timer resolution would overstate quality |
 | 4–7 | Root Delay | 0 (hardware reference, per RFC 5905 §6) |
 | 8–11 | Root Dispersion | model-driven: `max(jitter, 100 µs) + PHI × age` |
-| 12–15 | Reference ID | `GPS\0` (stratum 1) or `INIT` (stratum 16) |
+| 12–15 | Reference ID | `GPS\0` (stratum 1) or `INIT` (unsynchronised; LI=3 distinguishes this from a KoD, whose refid is `RATE`) |
 | 16–23 | Reference Timestamp | `last_sync_ntp_ts` (time of last PPS discipline event) |
 | 24–31 | Originate Timestamp | client transmit timestamp (echoed) |
 | 32–39 | Receive Timestamp | server receive timestamp |
@@ -291,11 +334,12 @@ Standard mode-3 client → mode-4 server exchange per [RFC 5905 §7.3](https://w
 
 #### Mode-6 Diagnostics
 
-**Relevant spec:** [RFC 1305 §3.2](https://www.rfc-editor.org/rfc/rfc1305#section-3.2)
+**Relevant spec:** [RFC 1305 Appendix B](https://www.rfc-editor.org/rfc/rfc1305#appendix-B)
 
 Mode-6 (control) packets from `ntpq` are answered with the following opcodes:
 
-- **READSTAT (op=1)**: Returns one pseudo-association entry. The system status word encodes `[LI:2][ClkSrc:6][EvtCode:4][EvtCnt:4]` per RFC 1305 §3.2.1, with `ClkSrc = 4` (UHF/GPS, per RFC 1305 Table F-2). The peer status word uses `sel = 6` (system peer), which causes `ntpq -p` to display the `*` tally mark.
+- **READSTAT (op=1, assoc=0)**: Returns one pseudo-association entry `(assoc id = 1, peer status)`. The header carries the system status word `[LI:2][ClkSrc:6][EvtCode:4][EvtCnt:4]` per RFC 1305 B.2.1, with `ClkSrc = 4` (UHF satellite radio). The peer status word uses `sel = 6` (system peer), which causes `ntpq -p` to display the `*` tally mark.
+- **READSTAT (op=1, assoc=1)**: Returns that association's peer status word in the header status field with no payload (RFC 1305 B.3).
 - **READVAR (op=2, assoc=0)**: System variables. When synced, includes:
 
   | Variable | Description |
@@ -323,17 +367,28 @@ Mode-6 (control) packets from `ntpq` are answered with the following opcodes:
   | `xleave` | interleave delay (always 0.000) |
   | `filtdelay`, `filtoffset`, `filtdisp` | last-sample filter values (no 8-entry ring buffer maintained) |
 
-**Status word encoding** (per RFC 1305 §3.2.1):
+**Status word encoding** (per RFC 1305 B.2):
 ```
 System status = (LI << 14) | (ClkSrc << 8) | (EvtCode << 4) | EvtCnt
-  LI     = 0 (no warning) when stratum=1, 3 (alarm) when stratum=16
+  LI     = pending leap indicator (0/1/2) when stratum=1, 3 (alarm) when stratum=16
   ClkSrc = 4 (UHF/GPS) when synced, 0 (unspecified) when unsynced
 
 Peer status = (Sel << 13) | (Config << 12) | (Reach << 9)
   Sel    = 6 (system peer, '*' in ntpq) when synced, 0 when not
   Config = 1 (always configured)
   Reach  = 1 when synced, 0 when not
+
+Error status = (Code << 8)            // replaces the status word when the E bit is set
+  Code 3 = invalid opcode, Code 4 = unknown association id (RFC 1305 B.2.4)
 ```
+
+The `leap=` text variable is the two-bit LI value in binary (`00`, `01`, `10`, `11`), matching `ntpq`.
+
+**Error handling and hygiene**:
+
+- Unknown opcodes and unknown association ids get an error response: response bit + error bit set, opcode and sequence echoed, error status word as above, no data.
+- Packets with the response bit (R) already set are dropped before rate limiting: they are replies, not requests, and answering them would allow reflection between two servers.
+- Mode-6 shares the per-client rate limiter with time requests but is silently dropped (no KoD) when limited, since a KoD is a 48-byte time-format packet that `ntpq` would not understand.
 
 #### Jitter and Delay Tracking
 
@@ -349,10 +404,10 @@ Both `pps_jitter_us` and `proc_delay_us` are maintained as exponentially weighte
 
 #### Per-Client Rate Limiter
 
-A fixed-size table of 32 `ClientRecord` entries tracks the last accepted monotonic timestamp per IPv4 source address. On each incoming 48-byte time request (modes 0–5, 7) or mode-6 control query:
+A fixed-size table of 32 `ClientRecord` entries tracks the last accepted monotonic timestamp per IPv4 source address. On each incoming 48-byte time request (mode 3 or mode 1) or mode-6 control query:
 
 1. Look up the source address in the table (O(32) linear scan).
-2. If found and `now − last_us < MIN_POLL_INTERVAL_US` (2 s): send a KoD RATE response for 48-byte modes, silently drop mode-6, increment `rate_limited_total`, and skip normal processing.
+2. If found and `now − last_us < MIN_POLL_INTERVAL_US` (2 s): send a KoD RATE response for time requests, silently drop mode-6, increment `rate_limited_total`, and skip normal processing.
 3. If found and interval is sufficient: update `last_us`, serve normally.
 4. If not found: add a new entry (evicting the oldest `last_us` when the table is full), serve normally.
 
@@ -360,13 +415,21 @@ Mode-6 (`ntpq`) queries share the same per-client limiter. When a mode-6
 request exceeds the interval the packet is silently dropped (no response) to
 avoid amplification; over-limit 48-byte requests receive a KoD RATE response instead.
 
+The limiter is keyed on IPv4 addresses only: IPv6 sources are not tracked and
+are never rate limited (the firmware binds an IPv4 socket, so this path is
+unreachable in practice but is noted for completeness). The 32-entry table
+means that more than 32 distinct clients polling inside one interval can evict
+each other and defeat the limit; the ACL is the primary defence against
+untrusted sources, and the limiter is a safety net against misbehaving LAN
+clients.
+
 #### Kiss-o'-Death (KoD) Response
 
 Per [RFC 5905 §7.4](https://www.rfc-editor.org/rfc/rfc5905#section-7.4), a KoD packet signals the client to stop polling:
 
 | Field | Value |
 |---|---|
-| LI / Mode | LI=3 (alarm), Mode=4 (server) |
+| LI / Mode | LI=3 (alarm), Mode=4 (server) or 2 for a mode-1 request |
 | Stratum | 0 (kiss packet) |
 | Reference ID | `RATE` (RFC 5905 Table 6 kiss code) |
 | Originate Timestamp | client's Transmit Timestamp (bytes 40–47) |
@@ -388,7 +451,7 @@ To configure the compile-time ACL (via `NTP_ACL_CIDR` in `build.rs`):
 
 ```rust
 // Applied automatically at boot by BoardBoot::init_ntp_server()
-NtpServer::apply_boot_acl(&mut server);
+server.apply_boot_acl();
 // Empty NTP_ACL_CIDR → RFC 1918 private networks; non-empty → that CIDR only
 ```
 
@@ -471,6 +534,8 @@ In normal operation (GPS outputs RMC at ~1 Hz, PPS fires ~1 s later) the guard i
 
 **Boot test:** On first boot, three horizontal RGB bands (red/green/blue) are drawn to verify panel visibility, followed by an 800 ms delay.
 
+**Shared SPI bus ordering:** The TFT shares SPI2 with the microSD socket. `DisplayDevice::init` attaches the ST7789 as an SPI device (hardware CS on GPIO 7) *before* storage probes the card; `spi_bus_add_device` parks CS inactive, so the TFT stays deselected during the SD probe without any direct GPIO register writes. `init_panel` later takes that device handle and wires DC/RST/backlight.
+
 ---
 
 ### `battery` – Fuel Gauge
@@ -551,9 +616,17 @@ The main loop sleeps 1 ms per iteration (`FreeRtos::delay_ms(1)`). At the defaul
 
 ---
 
+### `sdlog` – microSD Log Mirror
+
+`sdlog::install()` replaces `EspLogger::initialize_default()` at boot with a wrapper that forwards every record to the console unchanged and additionally queues `info`-and-above records (regardless of per-tag console overrides) as `"<uptime ms> <LEVEL> <target>: <message>"` lines, the same millisecond stamp the console prints. Once `board` has mounted the card it calls `sdlog::start_writer()`, a priority‑2 thread (below the UI task at 5 and the main task at 10) that drains the queue to `/sdcard/gps-ntp.log` every 5 s, opening and closing the file each time so lines survive a power pull. The file rotates to `gps-ntp.1.log` past 8 MiB. The queue is capped at 16 KiB; overflow is counted and reported as a single `dropped` line on the next flush rather than blocking the logging task. Logging call sites therefore never touch SPI or FAT, which matters because the main loop's PPS/NMEA pairing is sensitive to exactly the kind of stall a synchronous card write would cause. If no card is mounted the writer is not started and the queue simply saturates at its cap. When a card is mounted, `sdlog::start_http_server()` also brings up a read-only `EspHttpServer` on port 80 serving `/log` and `/log/1` as `text/plain`; downloads hold a `CARD_LOCK` that the writer checks with `try_lock`, deferring its flush rather than appending mid-transfer.
+
+---
+
 ### `wifi` – Wi-Fi STA
 
 Uses `esp_idf_svc::wifi::EspWifi` to connect to a WPA2 access point. Credentials are injected at compile time via environment variables (`WIFI_SSID`, `WIFI_PASS`) and stored in the firmware binary in plaintext. The SSID (not the password) is logged at boot. See [`docs/setup.md`](setup.md#security-considerations) for deployment guidance.
+
+After the initial blocking connect, the driver is wrapped in `SharedWifi` (`Arc<Mutex<BlockingWifi<EspWifi>>>`) and shared with two consumers: the system-event-loop handler that re-issues a **non-blocking** `EspWifi::connect` on `StaDisconnected`, and the UI task, which reads the STA IP/gateway via `sta_netif().get_ip_info()` for the Network page. Lock holders must never wait on Wi-Fi events while holding the mutex, since the reconnect handler runs on the event task that delivers them.
 
 ---
 
@@ -587,13 +660,21 @@ Host unit tests (`cargo test` or `just test`) cover pure modules:
 
 | Module | What is tested |
 |---|---|
-| `gps` | Checksum validation, RMC/GGA parsing, coordinate conversion, timezone DST rules |
-| `ntp` | Packet field layout, anchor establishment, PPS discipline, mode-6 responses, EWMA smoothing, timestamp math (epoch offset, fraction encoding, frequency correction), sync state transitions (Locked/Holdover/Unsync cycle), mode-6 framing and 32-bit alignment, originate-timestamp echo, VN mirroring |
-| `pps` | Delta computation, u64 wraparound safety, First/Delta event sequencing |
+| `gps` | Checksum validation (including non-ASCII rejection without panicking), RMC/GGA parsing (fix flag cleared by a `V` status with empty position), coordinate conversion, timezone DST rules |
+| `ntp` | Packet field layout (stratum 0 + LI=3 + `INIT` when unsynchronised), anchor establishment, PPS discipline (frequency-estimate convergence and boundedness, integer-second accounting across missed/rejected pulses, PPS outages, a leap second, and a late-parsed backlog sentence that must not step the anchor), holdover policy (stratum 1 through the 33 min window, 16 after; PPS-locked anchor required), mode dispatch (mode 3→4, 1→2, others discarded; short packets and mode-6 responses dropped), mode-6 responses (READSTAT summary and per-association, READVAR, error status words, two-bit leap text), EWMA smoothing, bit-exact timestamp math under a frozen test clock (epoch offset, fraction encoding, frequency correction, `clock=` text), sync state transitions (Locked/Holdover/Unsync cycle), mode-6 framing and 32-bit alignment, originate-timestamp echo, VN mirroring and clamping |
+| `ntp::protection` | ACL CIDR matching, rate-limiter interval boundary, LRU eviction (evicted client re-admitted, survivors still limited) |
+| `pps` | Delta computation, u64 wraparound safety, First/Delta event sequencing, coalescing of multiple edges between polls, seqlock consistency under a concurrent writer |
+| `rtc` | BCD codec, register encode/decode round trip (PCF8523 register order), range validation, Unix conversions |
 | `timezone` | JSON field extraction for Open-Meteo and GeoNames response shapes |
 | `battery` | MAX17048 and LC709203 register decoding arithmetic |
 
+Tests live beside their module as `src/<module>/tests.rs` (declared with `#[cfg(test)] mod tests;`) rather than inline, so the coverage gate in `just coverage` can exclude them (`--ignore-filename-regex 'src/main\.rs$|/tests\.rs$'`) and measure only production code. The `ntp` tests freeze the monotonic clock through a thread-local override (`test_clock::freeze`) where exact arithmetic matters; everything else uses the real clock with edge timestamps placed explicitly in the past.
+
 ESP-IDF target modules (`app`, `board`, `display`, `pins`, `storage`, `wifi`, `ui_task`, `logging`) are excluded from host builds via `#[cfg(target_os = "espidf")]`.
+
+### Unsafe code policy
+
+All `unsafe` in the firmware is FFI into ESP-IDF where `esp-idf-svc`/`esp-idf-hal` offer no safe wrapper (e.g. `esp_timer_get_time` for the ISR-shared timebase, `esp_wifi_set_ps`, heap/partition statistics, `subscribe_nonstatic` for the PPS ISR). Where a safe API exists it is used instead (netif IP info, `EspWifi::connect`, SPI device CS). `Cargo.toml` enforces this via `[lints]`: `clippy::undocumented_unsafe_blocks = "deny"` (every block needs a `// SAFETY:` comment), `clippy::multiple_unsafe_ops_per_block = "warn"` (one FFI call per block so each comment justifies exactly one operation), and `rust::unsafe_op_in_unsafe_fn = "warn"`. Run `cargo +esp clippy` to check the ESP-only modules, since host clippy never sees them.
 
 ## NTP Client Interoperability
 
