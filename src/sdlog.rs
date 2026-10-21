@@ -15,9 +15,11 @@
 //!
 //! [`start_http_server`] exposes the current and rotated files read-only at
 //! `http://<device>/log` and `/log/1` so a run can be collected over the LAN
-//! without pulling the card.  A single [`CARD_LOCK`] serialises the writer's
-//! appends with HTTP reads; the writer uses `try_lock` and simply defers a
-//! flush while a download is in progress.
+//! without pulling the card, and a `/files` page listing the card root with
+//! per-file delete (POST only, top-level files only, never the ready marker)
+//! for clearing out cruft.  A single [`CARD_LOCK`] serialises the writer's
+//! appends with HTTP reads and deletes; the writer uses `try_lock` and simply
+//! defers a flush while a request is in progress.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -61,6 +63,8 @@ const HTTP_CHUNK_BYTES: usize = 2048;
 
 /// Serialises card access between the writer thread and HTTP downloads.
 static CARD_LOCK: Mutex<()> = Mutex::new(());
+/// Upper bound on a `POST /files/delete` form body.
+const DELETE_BODY_MAX: usize = 512;
 
 struct Queue {
     lines: VecDeque<String>,
@@ -257,10 +261,18 @@ pub fn start_http_server() -> anyhow::Result<EspHttpServer<'static>> {
     server
         .fn_handler::<anyhow::Error, _>("/", Method::Get, |req| {
             let mut resp = req.into_response(200, None, &[("Content-Type", "text/plain")])?;
-            resp.write_all(b"rust_gps_ntp log mirror\n  /log    current\n  /log/1  rotated\n")?;
+            resp.write_all(
+                b"rust_gps_ntp log mirror\n  /log    current\n  /log/1  rotated\n  /files  card root listing (delete via form)\n",
+            )?;
             Ok(())
         })
         .context("route /")?;
+    server
+        .fn_handler::<anyhow::Error, _>("/files", Method::Get, serve_listing)
+        .context("route /files")?;
+    server
+        .fn_handler::<anyhow::Error, _>("/files/delete", Method::Post, handle_delete)
+        .context("route /files/delete")?;
     server
         .fn_handler::<anyhow::Error, _>("/log", Method::Get, |req| serve_file(req, LOG_PATH))
         .context("route /log")?;
@@ -302,5 +314,177 @@ fn serve_file(
         }
         resp.write_all(&buf[..n])?;
     }
+    Ok(())
+}
+
+/// Minimal HTML escaping for file names rendered into the listing page.
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// `GET /files`: HTML listing of the card root with a delete button per file.
+///
+/// Directories are listed but not deletable; the ready marker is listed as
+/// protected.  Deleting goes through `POST /files/delete` so a plain page
+/// load (or a link prefetch) can never remove anything.
+fn serve_listing(
+    req: embedded_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'_>>,
+) -> anyhow::Result<()> {
+    let _card = CARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut entries: Vec<(String, Option<u64>)> = Vec::new();
+    if let Ok(dir) = fs::read_dir(storage::MOUNT_POINT) {
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let size = entry
+                .metadata()
+                .ok()
+                .filter(|m| m.is_file())
+                .map(|m| m.len());
+            entries.push((name, size));
+        }
+    }
+    entries.sort();
+
+    let mut page = String::from(
+        "<!doctype html><title>SD card</title><style>body{font:14px monospace}td{padding:2px 10px}</style><h2>/sdcard</h2><table>",
+    );
+    let marker_name = storage::READY_MARKER.rsplit('/').next().unwrap_or_default();
+    for (name, size) in &entries {
+        let escaped = html_escape(name);
+        let _ = write!(page, "<tr><td>{escaped}</td>");
+        match size {
+            None => {
+                let _ = write!(page, "<td>dir</td><td></td></tr>");
+            }
+            Some(_) if name == marker_name => {
+                let _ = write!(
+                    page,
+                    "<td>{}</td><td>protected</td></tr>",
+                    size.unwrap_or(0)
+                );
+            }
+            Some(bytes) => {
+                let _ = write!(
+                    page,
+                    "<td>{bytes}</td><td><form method=post action=/files/delete style=\"display:inline\"><input type=hidden name=name value=\"{escaped}\"><button onclick=\"return confirm('Delete {escaped}?')\">delete</button></form></td></tr>"
+                );
+            }
+        }
+    }
+    let _ = write!(
+        page,
+        "</table><p>{} entries. Logs: <a href=/log>/log</a> <a href=/log/1>/log/1</a></p>",
+        entries.len()
+    );
+    drop(_card);
+    let mut resp = req.into_response(200, None, &[("Content-Type", "text/html; charset=utf-8")])?;
+    resp.write_all(page.as_bytes())?;
+    Ok(())
+}
+
+/// Decode an `application/x-www-form-urlencoded` value (`+` and `%XX`).
+fn form_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &raw[i + 1..i + 3];
+                match u8::from_str_radix(hex, 16) {
+                    Ok(v) => {
+                        out.push(v);
+                        i += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `POST /files/delete` with body `name=<file>`: remove one top-level file.
+///
+/// Rejects anything containing a path separator or `..`, directories, and the
+/// ready marker.  Responds with a redirect back to `/files` on success so the
+/// browser shows the updated listing.
+fn handle_delete(
+    mut req: embedded_svc::http::server::Request<
+        &mut esp_idf_svc::http::server::EspHttpConnection<'_>,
+    >,
+) -> anyhow::Result<()> {
+    let mut body = Vec::new();
+    let mut chunk = [0_u8; 128];
+    loop {
+        let n = req.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if body.len() > DELETE_BODY_MAX {
+            return respond_text(req, 413, "body too large\n");
+        }
+    }
+    let body = String::from_utf8_lossy(&body);
+    let Some(name) = body
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "name")
+        .map(|(_, v)| form_decode(v))
+    else {
+        return respond_text(req, 400, "missing name\n");
+    };
+    let marker_name = storage::READY_MARKER.rsplit('/').next().unwrap_or_default();
+    if name.is_empty() || name.contains(['/', '\\']) || name.contains("..") || name == marker_name {
+        return respond_text(req, 400, "refused\n");
+    }
+    let path = format!("{}/{name}", storage::MOUNT_POINT);
+    let result = {
+        let _card = CARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        match fs::metadata(&path) {
+            Ok(m) if m.is_file() => fs::remove_file(&path).map(|()| true),
+            Ok(_) => Ok(false),
+            Err(e) => Err(e),
+        }
+    };
+    match result {
+        Ok(true) => {
+            log::info!("SD log: deleted {path} via HTTP");
+            let _ = req.into_response(303, None, &[("Location", "/files")])?;
+            Ok(())
+        }
+        Ok(false) => respond_text(req, 400, "not a file\n"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            respond_text(req, 404, "no such file\n")
+        }
+        Err(e) => {
+            log::warn!("SD log: delete {path} failed: {e}");
+            respond_text(req, 500, "delete failed\n")
+        }
+    }
+}
+
+/// Send a short plain-text response with the given status.
+fn respond_text(
+    req: embedded_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'_>>,
+    status: u16,
+    text: &str,
+) -> anyhow::Result<()> {
+    let mut resp = req.into_response(status, None, &[("Content-Type", "text/plain")])?;
+    resp.write_all(text.as_bytes())?;
     Ok(())
 }

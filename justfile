@@ -128,6 +128,19 @@ ci-no-esp: fmt-check lint coverage
 validate-ntp device=DEFAULT_DEVICE *flags="":
     python3 scripts/validate_ntp.py {{device}} {{flags}}
 
+# List files in the microSD root over HTTP (requires a mounted card).
+sd-ls device=DEFAULT_DEVICE:
+    curl -s http://{{device}}/files | sed -e 's/<[^>]*>/ /g' -e 's/  */ /g' | grep -v '^ *$'
+
+# Delete one top-level file from the microSD over HTTP.  `just sd-rm old.txt`
+sd-rm name device=DEFAULT_DEVICE:
+    curl -s -o /dev/null -w "%{http_code}\n" --data-urlencode "name={{name}}" http://{{device}}/files/delete
+
+# Download the current (and rotated, if any) card log.
+sd-log device=DEFAULT_DEVICE:
+    curl -s -o gps-ntp.log http://{{device}}/log && wc -l gps-ntp.log
+    -curl -s -f -o gps-ntp.1.log http://{{device}}/log/1 && wc -l gps-ntp.1.log
+
 # Sustained NTP load from this host (single or multi-worker with --bind-ip).
 # Respects the device's 2 s per-client rate limiter (default 2.5 s interval).
 #

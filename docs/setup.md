@@ -274,9 +274,16 @@ curl -o gps-ntp.log  http://gps-ntp/log      # current file
 curl -o gps-ntp.1.log http://gps-ntp/log/1   # rotated file, if any
 ```
 
-The HTTP endpoint is read-only and unauthenticated (it only exists when a card
-is mounted); treat it as having the same trust boundary as the NTP service,
-since the log includes the STA SSID and client IP addresses. Flushes happen
+`http://gps-ntp/files` lists the card root in a browser with a delete button
+per file (top-level files only; directories and the ready marker are never
+deletable), for clearing out leftovers from a card's previous life. The same
+operations are available from the shell as `just sd-ls`, `just sd-rm <name>`
+and `just sd-log`.
+
+The HTTP endpoints are unauthenticated (they only exist when a card is
+mounted); treat them as having the same trust boundary as the NTP service,
+since the log includes the STA SSID and client IP addresses and anyone on the
+LAN can delete card files. Flushes happen
 every 5 s, so at most the last few seconds are lost on a power pull.
 Debug/trace lines are never written to the card even when a module is raised
 to `debug`; use the serial console for those.

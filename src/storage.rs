@@ -23,7 +23,7 @@ pub const MOUNT_POINT: &str = "/sdcard";
 pub const STATUS_REFRESH_US: i64 = 60_000_000;
 
 /// Marker file written at mount to confirm read/write access.
-const READY_MARKER: &str = "/sdcard/.rust_gps_ntp_ready";
+pub const READY_MARKER: &str = "/sdcard/.rust_gps_ntp_ready";
 
 /// Adalogger SD card chip-select on ESP32-S3 TFT Feather.
 ///
