@@ -4,7 +4,8 @@
 //! I2C run on a lower-priority panel task. SD filesystem calls run on `sd_io`,
 //! below a watchdog that restarts the chip when one does not return. The TFT
 //! driver busy-waits inside `spi_device_polling_transmit` with no timeout, so
-//! drawing must not share a task with the button.
+//! drawing must not share a task with the button. If the panel task stops
+//! looping, the button task restarts the chip even while the backlight is off.
 
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
@@ -38,9 +39,16 @@ const DRAW_INTERVAL_US: i64 = 5_000_000;
 const SCREEN_BLANK_US: i64 = 15_000_000;
 const BUTTON_DEBOUNCE_US: i64 = 200_000;
 const PULLUP_REFRESH_US: i64 = 1_000_000;
-/// Longer than one full-frame draw. A stuck SD call is restarted by `sd_wd`
-/// and does not share this task.
-const FRAME_STALL_US: i64 = 15_000_000;
+/// The panel task must lap its loop within this time. A stuck SD call is
+/// restarted by `sd_wd` and does not share this task. Blanking the backlight
+/// must not cancel the deadline: a draw that hangs as the screen turns off
+/// used to be forgotten, so the last frame (including a stale charge reading)
+/// stayed up until power was pulled.
+const PANEL_LOOP_STALL_US: i64 = 5_000_000;
+/// Re-apply GPIO0's input mode after this long held low. A USB charger can
+/// make the Serial/JTAG PHY clear the pin mux, so the boot button stays low
+/// and later presses never register until VBUS drops.
+const BUTTON_HELD_RECOVER_US: i64 = 500_000;
 const STUCK_LOW_US: i64 = 2_000_000;
 const BUTTON_LOOP_DELAY_MS: u32 = 10;
 const PANEL_LOOP_DELAY_MS: u32 = 20;
@@ -48,12 +56,14 @@ const PANEL_LOOP_DELAY_MS: u32 = 20;
 /// Falling edges on the page button. The ISR only bumps this counter.
 static BUTTON_EDGES: AtomicU32 = AtomicU32::new(0);
 
+/// Last time the panel task reached the top of its loop.
+static PANEL_LOOP_US: AtomicI64 = AtomicI64::new(0);
+
 /// Shared page / backlight / redraw generation between the button and panel tasks.
 struct UiControl {
     page: AtomicU8,
     screen_on: AtomicBool,
     render_req: AtomicU32,
-    render_done: AtomicU32,
 }
 
 /// Shared GPS, PPS, NTP discipline, RTC, and storage samples written by tasks.
@@ -238,13 +248,17 @@ impl UiTaskHandle {
         if let Err(err) = button.set_pull(Pull::Up) {
             log::warn!("Display: failed to enable button pull-up: {}", err);
         }
+        // A wall charger is not a USB host. The Serial/JTAG PHY can still see
+        // D+/D- shorted and reset the IO mux, which drops GPIO0's input mode
+        // so the page button reads as held until the cable is unplugged.
+        disarm_usb_iomux_reset();
         arm_button_interrupt(&mut button)?;
+        PANEL_LOOP_US.store(monotonic_us(), Ordering::Relaxed);
 
         let control = Arc::new(UiControl {
             page: AtomicU8::new(Page::Time.index()),
             screen_on: AtomicBool::new(true),
             render_req: AtomicU32::new(1),
-            render_done: AtomicU32::new(0),
         });
         let panel_feed = Arc::clone(&feed);
         let panel_control = Arc::clone(&control);
@@ -344,8 +358,8 @@ fn button_task_main(
     let mut last_pullup_us = last_interaction_us;
     let mut low_since = 0_i64;
     let mut stuck_logged = false;
-    let mut last_done = control.render_done.load(Ordering::Relaxed);
-    let mut stall_since = 0_i64;
+    let mut last_recover_us = 0_i64;
+    let mut restart_blocked_logged = false;
 
     loop {
         let now_us = monotonic_us();
@@ -366,7 +380,19 @@ fn button_task_main(
         if level_pressed {
             if low_since == 0 {
                 low_since = now_us;
-            } else if !stuck_logged && now_us.saturating_sub(low_since) >= STUCK_LOW_US {
+            } else if now_us.saturating_sub(low_since) >= BUTTON_HELD_RECOVER_US
+                && now_us.saturating_sub(last_recover_us) >= PULLUP_REFRESH_US
+            {
+                // The pin should already be an input with a pull-up. Doing it
+                // again repairs a USB PHY IO-mux reset without waiting for the
+                // cable to be unplugged.
+                restore_button_input(button);
+                // Reconfiguring the pin can post a stale edge. Consume it so
+                // the repair itself does not turn the page.
+                last_edges = BUTTON_EDGES.load(Ordering::Relaxed);
+                last_recover_us = now_us;
+            }
+            if !stuck_logged && now_us.saturating_sub(low_since) >= STUCK_LOW_US {
                 log::warn!(
                     "Display: button line held low; waiting for release before the next press"
                 );
@@ -421,21 +447,21 @@ fn button_task_main(
             last_pullup_us = now_us;
         }
 
-        let done = control.render_done.load(Ordering::Relaxed);
-        if done != last_done {
-            last_done = done;
-            stall_since = 0;
-        }
-        let frame_pending = control.screen_on.load(Ordering::Relaxed)
-            && control.render_req.load(Ordering::Relaxed) != done;
-        if frame_pending {
-            if stall_since == 0 {
-                stall_since = now_us;
-            } else if now_us.saturating_sub(stall_since) >= FRAME_STALL_US {
+        let panel_at = PANEL_LOOP_US.load(Ordering::Relaxed);
+        if panel_at != 0 && now_us.saturating_sub(panel_at) >= PANEL_LOOP_STALL_US {
+            // GPIO0 low at reset selects the ROM download bootloader. A panel
+            // stall that coincides with a held (or USB-stuck) button must wait
+            // until the line is high, or the restart would not come back.
+            if button.is_high() {
                 restart_stalled_panel();
+            } else if !restart_blocked_logged {
+                log::error!(
+                    "Display: panel task stalled while GPIO0 is low; holding restart so the chip does not enter download mode"
+                );
+                restart_blocked_logged = true;
             }
         } else {
-            stall_since = 0;
+            restart_blocked_logged = false;
         }
 
         FreeRtos::delay_ms(BUTTON_LOOP_DELAY_MS);
@@ -470,6 +496,7 @@ fn panel_task_main<DI, RST, BL, PinE>(
 
     loop {
         let now_us = monotonic_us();
+        PANEL_LOOP_US.store(now_us, Ordering::Relaxed);
         let req = control.render_req.load(Ordering::Relaxed);
         if control.screen_on.load(Ordering::Relaxed) && req != last_drawn {
             let page = Page::from_index(control.page.load(Ordering::Relaxed));
@@ -493,11 +520,9 @@ fn panel_task_main<DI, RST, BL, PinE>(
                 rendered_once = true;
             }
             // A press during the draw changes the page after we sampled it.
-            // Leave `last_drawn` behind so the next loop paints the new page,
-            // but still publish `render_done` so the stall watchdog sees progress.
+            // Leave `last_drawn` behind so the next loop paints the new page.
             let page_now = Page::from_index(control.page.load(Ordering::Relaxed));
             let req_now = control.render_req.load(Ordering::Relaxed);
-            control.render_done.store(req, Ordering::Relaxed);
             if page_now == page && req_now == req {
                 last_drawn = req;
             }
@@ -590,10 +615,52 @@ fn sample_sensors(
     }
 }
 
-/// The panel task did not finish a frame. SPI polling waits forever when the
+/// Stop a USB Serial/JTAG connect from resetting the IO mux.
+///
+/// A dedicated charger shorts D+ and D-. The PHY can treat that as a download
+/// event and return GPIO0 (and the other app pins) to their reset state while
+/// the firmware is running. Bit 18 of `RTC_CNTL_USB_CONF_REG` is the ESP32-S3
+/// control that ignores that mux reset. USB serial itself keeps working, so a
+/// host can still open the console.
+fn disarm_usb_iomux_reset() {
+    const RTC_CNTL_USB_CONF_REG: *mut u32 = 0x6000_8120 as *mut u32;
+    const IO_MUX_RESET_DISABLE: u32 = 1 << 18;
+    // SAFETY: `0x60008120` is `RTC_CNTL_USB_CONF_REG` on ESP32-S3
+    // (`DR_REG_RTCCNTL_BASE + 0x120`). One aligned volatile read of that
+    // memory-mapped register.
+    let current = unsafe { RTC_CNTL_USB_CONF_REG.read_volatile() };
+    // SAFETY: same register. OR-ing bit 18 only disables the USB IO-mux reset.
+    unsafe { RTC_CNTL_USB_CONF_REG.write_volatile(current | IO_MUX_RESET_DISABLE) };
+}
+
+/// Put GPIO0 back into pulled-up input mode and re-arm its falling-edge ISR.
+fn restore_button_input(button: &mut PinDriver<'static, gpio::Gpio0, Input>) {
+    if let Err(err) = button.set_pull(Pull::Up) {
+        log::warn!("Display: failed to refresh button pull-up: {err}");
+    }
+    // SAFETY: this task owns GPIO0 for the process lifetime. Selecting input
+    // mode again undoes a USB IO-mux reset without releasing the driver.
+    let rc = unsafe {
+        esp_idf_svc::sys::gpio_set_direction(
+            esp_idf_svc::sys::gpio_num_t_GPIO_NUM_0,
+            esp_idf_svc::sys::gpio_mode_t_GPIO_MODE_INPUT,
+        )
+    };
+    if rc != esp_idf_svc::sys::ESP_OK {
+        log::warn!("Display: failed to restore button input mode: {rc}");
+    }
+    if let Err(err) = button.set_interrupt_type(InterruptType::NegEdge) {
+        log::warn!("Display: failed to restore button edge type: {err}");
+    }
+    if let Err(err) = button.enable_interrupt() {
+        log::warn!("Display: failed to re-arm button interrupt: {err}");
+    }
+}
+
+/// The panel task stopped looping. SPI polling waits forever when the
 /// peripheral never sets its done bit, so the only recovery is a restart.
 fn restart_stalled_panel() -> ! {
-    log::error!("Display: panel draw stalled with the screen on; restarting");
+    log::error!("Display: panel task stopped responding; restarting");
     // SAFETY: `esp_restart` takes no arguments and does not return. Calling it
     // from a task is the supported way to reset after the SPI driver has
     // busy-waited past any useful timeout.
