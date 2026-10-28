@@ -7,7 +7,7 @@
 use crate::i2c_bus::{FeatherI2cBus, I2cDevice};
 
 /// Last sampled battery telemetry values.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BatterySnapshot {
     /// Battery voltage in volts.
     pub voltage_v: f32,

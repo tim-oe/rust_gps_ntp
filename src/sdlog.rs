@@ -17,9 +17,9 @@
 //! `http://<device>/log` and `/log/1` so a run can be collected over the LAN
 //! without pulling the card, and a `/files` page listing the card root with
 //! per-file delete (POST only, top-level files only, never the ready marker)
-//! for clearing out cruft.  A single [`CARD_LOCK`] serialises the writer's
-//! appends with HTTP reads and deletes; the writer uses `try_lock` and simply
-//! defers a flush while a request is in progress.
+//! for clearing out cruft.  Appends, reads, and deletes all run on the SD
+//! worker ([`storage::call`]), so a stuck card transfer is the worker's
+//! problem and the HTTP task never enters the SPI driver.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -61,8 +61,6 @@ const HTTP_STACK_BYTES: usize = 8192;
 /// Chunk size for streaming a log file over HTTP.
 const HTTP_CHUNK_BYTES: usize = 2048;
 
-/// Serialises card access between the writer thread and HTTP downloads.
-static CARD_LOCK: Mutex<()> = Mutex::new(());
 /// Upper bound on a `POST /files/delete` form body.
 const DELETE_BODY_MAX: usize = 512;
 
@@ -153,12 +151,9 @@ pub fn install() {
 
 /// Append queued lines to the card, rotating first if the file is too large.
 ///
-/// Returns without draining when an HTTP download holds [`CARD_LOCK`]; the
-/// lines stay queued for the next cycle.
+/// Runs on the SD worker, which also runs HTTP reads, so a flush cannot
+/// start in the middle of a chunk.
 fn flush_to_card() -> anyhow::Result<()> {
-    let Ok(_card) = CARD_LOCK.try_lock() else {
-        return Ok(());
-    };
     let (lines, dropped) = LOGGER.drain();
     if lines.is_empty() && dropped == 0 {
         return Ok(());
@@ -216,7 +211,7 @@ pub fn start_writer() -> anyhow::Result<thread::JoinHandle<()>> {
                 if !storage::is_ready() {
                     continue;
                 }
-                match flush_to_card() {
+                match storage::call("sd log", flush_to_card) {
                     Ok(()) => failed_once = false,
                     Err(err) if !failed_once => {
                         failed_once = true;
@@ -242,8 +237,9 @@ pub fn start_writer() -> anyhow::Result<thread::JoinHandle<()>> {
 /// Start a read-only HTTP server exposing the log files on port 80.
 ///
 /// Routes: `/` (index), `/log` (current file), `/log/1` (rotated file).
-/// Responses are `text/plain`, streamed in [`HTTP_CHUNK_BYTES`] pieces while
-/// holding [`CARD_LOCK`], so the writer never appends mid-download.  There is
+/// Responses are `text/plain`, streamed in [`HTTP_CHUNK_BYTES`] pieces.  Each
+/// chunk is read on the SD worker, so the writer cannot append mid-chunk.
+/// There is
 /// no authentication: the endpoint is intended for the same trusted LAN that
 /// is allowed to use the NTP service, and the log contains the STA SSID and
 /// client IP addresses.
@@ -292,29 +288,50 @@ fn serve_file(
     req: embedded_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'_>>,
     path: &str,
 ) -> anyhow::Result<()> {
-    use std::io::Read as _;
-
-    let _card = CARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(mut file) = fs::File::open(path) else {
+    let path_owned = path.to_owned();
+    let len = storage::call("sd stat", {
+        let path_owned = path_owned.clone();
+        move || fs::metadata(path_owned).map(|meta| meta.len())
+    });
+    let Ok(len) = len else {
         let mut resp = req.into_response(404, None, &[("Content-Type", "text/plain")])?;
         resp.write_all(b"no such log\n")?;
         return Ok(());
     };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0).to_string();
+    let len_header = len.to_string();
     let mut resp = req.into_response(
         200,
         None,
-        &[("Content-Type", "text/plain"), ("Content-Length", &len)],
+        &[
+            ("Content-Type", "text/plain"),
+            ("Content-Length", &len_header),
+        ],
     )?;
-    let mut buf = [0_u8; HTTP_CHUNK_BYTES];
-    loop {
-        let n = file.read(&mut buf).context("read log")?;
-        if n == 0 {
+    let mut offset = 0_u64;
+    while offset < len {
+        let chunk = read_chunk(&path_owned, offset, HTTP_CHUNK_BYTES).context("read log")?;
+        if chunk.is_empty() {
             break;
         }
-        resp.write_all(&buf[..n])?;
+        offset = offset.saturating_add(chunk.len() as u64);
+        resp.write_all(&chunk)?;
     }
     Ok(())
+}
+
+/// Read one slice of `path` on the SD worker.
+fn read_chunk(path: &str, offset: u64, max: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let path = path.to_owned();
+    storage::call("sd read", move || {
+        let mut file = fs::File::open(path)?;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0_u8; max];
+        let n = file.read(&mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    })
 }
 
 /// Minimal HTML escaping for file names rendered into the listing page.
@@ -340,20 +357,22 @@ fn html_escape(input: &str) -> String {
 fn serve_listing(
     req: embedded_svc::http::server::Request<&mut esp_idf_svc::http::server::EspHttpConnection<'_>>,
 ) -> anyhow::Result<()> {
-    let _card = CARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut entries: Vec<(String, Option<u64>)> = Vec::new();
-    if let Ok(dir) = fs::read_dir(storage::MOUNT_POINT) {
-        for entry in dir.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let size = entry
-                .metadata()
-                .ok()
-                .filter(|m| m.is_file())
-                .map(|m| m.len());
-            entries.push((name, size));
+    let entries = storage::call("sd list", || {
+        let mut entries: Vec<(String, Option<u64>)> = Vec::new();
+        if let Ok(dir) = fs::read_dir(storage::MOUNT_POINT) {
+            for entry in dir.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let size = entry
+                    .metadata()
+                    .ok()
+                    .filter(|meta| meta.is_file())
+                    .map(|meta| meta.len());
+                entries.push((name, size));
+            }
         }
-    }
-    entries.sort();
+        entries.sort();
+        entries
+    });
 
     let mut page = String::from(
         "<!doctype html><title>SD card</title><style>body{font:14px monospace}td{padding:2px 10px}</style><h2>/sdcard</h2><table>",
@@ -386,7 +405,6 @@ fn serve_listing(
         "</table><p>{} entries. Logs: <a href=/log>/log</a> <a href=/log/1>/log/1</a></p>",
         entries.len()
     );
-    drop(_card);
     let mut resp = req.into_response(200, None, &[("Content-Type", "text/html; charset=utf-8")])?;
     resp.write_all(page.as_bytes())?;
     Ok(())
@@ -454,12 +472,12 @@ fn handle_delete(
     }
     let path = format!("{}/{name}", storage::MOUNT_POINT);
     let result = {
-        let _card = CARD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        match fs::metadata(&path) {
-            Ok(m) if m.is_file() => fs::remove_file(&path).map(|()| true),
+        let path = path.clone();
+        storage::call("sd delete", move || match fs::metadata(&path) {
+            Ok(meta) if meta.is_file() => fs::remove_file(&path).map(|()| true),
             Ok(_) => Ok(false),
-            Err(e) => Err(e),
-        }
+            Err(err) => Err(err),
+        })
     };
     match result {
         Ok(true) => {

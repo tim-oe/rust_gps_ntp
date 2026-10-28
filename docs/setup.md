@@ -284,7 +284,11 @@ The HTTP endpoints are unauthenticated (they only exist when a card is
 mounted); treat them as having the same trust boundary as the NTP service,
 since the log includes the STA SSID and client IP addresses and anyone on the
 LAN can delete card files. Flushes happen
-every 5 s, so at most the last few seconds are lost on a power pull.
+every 5 s, so at most the last few seconds are lost on a power pull. If any
+single card call (a flush, a free-space read, or one HTTP chunk) does not
+return within 180 seconds, the firmware restarts. A stuck SPI transfer cannot
+be cancelled without abandoning the bus lock, so the chip reset is the
+recovery.
 Debug/trace lines are never written to the card even when a module is raised
 to `debug`; use the serial console for those.
 

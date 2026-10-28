@@ -128,10 +128,10 @@ impl BoardBoot {
             Arc::clone(&ui_feed),
             panel.display,
             panel.button,
+            panel.backlight,
             i2c_bus,
             battery,
             rtc,
-            panel.backlight_on_state,
             Arc::clone(&wifi),
         )?;
 

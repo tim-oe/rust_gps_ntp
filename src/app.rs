@@ -40,7 +40,6 @@ use crate::logging;
 use crate::ntp::{self, DisciplineState};
 use crate::pps::{self, PpsEvent};
 use crate::rtc;
-use crate::storage::{self, StorageStatus};
 use crate::timezone::{self, TimezoneStore, TimezoneWorker};
 use crate::ui_task::UiFeed;
 use crate::wifi;
@@ -72,7 +71,6 @@ pub fn run() -> anyhow::Result<()> {
     let mut last_rtc_fallback_us = 0_i64;
     let mut last_rtc_write_us = 0_i64;
     let mut last_rtc_utc = boot_rtc_unix;
-    let mut last_storage_refresh_us = 0_i64;
 
     // --- Self-check state: track first-event milestones and emit timeout warnings. ---
     let boot_us = monotonic_us();
@@ -141,18 +139,10 @@ pub fn run() -> anyhow::Result<()> {
             &mut last_rtc_utc,
         );
 
-        let mut now_us = monotonic_us();
-
-        if ui_feed.storage().mounted
-            && (last_storage_refresh_us == 0
-                || (now_us - last_storage_refresh_us) >= storage::STATUS_REFRESH_US)
-        {
-            ui_feed.publish_storage(StorageStatus::refresh(
-                storage::MOUNT_POINT,
-                ui_feed.storage(),
-            ));
-            last_storage_refresh_us = now_us;
-        }
+        // SD filesystem calls stay off this loop. They run on `sd_io`, and
+        // `sd_wd` restarts the chip if one does not return within
+        // `storage::SD_CALL_TIMEOUT_US`. The panel only requests a free-space
+        // refresh; it does not call into the card.
 
         if gps_uart.bytes_seen() > 0 && gps_uart.bytes_seen() % 512 == 0 {
             log::debug!("GPS: diagnostics bytes received={}", gps_uart.bytes_seen());
@@ -197,7 +187,7 @@ pub fn run() -> anyhow::Result<()> {
 
         // During holdover the dispersion grows with time; refresh the display
         // snapshot every second so the UI reflects current uncertainty.
-        now_us = monotonic_us();
+        let now_us = monotonic_us();
         if (now_us - last_ntp_publish_us) >= 1_000_000 {
             ui_feed.publish_ntp(ntp_server.ntp_snapshot(gps.fix));
             last_ntp_publish_us = now_us;

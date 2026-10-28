@@ -146,7 +146,7 @@ impl DisplayDevice {
         InitializedPanel<
             SPIInterfaceNoCS<TftSpiDevice, PinDriver<'static, gpio::Gpio39, Output>>,
             PinDriver<'static, gpio::Gpio40, Output>,
-            PinDriver<'static, gpio::Gpio45, Output>,
+            NoBacklight,
         >,
     > {
         let tft_spi = self
@@ -166,19 +166,29 @@ impl DisplayDevice {
 
         let dc = PinDriver::output(dc).context("failed to init TFT DC")?;
         let rst = PinDriver::output(rst).context("failed to init TFT RST")?;
-        let backlight = PinDriver::output(bl).context("failed to init TFT backlight")?;
+        let mut backlight = PinDriver::output(bl).context("failed to init TFT backlight")?;
         let button = PinDriver::input(button_pin).context("failed to init page button")?;
 
+        // The backlight pin stays out of the ST7789 driver so the button task
+        // can turn the panel on and off without taking the SPI bus. The driver
+        // gets a no-op pin; `init` only toggles the backlight when one is set.
+        set_backlight_pin(&mut backlight, true)?;
         let di = SPIInterfaceNoCS::new(tft_spi, dc);
-        let mut display = ST7789::new(di, Some(rst), Some(backlight), PANEL_WIDTH, PANEL_HEIGHT);
+        let mut display = ST7789::new(
+            di,
+            Some(rst),
+            Option::<NoBacklight>::None,
+            PANEL_WIDTH,
+            PANEL_HEIGHT,
+        );
         let mut ets = Ets;
-        let backlight_on_state = init_display(&mut display, &mut ets)?;
+        let _backlight_on_state = init_display(&mut display, &mut ets)?;
         self.panel_claimed = true;
 
         Ok(InitializedPanel {
             display,
             button,
-            backlight_on_state,
+            backlight,
         })
     }
 
@@ -199,7 +209,10 @@ impl DisplayDevice {
     }
 }
 
-/// Initialized ST7789 panel, page button, and backlight state for the UI task.
+/// Initialized ST7789 panel, page button, and backlight GPIO for the UI tasks.
+///
+/// The backlight pin is not owned by the panel driver. The button task drives
+/// it directly so a stuck SPI transfer cannot prevent the screen from waking.
 pub struct InitializedPanel<DI, RST, BL>
 where
     DI: display_interface::WriteOnlyDataCommand,
@@ -208,7 +221,37 @@ where
 {
     pub display: ST7789<DI, RST, BL>,
     pub button: PinDriver<'static, gpio::Gpio0, Input>,
-    pub backlight_on_state: BacklightState,
+    pub backlight: PinDriver<'static, gpio::Gpio45, Output>,
+}
+
+/// Stand-in backlight pin so [`ST7789`] can be built without owning GPIO45.
+pub struct NoBacklight;
+
+impl embedded_hal_02::digital::v2::OutputPin for NoBacklight {
+    // Same error type as the reset pin so `ST7789` can share one `PinE`.
+    type Error = esp_idf_svc::sys::EspError;
+
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+/// Drive the TFT backlight GPIO, honoring [`DISPLAY_BACKLIGHT_ACTIVE_LOW`].
+pub fn set_backlight_pin(
+    pin: &mut PinDriver<'static, gpio::Gpio45, Output>,
+    on: bool,
+) -> anyhow::Result<()> {
+    let high = if DISPLAY_BACKLIGHT_ACTIVE_LOW {
+        !on
+    } else {
+        on
+    };
+    let result = if high { pin.set_high() } else { pin.set_low() };
+    result.context("failed to set TFT backlight pin")
 }
 
 /// Enable the TFT power rail and wait for the panel to stabilize.
@@ -233,7 +276,7 @@ fn enable_power(
 }
 
 /// Application display pages shown by button rotation.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Page {
     Time,
     Location,
@@ -259,6 +302,30 @@ impl Page {
             Self::Battery => Self::Ntp,
             Self::Ntp => Self::Network,
             Self::Network => Self::Time,
+        }
+    }
+
+    /// Stable index of this page in the rotation, starting at 0 for [`Self::Time`].
+    pub fn index(self) -> u8 {
+        match self {
+            Self::Time => 0,
+            Self::Location => 1,
+            Self::Resources => 2,
+            Self::Battery => 3,
+            Self::Ntp => 4,
+            Self::Network => 5,
+        }
+    }
+
+    /// Page for `index`, wrapping so a stale atomic value still lands on a page.
+    pub fn from_index(index: u8) -> Self {
+        match index % 6 {
+            0 => Self::Time,
+            1 => Self::Location,
+            2 => Self::Resources,
+            3 => Self::Battery,
+            4 => Self::Ntp,
+            _ => Self::Network,
         }
     }
 }

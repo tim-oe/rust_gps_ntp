@@ -104,14 +104,16 @@ pub fn load_cached_sd() -> Option<String> {
     if !crate::storage::is_ready() {
         return None;
     }
-    let mut file = fs::File::open(SD_TZ_CACHE_PATH).ok()?;
-    let mut buf = [0_u8; 64];
-    let n = file.read(&mut buf).ok()?;
-    let name = std::str::from_utf8(&buf[..n]).ok()?.trim();
-    if name.is_empty() || chrono_tz::Tz::from_str(name).is_err() {
-        return None;
-    }
-    Some(name.to_owned())
+    crate::storage::call("sd tz", || {
+        let mut file = fs::File::open(SD_TZ_CACHE_PATH).ok()?;
+        let mut buf = [0_u8; 64];
+        let n = file.read(&mut buf).ok()?;
+        let name = std::str::from_utf8(&buf[..n]).ok()?.trim();
+        if name.is_empty() || chrono_tz::Tz::from_str(name).is_err() {
+            return None;
+        }
+        Some(name.to_owned())
+    })
 }
 
 /// Persist an IANA timezone to the microSD backup file.
@@ -123,16 +125,19 @@ pub fn save_cached_sd(tz_name: &str) -> anyhow::Result<()> {
     if !crate::storage::is_ready() {
         return Ok(());
     }
-    fs::create_dir_all(SD_TZ_CACHE_DIR)
-        .map_err(|e| anyhow!("failed to create {SD_TZ_CACHE_DIR}: {e}"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(SD_TZ_CACHE_PATH)
-        .map_err(|e| anyhow!("failed to open {SD_TZ_CACHE_PATH}: {e}"))?;
-    file.write_all(tz_name.as_bytes())
-        .map_err(|e| anyhow!("failed to write {SD_TZ_CACHE_PATH}: {e}"))
+    let tz_name = tz_name.to_owned();
+    crate::storage::call("sd tz", move || {
+        fs::create_dir_all(SD_TZ_CACHE_DIR)
+            .map_err(|e| anyhow!("failed to create {SD_TZ_CACHE_DIR}: {e}"))?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(SD_TZ_CACHE_PATH)
+            .map_err(|e| anyhow!("failed to open {SD_TZ_CACHE_PATH}: {e}"))?;
+        file.write_all(tz_name.as_bytes())
+            .map_err(|e| anyhow!("failed to write {SD_TZ_CACHE_PATH}: {e}"))
+    })
 }
 
 /// Persist timezone to NVS and, when mounted, microSD.

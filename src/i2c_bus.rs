@@ -3,6 +3,8 @@
 //! Device modules implement [`I2cDevice`] and receive a [`FeatherI2cBus`] at init.
 //! SDA/SCL GPIOs are claimed from [`crate::pins::PinPool`] in [`FeatherI2cBus::init`].
 
+use core::time::Duration;
+
 use anyhow::Context;
 use esp_idf_svc::hal::i2c::{self, I2c, I2cDriver};
 use esp_idf_svc::hal::peripheral::Peripheral;
@@ -42,7 +44,15 @@ impl FeatherI2cBus {
         let scl = pool
             .take_gpio41(Self::MODULE)
             .map_err(anyhow::Error::from)?;
-        let cfg = i2c::config::Config::new().baudrate(100.kHz().into());
+        // Hardware SCL timeout so a stuck bus raises the I2C interrupt instead
+        // of leaving `i2c_master_cmd_begin` parked until the software ticks
+        // expire. The register is a power-of-two XTAL-cycle count; 20 ms is
+        // inside the range the ESP32-S3 peripheral can represent.
+        let timeout =
+            <i2c::APBTickType as core::convert::From<Duration>>::from(Duration::from_millis(20));
+        let cfg = i2c::config::Config::new()
+            .baudrate(100.kHz().into())
+            .timeout(timeout);
         let driver = I2cDriver::new(i2c_peripheral, sda, scl, &cfg)
             .context("failed to initialize Feather I2C bus")?;
         log::info!(

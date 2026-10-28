@@ -53,11 +53,13 @@ fn compile_time_ssid() -> String {
 
 /// Read the current STA interface addresses from the Wi-Fi driver's netif.
 ///
-/// Falls back to the `"n/a"` defaults when the lock is poisoned or the netif
-/// has no address yet (e.g. mid-reconnect); the display simply shows `n/a`.
+/// Falls back to the `"n/a"` defaults when the lock is busy, poisoned, or the
+/// netif has no address yet (e.g. mid-reconnect). The lock is tried, not
+/// waited on: the reconnect handler holds the same mutex on the system event
+/// task, and blocking here would freeze the task that paints the panel.
 pub fn read_network_snapshot(wifi: &SharedWifi) -> NetworkSnapshot {
     let mut snap = NetworkSnapshot::default();
-    let Ok(guard) = wifi.lock() else {
+    let Ok(guard) = wifi.try_lock() else {
         return snap;
     };
     if let Ok(ip_info) = guard.wifi().sta_netif().get_ip_info() {

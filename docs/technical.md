@@ -69,7 +69,7 @@ src/
 │   └── cidr_parse.rs   # parse_ipv4_cidr, include!d by protection.rs and build.rs
 │   (each host-testable module keeps its tests in <module>/tests.rs)
 ├── display.rs      # DisplayDevice: ST7789 TFT, shared SPI bus, panel init
-├── storage.rs      # StorageDevice: Adalogger microSD on shared SPI
+├── storage.rs      # StorageDevice: Adalogger microSD, SD worker, call watchdog
 ├── rtc.rs          # PCF8523 RTC on Feather I2C
 ├── battery.rs      # MAX17048 / LC709203 I2C fuel gauge
 ├── timezone.rs     # IANA timezone resolution, NVS cache, HTTP worker
@@ -613,15 +613,32 @@ module that owns each bus; GPIO numbers are never exposed through `app`.
     - Poll `TimezoneWorker` for completed HTTP result
     - `NtpServer::poll` – serve pending UDP requests
     - `PpsDevice::poll` – forward PPS events to `NtpServer` and `UiFeed`
-    - Periodic storage status refresh, RTC writeback, boot self-checks
+    - RTC writeback and boot self-checks. SD free-space refresh is requested by the panel and executed on `sd_io`
 
 The main loop sleeps 1 ms per iteration (`FreeRtos::delay_ms(1)`). At the default 100 Hz FreeRTOS tick rate this would round up to 10 ms; `sdkconfig.defaults` sets `CONFIG_FREERTOS_HZ=1000` so the sleep is actually 1 ms. GPS sentences arrive at approximately 1 Hz with minimal per-sentence processing time; NTP requests are served non-blocking from a pre-bound UDP socket.
 
 ---
 
+### `storage` – microSD call watchdog
+
+The card and the TFT share SPI2. ESP-IDF's SD driver performs every transfer with `spi_device_polling_transmit`, which calls `spi_device_polling_end(portMAX_DELAY)`. That wait gives up only when the elapsed tick count is greater than `0xFFFFFFFF`, so a transfer that never sets the done bit does not return. `sdspi_host_start_command` holds `spi_device_acquire_bus` and the card's chip-select across the wait, and `f_getfree` / `f_write` already hold the FatFS volume mutex. Deleting the task would leave all three of those taken. The display uses the same bus, so the next draw would wait forever as well.
+
+`StorageDevice::init` starts two threads before it probes the card:
+
+| Thread | Priority | Role |
+|---|---|---|
+| `sd_io` | 2 | The only thread that enters the filesystem after mount |
+| `sd_wd` | 3 | If the in-flight call has not returned in 180 s (`storage::SD_CALL_TIMEOUT_US`), log and `esp_restart()` |
+
+Priority 3 is above the worker, so the tick preempts the busy-wait, and below the panel (4) and the button (6). Mount borrows the shared `SpiDriver`, so it runs on a short-lived priority-2 thread under the same deadline instead of a queued job. Everything else (`sdlog` appends, HTTP reads and deletes, the timezone file, and the free-space reread) goes through `storage::call`, which blocks the caller until the worker finishes. A call made on `sd_io` itself runs inline.
+
+The panel does not call `esp_vfs_fat_info`. Every 60 s it sets a flag; `sd_io` does the read and the panel copies the result on a later pass. That request is armed while the backlight is off, and `sd_wd` still restarts a stuck read in that state. `is_ready()` is the flag recorded when the ready marker was written at mount, so other tasks do not `stat` the card.
+
+The 5 s `command_timeout_ms` on the SD host only bounds the loops that wait for the card to leave busy or to send a data token. Each iteration of those loops still calls `spi_device_polling_transmit`, so it does not cover the hang this watchdog exists for.
+
 ### `sdlog` – microSD Log Mirror
 
-`sdlog::install()` replaces `EspLogger::initialize_default()` at boot with a wrapper that forwards every record to the console unchanged and additionally queues `info`-and-above records (regardless of per-tag console overrides) as `"<uptime ms> <LEVEL> <target>: <message>"` lines, the same millisecond stamp the console prints. Once `board` has mounted the card it calls `sdlog::start_writer()`, a priority‑2 thread (below the UI task at 5 and the main task at 10) that drains the queue to `/sdcard/gps-ntp.log` every 5 s, opening and closing the file each time so lines survive a power pull. The file rotates to `gps-ntp.1.log` past 8 MiB. The queue is capped at 16 KiB; overflow is counted and reported as a single `dropped` line on the next flush rather than blocking the logging task. Logging call sites therefore never touch SPI or FAT, which matters because the main loop's PPS/NMEA pairing is sensitive to exactly the kind of stall a synchronous card write would cause. If no card is mounted the writer is not started and the queue simply saturates at its cap. When a card is mounted, `sdlog::start_http_server()` also brings up a read-only `EspHttpServer` on port 80 serving `/log` and `/log/1` as `text/plain`; downloads hold a `CARD_LOCK` that the writer checks with `try_lock`, deferring its flush rather than appending mid-transfer. `GET /files` renders the card root as HTML with a `POST /files/delete` form per file; the handler accepts only a bare top-level file name (no separators or `..`), refuses directories and the ready marker, and redirects back to the listing. Deletion is POST-only so page loads and link prefetches cannot remove anything.
+`sdlog::install()` replaces `EspLogger::initialize_default()` at boot with a wrapper that forwards every record to the console unchanged and additionally queues `info`-and-above records (regardless of per-tag console overrides) as `"<uptime ms> <LEVEL> <target>: <message>"` lines, the same millisecond stamp the console prints. Once `board` has mounted the card it calls `sdlog::start_writer()`, a priority‑2 thread (below the panel task at 4 and the main task at 10) that every 5 s hands the queued lines to `storage::call`. The SD worker opens, appends, and closes `/sdcard/gps-ntp.log`, so lines survive a power pull. The file rotates to `gps-ntp.1.log` past 8 MiB. The queue is capped at 16 KiB; overflow is counted and reported as a single `dropped` line on the next flush rather than blocking the logging task. Logging call sites therefore never touch SPI or FAT, which matters because the main loop's PPS/NMEA pairing is sensitive to exactly the kind of stall a synchronous card write would cause. If no card is mounted the writer is not started and the queue simply saturates at its cap. When a card is mounted, `sdlog::start_http_server()` also brings up an `EspHttpServer` on port 80 serving `/log` and `/log/1` as `text/plain`. Each chunk, directory listing, and delete runs through `storage::call`, so the HTTP task (priority 5) never enters the SPI driver; the worker serialises those calls with log appends. `GET /files` renders the card root as HTML with a `POST /files/delete` form per file; the handler accepts only a bare top-level file name (no separators or `..`), refuses directories and the ready marker, and redirects back to the listing. Deletion is POST-only so page loads and link prefetches cannot remove anything.
 
 ---
 
